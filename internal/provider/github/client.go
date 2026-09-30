@@ -6,6 +6,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -115,6 +116,45 @@ func (c *Client) do(ctx context.Context, method, path string, auth bool, out any
 		}
 	}
 	return resp, nil
+}
+
+// send is do() for a request with a JSON body.
+func (c *Client) send(ctx context.Context, method, path string, body any, out any) error {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.api()+path, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Api-Version", apiVersion)
+	req.Header.Set("User-Agent", "bladerunner")
+	if c.Token == nil {
+		return diag.New(diag.CodeTokenMissing, "no GitHub token available", "no token source was configured", "run `bladerunner init`")
+	}
+	tok, err := c.Token(ctx)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return diag.Wrap(err, diag.CodeGitHubUnavailable, "cannot reach GitHub", "the network is down or a proxy blocks "+c.api(), "check the connection, then re-run")
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode/100 != 2 {
+		return apiError(method, path, resp, data, true)
+	}
+	if out != nil && len(data) > 0 {
+		if err := json.Unmarshal(data, out); err != nil {
+			return diag.Wrap(err, diag.CodeGitHubUnavailable, "GitHub answered with something that is not JSON", "a proxy is rewriting the response", "check the network")
+		}
+	}
+	return nil
 }
 
 // apiError turns an HTTP failure into a diag error naming the likely cause and the fix.
@@ -227,6 +267,111 @@ func (c *Client) Commit(ctx context.Context, repository, sha string) (provider.C
 		cm.Payload = *out.Verification.Payload
 	}
 	return cm, nil
+}
+
+// ListCommits returns recent commit ids of the default branch.
+func (c *Client) ListCommits(ctx context.Context, repository string, limit int) ([]string, error) {
+	if limit < 1 || limit > 100 {
+		limit = 30
+	}
+	var out []struct {
+		SHA string `json:"sha"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/commits?per_page=%d", repository, limit), c.Token != nil, &out); err != nil {
+		return nil, err
+	}
+	shas := make([]string, 0, len(out))
+	for _, x := range out {
+		shas = append(shas, x.SHA)
+	}
+	return shas, nil
+}
+
+// ListRuns returns recent workflow runs. The field names are assumptions to confirm in BR-0.
+func (c *Client) ListRuns(ctx context.Context, repository, status string) ([]provider.Run, error) {
+	q := url.Values{"per_page": {"30"}}
+	if status != "" {
+		q.Set("status", status)
+	}
+	var out struct {
+		Runs []struct {
+			ID       int64  `json:"id"`
+			HeadSHA  string `json:"head_sha"`
+			Event    string `json:"event"`
+			Status   string `json:"status"`
+			HeadRepo *struct {
+				FullName string `json:"full_name"`
+			} `json:"head_repository"`
+			Actor *struct {
+				Login string `json:"login"`
+			} `json:"actor"`
+		} `json:"workflow_runs"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/actions/runs?"+q.Encode(), true, &out); err != nil {
+		return nil, err
+	}
+	runs := make([]provider.Run, 0, len(out.Runs))
+	for _, r := range out.Runs {
+		run := provider.Run{ID: r.ID, HeadSHA: r.HeadSHA, Event: r.Event, Status: r.Status}
+		if r.HeadRepo != nil {
+			run.HeadRepository = r.HeadRepo.FullName
+		}
+		if r.Actor != nil {
+			run.Actor = r.Actor.Login
+		}
+		runs = append(runs, run)
+	}
+	return runs, nil
+}
+
+// ListJobs returns the jobs of a run.
+func (c *Client) ListJobs(ctx context.Context, repository string, runID int64) ([]provider.Job, error) {
+	var out struct {
+		Jobs []struct {
+			ID         int64    `json:"id"`
+			RunID      int64    `json:"run_id"`
+			Status     string   `json:"status"`
+			Labels     []string `json:"labels"`
+			RunnerName *string  `json:"runner_name"`
+			HeadSHA    string   `json:"head_sha"`
+		} `json:"jobs"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs/%d/jobs", repository, runID), true, &out); err != nil {
+		return nil, err
+	}
+	jobs := make([]provider.Job, 0, len(out.Jobs))
+	for _, j := range out.Jobs {
+		job := provider.Job{ID: j.ID, RunID: j.RunID, Status: j.Status, Labels: j.Labels, HeadSHA: j.HeadSHA}
+		if j.RunnerName != nil {
+			job.RunnerName = *j.RunnerName
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, nil
+}
+
+// GenerateJITConfig registers a single-use runner. The endpoint and fields are assumptions to
+// confirm in BR-0 (spec C2).
+func (c *Client) GenerateJITConfig(ctx context.Context, s provider.Scope, name string, labels []string) (provider.JITConfig, error) {
+	base, err := scopePath(s)
+	if err != nil {
+		return provider.JITConfig{}, err
+	}
+	body := map[string]any{"name": name, "runner_group_id": 1, "labels": labels, "work_folder": "_work"}
+	var out struct {
+		Runner struct {
+			ID int64 `json:"id"`
+		} `json:"runner"`
+		Encoded string `json:"encoded_jit_config"`
+	}
+	if err := c.send(ctx, http.MethodPost, base+"/actions/runners/generate-jitconfig", body, &out); err != nil {
+		return provider.JITConfig{}, err
+	}
+	if out.Encoded == "" {
+		return provider.JITConfig{}, diag.New(diag.CodeRegistrationFailed, "GitHub returned no just-in-time runner config",
+			"the response had no \"encoded_jit_config\"", "see docs/decisions/0006 (C2)")
+	}
+	return provider.JITConfig{RunnerID: out.Runner.ID, Encoded: out.Encoded}, nil
 }
 
 // RegistrationToken mints a registration token. The token is returned, never stored.

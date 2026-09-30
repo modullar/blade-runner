@@ -1,140 +1,106 @@
-# BR-0 runbook: prove it on a real Mac
+# BR-0 runbook: prove the assumptions on a real Mac
 
 Everything so far was built where there is no Mac and no route to the live GitHub API. This
-runbook is how you (on your Mac, logged in to its desktop) answer the open questions. Paste the
-output back, and the answers go into `docs/decisions/`. Nothing here needs more than a few
-minutes, and it ends with everything removed.
+runbook answers the open questions (ADR 0006, "Assumptions") with real behaviour.
 
-**Risk.** `modullar/blade-runner` is public. Do step 1 first. The hook is designed to refuse
-everyone but you, but it is exactly what this runbook tests, so until step 6 passes treat your
-Mac as unprotected: do not leave the runner running.
+**It is safe by construction.** Nothing here installs a runner, registers a service, or lets any
+workflow run on your Mac. `bladerunner probe` only reads from GitHub. The one write is a temporary
+just-in-time runner registration that is deleted in the same run (skip it with `--skip-jit`).
+Do **not** run `bladerunner apply`: until the supervisor exists (ADR 0006, increment 3), nothing
+protects a machine that runs a host-installed runner.
 
 ## 0. Prerequisites
 
 ```sh
-brew install go          # Go 1.24 or newer
-xcode-select --install   # if `git --version` does not work
+brew install go                 # Go 1.24 or newer
+brew install --cask docker      # or Colima/OrbStack; `docker version` must work
 git clone https://github.com/modullar/blade-runner && cd blade-runner
 git checkout claude/optimistic-lovelace-kzj98s
 ```
 
-## 1. Lock the repository down first
-
-GitHub > blade-runner > Settings > Actions > General:
-- **Fork pull request workflows from outside collaborators**: "Require approval for all outside collaborators".
-- Settings > Collaborators: nobody but you with write access.
-
-## 2. Run the test suites for real
+## 1. Run the test suites on the real Mac
 
 ```sh
-go test -count=1 ./...                                   # the ordinary suite
-go test -tags integration -v -count=1 ./internal/platform/integration   # REAL launchd
+go vet ./... && go test -count=1 ./...
 ```
 
-The second one installs a harmless service (a script that sleeps) under a unique name, starts,
-stops and reloads it, then uninstalls it. **Expected: PASS.** If it fails or skips, paste the
-output; it is the first real test of the macOS code.
+This includes `./internal/isolation`, which drives the **real Docker** (create, audit, run, remove)
+on your machine. **Expected: all `ok`.** A failure in `isolation` is the most useful result: paste
+the output, because it means Docker on Mac behaves differently from the Linux that built this.
 
-## 3. Create a token and initialise
+## 2. Make a signed commit (answers C1)
 
-Create a token on GitHub (Settings > Developer settings > Fine-grained tokens, limited to this
-repository). Start with **Administration: read and write**; if a step below reports BR-E021,
-note which permission fixes it. That answers spec A2.
+Admission needs commits signed with an **ed25519 SSH key** (RSA, ECDSA and GPG are refused).
 
 ```sh
-go build -o bladerunner ./cmd/bladerunner
-pbpaste | ./bladerunner init --scope repo --repository modullar/blade-runner \
-  --name mac-br0 --allow-public-runner --token-stdin     # token copied to the clipboard first
+ssh-keygen -t ed25519 -f ~/.ssh/br_signing -C "blade-runner signing"   # skip if you have one
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/br_signing.pub
+git config --global commit.gpgsign true
 ```
 
-## 4. A probe workflow
-
-On a new branch (a `push` trigger runs from the branch, so nothing needs to be on `main`):
+Add `br_signing.pub` on GitHub as a **Signing key** (Settings > SSH and GPG keys), then:
 
 ```sh
 git checkout -b br0-probe
-mkdir -p .github/workflows
-cat > .github/workflows/br0.yml <<'YML'
+git commit --allow-empty -m "BR-0: signed commit"
+git push -u origin br0-probe
+```
+
+GitHub should show "Verified" on that commit.
+
+## 3. Give the probe something to look at (answers C3)
+
+The probe reads run and job records. Trigger one run on GitHub-hosted runners (nothing on your
+Mac): add `.github/workflows/br0.yml` on the `br0-probe` branch and push.
+
+```yaml
 name: br0
 on: [push]
 jobs:
   probe:
-    runs-on: self-hosted
-    if: github.actor == 'modullar'
+    runs-on: ubuntu-latest
     steps:
-      - run: |
-          echo "actor=$GITHUB_ACTOR event=$GITHUB_EVENT_NAME repo=$GITHUB_REPOSITORY"
-          uname -a; id
-YML
-git add .github && git commit -qm "BR-0 probe"
+      - run: echo hello
 ```
 
-## 5. Apply, then check health
+Wait for it to finish (or leave it queued; either is useful).
+
+## 4. Create a token and run the probe (answers A2, C1, C2, C3, H6)
+
+Create a **fine-grained token** limited to this repository (Settings > Developer settings).
+Start with **Administration: read and write** and **Actions: read**; if the probe reports which
+call was refused (403), note which permission fixes it: that is the answer to A2.
 
 ```sh
-./bladerunner apply --dry-run        # read the plan
-./bladerunner apply --allow-public-runner --fork-approval-confirmed
-./bladerunner doctor
+go build -o bladerunner ./cmd/bladerunner
+read -rs BLADERUNNER_TOKEN && export BLADERUNNER_TOKEN    # paste the token, press return
+./bladerunner probe github --repository modullar/blade-runner
 ```
 
-**Record:** did apply reach "done"? Did `doctor` pass everything? (A3, A6, A2.) If `apply` stops,
-the error code and message are the finding.
+The report contains no secrets, so paste it back as is. Each line is `PASS`, `FAIL`, `SKIP`
+or `NOTE`, with the assumption id. The exit status is 1 if anything failed.
 
-## 6. The test that matters: does the hook enforce?
+Useful variants:
 
 ```sh
-git push -u origin br0-probe         # the probe runs on your Mac, as you
+./bladerunner probe github --repository modullar/blade-runner --skip-jit   # no temporary runner at all
 ```
 
-**Expected:** the `probe` job runs and prints `actor=modullar ...`. The job log's "Set up job"
-step should show the hook's line `bladerunner: allowed: modullar's push on modullar/blade-runner`.
-That shows H1 to H3.
-
-Now make the same job fail for the *right* reason: change who the hook trusts, by editing its
-policy file directly (not the config, and not through `apply`, which would repair it), and push
-again.
+## 5. Clean up
 
 ```sh
-P=~/.bladerunner/runners/mac-br0/hooks/policy.json
-sed -i '' 's/"modullar"/"someone-else"/' "$P" && cat "$P"
-git commit --allow-empty -qm "BR-0: the hook must refuse me now" && git push
-```
-
-**Expected:** the job **fails before any step runs**, with `bladerunner: REFUSED this job:
-modullar is not a trusted actor ...`. If instead it runs and prints `actor=modullar`, **the hook
-is not enforcing (H1 or H2 is false): stop, run step 8, and tell me.** That is the most
-important result of the whole runbook.
-
-Then let `apply` repair the tampering (this also tests that it notices and restarts the runner):
-
-```sh
-./bladerunner doctor                 # expected: job-hook FAILS (policy out of date)
-./bladerunner apply --allow-public-runner --fork-approval-confirmed   # expected: job-hook, service-running
-./bladerunner doctor                 # expected: all green
-```
-
-Next, a pull request from a branch of the same repository (this tests H4): open a PR from
-`br0-probe` into `main`. **Expected:** the probe job runs. If you have a second GitHub account,
-fork the repository with it and open a PR from the fork: **Expected:** the run waits for your
-approval, and if you approve it, the job is **refused** by the hook (it comes from a fork).
-
-## 7. Record what you saw
-
-| Question | Answer |
-|----------|--------|
-| A2: which token permission was enough? | |
-| A3: did `config.sh` register with the token in the environment? | |
-| A4: how long does a job wait when the runner is offline (stop the service with `launchctl bootout gui/$(id -u)/dev.bladerunner.runner.mac-br0`, push, and watch)? | |
-| A6: did the LaunchAgent start and survive `launchctl bootout`/`bootstrap`? | |
-| H1/H2: was the owner refused when the policy did not trust them? | |
-| H3/H4/H5: were the `GITHUB_*` values and the event payload present? | |
-| H6: did `apply` read the fork-approval setting, or ask for `--fork-approval-confirmed`? | |
-
-## 8. Clean up
-
-```sh
-./bladerunner remove --yes
+unset BLADERUNNER_TOKEN
 git checkout main && git branch -D br0-probe && git push origin --delete br0-probe
 ```
 
-Revoke the token on GitHub. `remove` leaves `bladerunner.yaml` and your branches alone.
+Revoke the token on GitHub. If the probe ever printed that it could not delete its temporary
+runner, remove it under Settings > Actions > Runners.
+
+## 6. What to send back
+
+1. The output of step 1 if anything failed (otherwise just "all ok").
+2. The full probe report from step 4.
+3. Which token permissions you used.
+
+With these, the supervisor is built on confirmed behaviour instead of assumptions.

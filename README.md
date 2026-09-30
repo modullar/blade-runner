@@ -87,8 +87,12 @@ go test -race ./...       # hermetic: real files, real processes, real git, a fa
 go test -tags integration -v -count=1 ./internal/platform/integration
 ```
 
-The integration test skips, saying why, where there is no service manager. The full BR-0
-procedure for a real Mac is in [docs/BR-0-runbook.md](docs/BR-0-runbook.md).
+The integration test skips, saying why, where there is no service manager.
+
+To check the GitHub behaviour the design assumes, without installing anything:
+`bladerunner probe github --repository OWNER/REPO` (read-only; its one write is a temporary
+just-in-time runner that it deletes). The safe BR-0 procedure for a real Mac is in
+[docs/BR-0-runbook.md](docs/BR-0-runbook.md).
 
 No third-party modules; see [decision 0001](docs/decisions/0001-language-and-dependencies.md).
 CI (`.github/workflows/ci.yml`) runs these on Linux and macOS and cross-compiles darwin and

@@ -99,6 +99,9 @@ installs the login-based hook of 0005. `trust verify` only reports what admissio
 
 ## Assumptions to verify in BR-0
 
+`bladerunner probe github --repository OWNER/REPO` checks C1, C2 and C3 (and A2, H6) against the
+real GitHub and prints a report with no secrets; see [the runbook](../BR-0-runbook.md).
+
 | # | Assumption | If wrong |
 |---|------------|----------|
 | C1 | `GET /repos/{r}/git/commits/{sha}` returns `verification.payload` and `verification.signature` for a signed commit even when GitHub cannot verify it itself | Admission cannot fetch the signed bytes that way; the fallback is to `git fetch` the object, which needs git and a credential on the host |

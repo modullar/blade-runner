@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/modullar/blade-runner/internal/cli"
+	"github.com/modullar/blade-runner/internal/provider"
 	"github.com/modullar/blade-runner/internal/testrig"
 )
 
@@ -363,4 +364,85 @@ func TestOnlyFullCommitIdsAreAccepted(t *testing.T) {
 	if code := c.run("", "trust", "verify", "--sha", commits["owner"].SHA[:10], "-c", c.cfgPath); code != cli.ExitFailure || !strings.Contains(c.err.String(), "full commit id") {
 		t.Errorf("abbreviated id: exit %d\n%s", code, c.err.String())
 	}
+}
+
+func TestProbeCommandReportsWithoutTouchingTheMachine(t *testing.T) {
+	c := newCLIRig(t)
+	c.serveCommits()
+	c.srv.AddRun("acme/widgets", providerRun(7))
+	d := func(args ...string) int {
+		c.out.Reset()
+		c.err.Reset()
+		deps := cli.Deps{
+			UserHome: c.userHome, Stdin: strings.NewReader(testrig.Token + "\n"), Stdout: &c.out, Stderr: &c.err,
+			GitHubAPIURL: c.srv.URL, GitHubWebURL: c.srv.URL,
+			Getenv: func(k string) string {
+				if k == "BLADERUNNER_TOKEN" {
+					return testrig.Token
+				}
+				return ""
+			},
+		}
+		return cli.Run(context.Background(), append([]string{"probe", "github"}, args...), deps)
+	}
+
+	if code := d("--repository", "acme/widgets"); code != cli.ExitOK {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, c.out.String(), c.err.String())
+	}
+	out := c.out.String()
+	for _, want := range []string{"[PASS] A2", "[PASS] C1", "[PASS] C3", "[PASS] C2", "no secrets", "not changed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report missing %q:\n%s", want, out)
+		}
+	}
+	for _, secret := range []string{testrig.Token, "JIT-"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("the report leaked %q", secret)
+		}
+	}
+	if left, _ := os.ReadDir(c.userHome); len(left) != 0 {
+		t.Errorf("the probe wrote to the machine: %v", left)
+	}
+	if n := len(c.srv.Runners("acme/widgets")); n != 0 {
+		t.Errorf("the probe left %d runner(s) on GitHub", n)
+	}
+
+	// The token can also come on stdin; a failing assumption exits non-zero and says so.
+	c.srv.JITUnsupported = true
+	if code := d("--repository", "acme/widgets", "--token-stdin"); code != cli.ExitFailure || !strings.Contains(c.out.String(), "At least one assumption failed") {
+		t.Errorf("a failing probe: exit %d\n%s", code, c.out.String())
+	}
+	if code := d("--repository", "acme/widgets", "--skip-jit", "--token-stdin"); code != cli.ExitOK {
+		t.Errorf("--skip-jit: exit %d\n%s", code, c.out.String())
+	}
+}
+
+func TestProbeCommandRefusesMisuse(t *testing.T) {
+	c := newCLIRig(t)
+	run := func(stdin string, getenv func(string) string, args ...string) int {
+		c.err.Reset()
+		return cli.Run(context.Background(), append([]string{"probe"}, args...),
+			cli.Deps{Stdin: strings.NewReader(stdin), Stdout: &c.out, Stderr: &c.err, GitHubAPIURL: c.srv.URL, Getenv: getenv})
+	}
+	none := func(string) string { return "" }
+	if code := run("", none, "github", "--repository", "acme/widgets"); code != cli.ExitFailure || !strings.Contains(c.err.String(), "BR-E020") {
+		t.Errorf("no token: exit %d\n%s", code, c.err.String())
+	}
+	if code := run("has space\n", none, "github", "--repository", "acme/widgets", "--token-stdin"); code != cli.ExitFailure {
+		t.Errorf("a malformed token: exit %d", code)
+	}
+	for name, args := range map[string][]string{
+		"no subcommand":    {},
+		"unknown target":   {"gitlab"},
+		"no repository":    {"github"},
+		"a bare repo name": {"github", "--repository", "widgets"},
+	} {
+		if code := run("x", none, args...); code != cli.ExitUsage {
+			t.Errorf("%s: exit %d, want 2", name, code)
+		}
+	}
+}
+
+func providerRun(id int64) provider.Run {
+	return provider.Run{ID: id, HeadSHA: strings.Repeat("a", 40), Event: "push", Status: "completed", HeadRepository: "acme/widgets", Actor: "acme"}
 }

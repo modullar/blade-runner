@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+
+	"github.com/modullar/blade-runner/internal/provider"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,8 +43,13 @@ type Server struct {
 	Down bool
 	// ForkApproval is the policy served per repository (default: the strictest).
 	// ForkApprovalUnsupported makes the endpoint answer 404, as an API that lacks it would.
-	ForkApproval            map[string]string
-	commits                 map[string]commitData // "owner/repo@sha"
+	ForkApproval map[string]string
+	commits      map[string]commitData // "owner/repo@sha"
+	commitOrder  map[string][]string   // repo -> shas, oldest first
+	runs         map[string][]provider.Run
+	jobs         map[string][]provider.Job
+	// JITUnsupported makes generate-jitconfig answer 404, as an API without it would.
+	JITUnsupported          bool
 	ForkApprovalUnsupported bool
 	// Tarball is the runner archive served; ChecksumOverride and OmitChecksum corrupt the
 	// published checksum on purpose.
@@ -95,6 +102,84 @@ func (s *Server) AddCommit(repo, sha, payload, signature string) {
 		s.commits = map[string]commitData{}
 	}
 	s.commits[repo+"@"+sha] = commitData{payload, signature}
+	if s.commitOrder == nil {
+		s.commitOrder = map[string][]string{}
+	}
+	s.commitOrder[repo] = append(s.commitOrder[repo], sha)
+}
+
+// AddRun makes a workflow run visible for repo (newest last; the API lists newest first).
+func (s *Server) AddRun(repo string, r provider.Run) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.runs == nil {
+		s.runs = map[string][]provider.Run{}
+	}
+	s.runs[repo] = append(s.runs[repo], r)
+}
+
+// AddJob makes a job visible under its run.
+func (s *Server) AddJob(repo string, j provider.Job) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.jobs == nil {
+		s.jobs = map[string][]provider.Job{}
+	}
+	s.jobs[repo] = append(s.jobs[repo], j)
+}
+
+func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request, repo string, rest []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(rest) == 1 { // GET .../actions/runs[?status=]
+		status := r.URL.Query().Get("status")
+		out := []map[string]any{}
+		all := s.runs[repo]
+		for i := len(all) - 1; i >= 0; i-- { // newest first
+			run := all[i]
+			if status != "" && run.Status != status {
+				continue
+			}
+			out = append(out, map[string]any{
+				"id": run.ID, "head_sha": run.HeadSHA, "event": run.Event, "status": run.Status,
+				"head_repository": map[string]string{"full_name": run.HeadRepository},
+				"actor":           map[string]string{"login": run.Actor},
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(out), "workflow_runs": out})
+		return
+	}
+	if len(rest) == 3 && rest[2] == "jobs" { // GET .../actions/runs/{id}/jobs
+		id, _ := strconv.ParseInt(rest[1], 10, 64)
+		out := []map[string]any{}
+		for _, j := range s.jobs[repo] {
+			if j.RunID == id {
+				var runner any
+				if j.RunnerName != "" {
+					runner = j.RunnerName
+				}
+				out = append(out, map[string]any{"id": j.ID, "run_id": j.RunID, "status": j.Status, "labels": j.Labels, "runner_name": runner, "head_sha": j.HeadSHA})
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(out), "jobs": out})
+		return
+	}
+	writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+}
+
+func (s *Server) handleCommitList(w http.ResponseWriter, r *http.Request, repo string) {
+	s.mu.Lock()
+	order := append([]string(nil), s.commitOrder[repo]...)
+	s.mu.Unlock()
+	if _, known := s.Repos[repo]; !known {
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+		return
+	}
+	out := []map[string]string{}
+	for i := len(order) - 1; i >= 0; i-- {
+		out = append(out, map[string]string{"sha": order[i]})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, repo, sha string) {
@@ -189,6 +274,13 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Repository visibility is readable without a token for public repositories.
+	if parts := strings.Split(strings.Trim(p, "/"), "/"); len(parts) == 4 && parts[0] == "repos" && parts[3] == "commits" && r.Method == http.MethodGet {
+		if !s.authorized(w, r) {
+			return
+		}
+		s.handleCommitList(w, r, parts[1]+"/"+parts[2])
+		return
+	}
 	if parts := strings.Split(strings.Trim(p, "/"), "/"); len(parts) == 6 && parts[0] == "repos" && parts[3] == "git" && parts[4] == "commits" && r.Method == http.MethodGet {
 		s.handleCommit(w, r, parts[1]+"/"+parts[2], parts[5])
 		return
@@ -267,6 +359,10 @@ func (s *Server) handleRunners(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	target, rest, ok := s.scopeTarget(parts)
+	if ok && len(rest) >= 1 && rest[0] == "runs" && r.Method == http.MethodGet {
+		s.handleRuns(w, r, parts[1]+"/"+parts[2], rest)
+		return
+	}
 	if !ok || len(rest) == 0 || rest[0] != "runners" {
 		writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
 		return
@@ -274,6 +370,23 @@ func (s *Server) handleRunners(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch {
+	case r.Method == http.MethodPost && len(rest) == 2 && rest[1] == "generate-jitconfig":
+		if s.JITUnsupported {
+			writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+			return
+		}
+		var req struct {
+			Name   string   `json:"name"`
+			Labels []string `json:"labels"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Name == "" {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"message": "name is required"})
+			return
+		}
+		s.register(target, req.Name, req.Labels, false) // registered, but nothing has started it
+		id := s.runners[target][len(s.runners[target])-1].ID
+		writeJSON(w, http.StatusCreated, map[string]any{"runner": map[string]any{"id": id, "name": req.Name}, "encoded_jit_config": fmt.Sprintf("JIT-%d", id)})
 	case r.Method == http.MethodGet && len(rest) == 1:
 		perPage, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
 		page, _ := strconv.Atoi(r.URL.Query().Get("page"))

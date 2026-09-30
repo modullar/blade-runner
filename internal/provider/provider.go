@@ -67,6 +67,16 @@ type Provider interface {
 	// Commit returns a commit's signed bytes and signature, exactly as stored. The caller does
 	// not trust them: it recomputes the commit id and checks the signature itself.
 	Commit(ctx context.Context, repository, sha string) (Commit, error)
+	// ListCommits returns up to limit recent commit ids of the repository's default branch.
+	ListCommits(ctx context.Context, repository string, limit int) ([]string, error)
+	// ListRuns returns recent workflow runs, newest first. status filters (queued, in_progress,
+	// completed); "" means any.
+	ListRuns(ctx context.Context, repository, status string) ([]Run, error)
+	// ListJobs returns the jobs of one workflow run.
+	ListJobs(ctx context.Context, repository string, runID int64) ([]Job, error)
+	// GenerateJITConfig registers a single-use runner and returns the config that starts it.
+	// The runner is registered the moment this returns: remove it if it is not used.
+	GenerateJITConfig(ctx context.Context, scope Scope, name string, labels []string) (JITConfig, error)
 	ListRunners(ctx context.Context, scope Scope) ([]Runner, error)
 	RemoveRunner(ctx context.Context, scope Scope, id int64) error
 	// RegistrationURL is the URL handed to the runner's configure script.
@@ -80,6 +90,32 @@ type Commit struct {
 	SHA       string
 	Payload   string
 	Signature string
+}
+
+// Run is a workflow run: what would execute, and on whose behalf.
+type Run struct {
+	ID             int64
+	HeadSHA        string // the commit the run executes (for a pull request, the merge commit)
+	Event          string
+	Status         string
+	HeadRepository string // where the commit lives: differs from the repository for a fork
+	Actor          string
+}
+
+// Job is one job of a run.
+type Job struct {
+	ID         int64
+	RunID      int64
+	Status     string
+	Labels     []string
+	RunnerName string
+	HeadSHA    string
+}
+
+// JITConfig is a just-in-time runner registration.
+type JITConfig struct {
+	RunnerID int64
+	Encoded  string // secret: it starts a runner; never log it or put it on a command line
 }
 
 // StrictForkApproval is the policy under which every outside contributor's workflow run

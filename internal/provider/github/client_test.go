@@ -347,3 +347,78 @@ func TestCommitErrorsAreMappedNotSwallowed(t *testing.T) {
 		t.Errorf("GitHub down: %v", err)
 	}
 }
+
+func TestListRunsAndJobsDecodeWhatTheSupervisorNeeds(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	s.AddRun("acme/widgets", provider.Run{ID: 1, HeadSHA: strings.Repeat("a", 40), Event: "push", Status: "completed", HeadRepository: "acme/widgets", Actor: "acme"})
+	s.AddRun("acme/widgets", provider.Run{ID: 2, HeadSHA: strings.Repeat("b", 40), Event: "pull_request", Status: "queued", HeadRepository: "mallory/widgets", Actor: "mallory"})
+	s.AddJob("acme/widgets", provider.Job{ID: 20, RunID: 2, Status: "queued", Labels: []string{"self-hosted", "gpu"}, HeadSHA: strings.Repeat("b", 40)})
+	s.AddJob("acme/widgets", provider.Job{ID: 21, RunID: 2, Status: "in_progress", Labels: []string{"self-hosted"}, RunnerName: "r1", HeadSHA: strings.Repeat("b", 40)})
+	c := newClient(s, "ghp_testtoken")
+
+	all, err := c.ListRuns(ctx, "acme/widgets", "")
+	if err != nil || len(all) != 2 || all[0].ID != 2 {
+		t.Fatalf("runs = %+v, %v (newest first)", all, err)
+	}
+	if all[0].HeadRepository != "mallory/widgets" || all[0].Actor != "mallory" || all[0].Event != "pull_request" {
+		t.Errorf("a fork's pull request must be distinguishable: %+v", all[0])
+	}
+	queued, _ := c.ListRuns(ctx, "acme/widgets", "queued")
+	if len(queued) != 1 || queued[0].ID != 2 {
+		t.Errorf("status filter: %+v", queued)
+	}
+	jobs, err := c.ListJobs(ctx, "acme/widgets", 2)
+	if err != nil || len(jobs) != 2 || jobs[0].Labels[1] != "gpu" || jobs[1].RunnerName != "r1" || jobs[0].RunnerName != "" {
+		t.Errorf("jobs = %+v, %v", jobs, err)
+	}
+	if none, err := c.ListJobs(ctx, "acme/widgets", 999); err != nil || len(none) != 0 {
+		t.Errorf("a run with no jobs: %+v %v", none, err)
+	}
+	if _, err := newClient(s, "ghp_wrong").ListRuns(ctx, "acme/widgets", ""); diag.CodeOf(err) != diag.CodeTokenRejected {
+		t.Errorf("wrong token: %v", err)
+	}
+}
+
+func TestListCommitsNewestFirst(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	s.AddCommit("acme/widgets", strings.Repeat("1", 40), "p", "s")
+	s.AddCommit("acme/widgets", strings.Repeat("2", 40), "p", "s")
+	got, err := newClient(s, "ghp_testtoken").ListCommits(ctx, "acme/widgets", 10)
+	if err != nil || len(got) != 2 || got[0] != strings.Repeat("2", 40) {
+		t.Errorf("commits = %v, %v", got, err)
+	}
+	if _, err := newClient(s, "ghp_testtoken").ListCommits(ctx, "ghost/none", 10); err == nil {
+		t.Error("an unknown repository must be an error")
+	}
+}
+
+func TestGenerateJITConfigRegistersAnOfflineSingleUseRunner(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	c := newClient(s, "ghp_testtoken")
+	scope := provider.Scope{Kind: "repo", Repository: "acme/widgets"}
+
+	cfg, err := c.GenerateJITConfig(ctx, scope, "job-runner-1", []string{"self-hosted", "br"})
+	if err != nil || cfg.Encoded == "" || cfg.RunnerID == 0 {
+		t.Fatalf("cfg = %+v, %v", cfg, err)
+	}
+	got := s.Runners("acme/widgets")
+	if len(got) != 1 || got[0].Name != "job-runner-1" || got[0].Online || got[0].Labels[1] != "br" {
+		t.Errorf("registered runners = %+v: it exists but nothing has started it", got)
+	}
+	if err := c.RemoveRunner(ctx, scope, cfg.RunnerID); err != nil {
+		t.Fatal(err)
+	}
+	s.JITUnsupported = true
+	if _, err := c.GenerateJITConfig(ctx, scope, "x", nil); err == nil {
+		t.Error("an API without JIT must be an error")
+	}
+	if _, err := c.GenerateJITConfig(ctx, provider.Scope{Kind: "repo", Repository: "noslash"}, "x", nil); err == nil {
+		t.Error("a malformed scope must be refused")
+	}
+	if _, err := newClient(s, "ghp_wrong").GenerateJITConfig(ctx, scope, "x", nil); diag.CodeOf(err) != diag.CodeTokenRejected {
+		t.Errorf("wrong token: %v", err)
+	}
+}

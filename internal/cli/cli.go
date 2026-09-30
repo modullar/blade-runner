@@ -128,6 +128,7 @@ Commands:
   doctor    check prerequisites, token, registration and service health
   remove    deregister the runner and delete everything it installed
   trust     manage which signing keys may run code here (add, list, revoke, verify)
+  probe     check the GitHub behaviours this design assumes (read-only; see docs/BR-0-runbook.md)
   version   print the version
 
 Run "bladerunner <command> -h" for a command's flags.
@@ -153,6 +154,8 @@ func Run(ctx context.Context, args []string, d Deps) int {
 		err = cmdHook(ctx, rest, &d)
 	case "trust":
 		err = cmdTrust(ctx, rest, &d)
+	case "probe":
+		err = cmdProbe(ctx, rest, &d)
 	case "remove":
 		err = cmdRemove(ctx, rest, &d)
 	case "version", "--version":
