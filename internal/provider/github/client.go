@@ -198,6 +198,37 @@ func (c *Client) ForkApprovalPolicy(ctx context.Context, repository string) (str
 	return out.Policy, nil
 }
 
+var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// Commit fetches a commit's signed payload and signature. It uses the token when one is
+// configured (a private repository needs it). It returns exactly what GitHub stores; the caller
+// must recompute the commit id and verify the signature, because nothing here is checked. The
+// "verification.payload" and "verification.signature" fields are assumptions to confirm in BR-0.
+func (c *Client) Commit(ctx context.Context, repository, sha string) (provider.Commit, error) {
+	if !shaRe.MatchString(sha) {
+		return provider.Commit{}, diag.New(diag.CodeNotAdmitted, fmt.Sprintf("%q is not a full commit id", sha),
+			"a commit must be named by its full 40-character id", "use the full SHA")
+	}
+	var out struct {
+		SHA          string `json:"sha"`
+		Verification struct {
+			Signature *string `json:"signature"`
+			Payload   *string `json:"payload"`
+		} `json:"verification"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/git/commits/"+sha, c.Token != nil, &out); err != nil {
+		return provider.Commit{}, err
+	}
+	cm := provider.Commit{SHA: out.SHA}
+	if out.Verification.Signature != nil {
+		cm.Signature = *out.Verification.Signature
+	}
+	if out.Verification.Payload != nil {
+		cm.Payload = *out.Verification.Payload
+	}
+	return cm, nil
+}
+
 // RegistrationToken mints a registration token. The token is returned, never stored.
 func (c *Client) RegistrationToken(ctx context.Context, s provider.Scope) (string, error) {
 	base, err := scopePath(s)

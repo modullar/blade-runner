@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -24,6 +26,7 @@ import (
 	"github.com/modullar/blade-runner/internal/provider/github"
 	"github.com/modullar/blade-runner/internal/provider/github/githubtest"
 	"github.com/modullar/blade-runner/internal/secrets"
+	"github.com/modullar/blade-runner/internal/trust"
 )
 
 // What githubtest accepts and what BaseConfig names.
@@ -157,6 +160,7 @@ func New(t *testing.T, configYAML string) *Rig {
 		Exec:     execx.OS{},
 		Fetcher:  &download.Fetcher{AllowHTTP: true},
 		State:    &core.StateStore{Path: layout.StateFile()},
+		Trust:    &trust.Store{Path: layout.TrustFile()},
 		Euid:     func() int { return 1000 },
 	}
 	env.BinaryPath = Binary(t)
@@ -264,4 +268,50 @@ func Binary(t testing.TB) string {
 		t.Fatalf("cannot build the bladerunner binary: %v", binErr)
 	}
 	return binPath
+}
+
+// RealCommit is a commit made by the real `git commit -S` with a real ssh-keygen key (see
+// internal/trust/testdata/real), split the way GitHub's API returns it.
+type RealCommit struct {
+	SHA       string
+	Payload   string
+	Signature string
+}
+
+// RealFixtures loads the real signed-commit fixtures: commits by "owner" and "mallory" (two
+// different keys) and an "unsigned" one, plus each signer's public key line.
+func RealFixtures(t testing.TB) (commits map[string]RealCommit, pubkeys map[string]string) {
+	t.Helper()
+	_, file, _, _ := runtime.Caller(0)
+	dir := filepath.Join(filepath.Dir(file), "..", "trust", "testdata", "real")
+	read := func(name string) []byte {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	commits, pubkeys = map[string]RealCommit{}, map[string]string{}
+	for _, l := range strings.Split(strings.TrimSpace(string(read("shas.txt"))), "\n") {
+		f := strings.Fields(l)
+		payload, sig, err := trust.SplitSignedCommit(read(f[0] + "-commit.raw"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		commits[f[0]] = RealCommit{SHA: f[1], Payload: string(payload), Signature: sig}
+	}
+	for _, who := range []string{"owner", "mallory"} {
+		pubkeys[who] = strings.TrimSpace(string(read(who + ".pub")))
+	}
+	return commits, pubkeys
+}
+
+// ServeCommits publishes the real fixtures on the fake GitHub for repo.
+func (r *Rig) ServeCommits(repo string) map[string]RealCommit {
+	r.T.Helper()
+	commits, _ := RealFixtures(r.T)
+	for _, c := range commits {
+		r.Srv.AddCommit(repo, c.SHA, c.Payload, c.Signature)
+	}
+	return commits
 }

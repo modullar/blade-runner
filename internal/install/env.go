@@ -15,6 +15,7 @@ import (
 	"github.com/modullar/blade-runner/internal/platform"
 	"github.com/modullar/blade-runner/internal/provider"
 	"github.com/modullar/blade-runner/internal/secrets"
+	"github.com/modullar/blade-runner/internal/trust"
 )
 
 // Layout is where one runner's files live: everything for runner NAME sits under
@@ -31,6 +32,7 @@ func (l Layout) LogDir() string      { return filepath.Join(l.RunnerHome(), "log
 func (l Layout) DownloadDir() string { return filepath.Join(l.RunnerHome(), "downloads") }
 func (l Layout) StateFile() string   { return filepath.Join(l.RunnerHome(), "state.json") }
 func (l Layout) HooksDir() string    { return filepath.Join(l.RunnerHome(), "hooks") }
+func (l Layout) TrustFile() string   { return filepath.Join(l.RunnerHome(), "trust.json") }
 func (l Layout) SecretsDir() string  { return filepath.Join(l.Home, "secrets") }
 
 // ExpandHome turns a leading ~ into the user's home directory.
@@ -58,6 +60,8 @@ type Env struct {
 	Exec     execx.Runner
 	Fetcher  *download.Fetcher
 	State    *core.StateStore
+	// Trust holds the public keys whose signed commits may run here.
+	Trust *trust.Store
 
 	// BinaryPath is this program's own path: the job hook script calls it back (`bladerunner
 	// hook job-started`), so it is recorded in the script and must be stable.

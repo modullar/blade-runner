@@ -64,10 +64,22 @@ type Provider interface {
 	// ForkApprovalPolicy returns the repository's "approval for running fork pull request
 	// workflows" setting (see docs/decisions/0005). The endpoint is an unverified assumption.
 	ForkApprovalPolicy(ctx context.Context, repository string) (string, error)
+	// Commit returns a commit's signed bytes and signature, exactly as stored. The caller does
+	// not trust them: it recomputes the commit id and checks the signature itself.
+	Commit(ctx context.Context, repository, sha string) (Commit, error)
 	ListRunners(ctx context.Context, scope Scope) ([]Runner, error)
 	RemoveRunner(ctx context.Context, scope Scope, id int64) error
 	// RegistrationURL is the URL handed to the runner's configure script.
 	RegistrationURL(scope Scope) string
+}
+
+// Commit is what the provider reports for a commit id. Payload is the commit object without
+// its signature (what was signed) and Signature the armored signature, or "" if unsigned.
+// Nothing in it is verified by the provider's word: see internal/trust.
+type Commit struct {
+	SHA       string
+	Payload   string
+	Signature string
 }
 
 // StrictForkApproval is the policy under which every outside contributor's workflow run

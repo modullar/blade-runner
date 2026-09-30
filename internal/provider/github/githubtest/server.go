@@ -42,6 +42,7 @@ type Server struct {
 	// ForkApproval is the policy served per repository (default: the strictest).
 	// ForkApprovalUnsupported makes the endpoint answer 404, as an API that lacks it would.
 	ForkApproval            map[string]string
+	commits                 map[string]commitData // "owner/repo@sha"
 	ForkApprovalUnsupported bool
 	// Tarball is the runner archive served; ChecksumOverride and OmitChecksum corrupt the
 	// published checksum on purpose.
@@ -80,6 +81,39 @@ func New() *Server {
 	}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.handle))
 	return s
+}
+
+type commitData struct{ payload, signature string }
+
+// AddCommit serves a commit (its signed payload and signature) for repo at sha. Pass the
+// signature "" for an unsigned commit. The server returns whatever it is given: it does not
+// check that the sha is the hash of the content, so tests can model a dishonest server.
+func (s *Server) AddCommit(repo, sha, payload, signature string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.commits == nil {
+		s.commits = map[string]commitData{}
+	}
+	s.commits[repo+"@"+sha] = commitData{payload, signature}
+}
+
+func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, repo, sha string) {
+	private, known := s.Repos[repo]
+	authed := r.Header.Get("Authorization") == "Bearer "+s.Token
+	s.mu.Lock()
+	cd, have := s.commits[repo+"@"+sha]
+	s.mu.Unlock()
+	if !known || !have || (private && !authed) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+		return
+	}
+	v := map[string]any{"verified": false, "reason": "unknown_key", "signature": nil, "payload": nil}
+	if cd.signature != "" {
+		v["signature"], v["payload"] = cd.signature, cd.payload
+	} else {
+		v["reason"] = "unsigned"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sha": sha, "verification": v})
 }
 
 // Requests returns "METHOD /path" for every request so far.
@@ -155,6 +189,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Repository visibility is readable without a token for public repositories.
+	if parts := strings.Split(strings.Trim(p, "/"), "/"); len(parts) == 6 && parts[0] == "repos" && parts[3] == "git" && parts[4] == "commits" && r.Method == http.MethodGet {
+		s.handleCommit(w, r, parts[1]+"/"+parts[2], parts[5])
+		return
+	}
 	if parts := strings.Split(strings.Trim(p, "/"), "/"); len(parts) == 3 && parts[0] == "repos" && r.Method == http.MethodGet {
 		s.handleRepo(w, r, parts[1]+"/"+parts[2])
 		return

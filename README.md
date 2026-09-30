@@ -14,7 +14,14 @@ bladerunner doctor    # prerequisites, token, registration, service, disk
 bladerunner remove    # deregister and delete everything it installed
 ```
 
-**Only your code runs on your machine.** `apply` installs a *job hook* that the runner runs
+**Direction (partly built): permission is a public key, and jobs run isolated.** A contributor
+is allowed to run code here when the owner adds their public key (`bladerunner trust add`); the
+host then checks, itself, that a commit is signed by a trusted key, with no reliance on GitHub's
+word. Verification is built and tested (`bladerunner trust verify`); running jobs only when it
+passes, and running them in isolated containers, are not built yet. See
+[decision 0006](docs/decisions/0006-signed-admission-and-isolation.md).
+
+**Only your code runs on your machine (what is in force today).** `apply` installs a *job hook* that the runner runs
 before every job and that refuses anyone not in `runner.trusted_actors` (default: the
 repository owner), any other repository, any event outsiders can cause, and any pull request
 from a fork, and refuses whenever it cannot tell. Each person sets up their own runner for
@@ -54,6 +61,8 @@ internal/yamlsubset/    the strict YAML subset the config uses (standard library
 internal/core/          idempotent, resumable step engine; state file; directory lock
 internal/hook/          the job-started policy: who may run jobs here (the enforcement)
 internal/guard/         workflow scan: defence in depth, not the enforcement
+internal/trust/         ed25519 SSH-signature verification of commits; the trust store
+internal/admit/         "may this commit run here?": provider bytes checked by internal/trust
 internal/install/       the gates and steps behind apply and remove
 internal/doctor/        diagnosis
 internal/provider/      CI-provider interface; github/ is the v1 implementation

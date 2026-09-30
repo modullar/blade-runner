@@ -188,6 +188,26 @@ or policy, a missing `.env` entry, or a `bladerunner` program that has moved (th
 it, and every job is refused while it is gone). Run `bladerunner apply`: it rewrites what is
 wrong and restarts the runner so it picks the hook up.
 
+### BR-E066
+
+**The trust store cannot be read or written.** It is the file of public keys this machine
+trusts (`~/.bladerunner/runners/<name>/trust.json`), and its content decides which commits may
+run, so it is never guessed at: a malformed file stops everything rather than being treated as
+empty. Restore it from a backup, or move it aside and re-add keys with `bladerunner trust add`.
+Adding a key that is already trusted, reusing a name, or re-adding a revoked key is refused here
+too: a revoked key stays revoked.
+
+### BR-E067
+
+**A commit is not admitted to run on this machine.** This machine runs only commits signed by a
+key in its trust store, and it checks that itself: the commit is signed; the signed bytes hash
+to the commit id (so they cannot be swapped for others); the signature is valid for the key it
+names; and that key is trusted, unexpired and unrevoked. The message says which check failed.
+To give someone permission, add their *public* key: `bladerunner trust add --name alice --key
+alice.pub`; they sign commits with the matching private key (`git config gpg.format ssh`,
+`git commit -S`). To take it back: `bladerunner trust revoke alice`. Only SSH signatures with
+ed25519 keys are supported.
+
 ### BR-E070
 
 **Low disk space** where the runner works. Below 10 GiB free is a warning and below 2 GiB a

@@ -1,5 +1,13 @@
 # Security model: only your code runs on your machine
 
+> **Direction change, partly built.** The owner's requirement is cryptographic admission (a
+> contributor's permission is their public key in a host-held trust store, verified by the host
+> against signed commits) plus jobs that run only in isolated containers. See
+> [decision 0006](decisions/0006-signed-admission-and-isolation.md). Admission is built and
+> tested (`bladerunner trust ...`) but **is not yet consulted when a job runs**, and isolation is
+> not built. Until they land, the layers below are what is in force, and they rely on GitHub's
+> statement of who the actor is rather than on a signature.
+
 A self-hosted runner executes whatever job GitHub sends it, as you, on your machine. On a
 public repository anyone can open a pull request from a fork, and other collaborators can push
 branches. Blade Runner's rule is: **code from anyone but the people you name never runs on

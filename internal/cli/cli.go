@@ -23,6 +23,7 @@ import (
 	"github.com/modullar/blade-runner/internal/platform/host"
 	"github.com/modullar/blade-runner/internal/provider/github"
 	"github.com/modullar/blade-runner/internal/secrets"
+	"github.com/modullar/blade-runner/internal/trust"
 )
 
 // Exit codes.
@@ -126,6 +127,7 @@ Commands:
   apply     install or update the runner and its service to match the config (--dry-run first)
   doctor    check prerequisites, token, registration and service health
   remove    deregister the runner and delete everything it installed
+  trust     manage which signing keys may run code here (add, list, revoke, verify)
   version   print the version
 
 Run "bladerunner <command> -h" for a command's flags.
@@ -149,6 +151,8 @@ func Run(ctx context.Context, args []string, d Deps) int {
 		err = cmdDoctor(ctx, rest, &d)
 	case "hook":
 		err = cmdHook(ctx, rest, &d)
+	case "trust":
+		err = cmdTrust(ctx, rest, &d)
 	case "remove":
 		err = cmdRemove(ctx, rest, &d)
 	case "version", "--version":
@@ -248,6 +252,7 @@ func newEnv(d *Deps, cfg *config.Config) (*install.Env, error) {
 		Exec:     d.Exec,
 		Fetcher:  d.Fetcher,
 		State:    &core.StateStore{Path: layout.StateFile()},
+		Trust:    &trust.Store{Path: layout.TrustFile()},
 		Euid:     d.Euid,
 	}, nil
 }

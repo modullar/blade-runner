@@ -23,6 +23,11 @@ fake can only confirm the code agrees with itself.
 
 | H1 to H6 | The runner honors a job-started hook and gives it the job's identity; the fork-approval API | **Open**; see [0005](0005-only-your-code-runs-here.md). H1 is what stops other people's code, so it comes first in BR-0 | `internal/hook`, `install/jobhook.go` |
 
+| C1 to C3 | GitHub exposes a commit's signed bytes, supports one-job just-in-time runners, and names the commit a job would run | **Open**; see [0006](0006-signed-admission-and-isolation.md) | `provider/github`, future supervisor |
+
+The current direction, cryptographic admission plus isolated runners, is
+[0006](0006-signed-admission-and-isolation.md); it supersedes the login-based hook of 0005 once built.
+
 Decisions that depart from or extend the spec are in [0004](0004-deviations-and-choices.md);
 how other people's code is kept off the machine is in [0005](0005-only-your-code-runs-here.md)
 and [../security.md](../security.md).

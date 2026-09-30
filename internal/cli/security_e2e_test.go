@@ -228,3 +228,139 @@ func TestHookCommandDecidesLikeThePolicy(t *testing.T) {
 		t.Errorf("an unknown hook: exit %d, want 2", code)
 	}
 }
+
+// ---- permission by cryptographic key -------------------------------------------------
+
+func (c *cliRig) serveCommits() (map[string]testrig.RealCommit, map[string]string) {
+	c.t.Helper()
+	commits, pub := testrig.RealFixtures(c.t)
+	for _, cm := range commits {
+		c.srv.AddCommit("acme/widgets", cm.SHA, cm.Payload, cm.Signature)
+	}
+	return commits, pub
+}
+
+func (c *cliRig) writePub(name, line string) string {
+	p := filepath.Join(c.t.TempDir(), name+".pub")
+	if err := os.WriteFile(p, []byte(line+"\n"), 0o644); err != nil {
+		c.t.Fatal(err)
+	}
+	return p
+}
+
+func TestPermissionIsGrantedAndWithdrawnWithKeys(t *testing.T) {
+	c := newCLIRig(t)
+	commits, pub := c.serveCommits()
+	c.mustRun(testrig.Token+"\n", c.initArgs()...)
+	trustArgs := func(rest ...string) []string { return append([]string{"trust"}, append(rest, "-c", c.cfgPath)...) }
+	verify := func(who string) int {
+		return c.run("", append([]string{"trust", "verify", "-c", c.cfgPath, "--sha"}, commits[who].SHA)...)
+	}
+
+	// Nobody has permission yet.
+	c.mustRun("", trustArgs("list")...)
+	if !strings.Contains(c.out.String(), "nobody has permission") {
+		t.Errorf("list on an empty store:\n%s", c.out.String())
+	}
+	if code := verify("owner"); code != cli.ExitFailure || !strings.Contains(c.err.String(), "BR-E067") {
+		t.Fatalf("verify with nobody trusted: exit %d\n%s", code, c.err.String())
+	}
+
+	// The owner trusts their own key; a contributor's commit is still refused.
+	c.mustRun("", trustArgs("add", "--name", "owner", "--key", c.writePub("owner", pub["owner"]))...)
+	if !strings.Contains(c.out.String(), "owner may now run code here") {
+		t.Errorf("add output:\n%s", c.out.String())
+	}
+	c.mustRun("", "trust", "verify", "-c", c.cfgPath, "--sha", commits["owner"].SHA)
+	if !strings.Contains(c.out.String(), "admitted") || !strings.Contains(c.out.String(), "signed by owner") {
+		t.Errorf("verify output:\n%s", c.out.String())
+	}
+	if code := verify("mallory"); code != cli.ExitFailure || !strings.Contains(c.err.String(), "does not trust") || !strings.Contains(c.err.String(), "bladerunner trust add") {
+		t.Fatalf("an untrusted contributor: exit %d\n%s", code, c.err.String())
+	}
+
+	// The contributor's key arrives on stdin (as if pasted or piped): permission is granted.
+	c.mustRun(pub["mallory"]+"\n", trustArgs("add", "--name", "mallory", "--key", "-", "--expires", "2099-01-01")...)
+	if code := verify("mallory"); code != cli.ExitOK {
+		t.Fatalf("after granting: exit %d\n%s", code, c.err.String())
+	}
+	c.mustRun("", trustArgs("list")...)
+	for _, want := range []string{"owner", "mallory", "active", "2099-01-01", "never", "SHA256:"} {
+		if !strings.Contains(c.out.String(), want) {
+			t.Errorf("list missing %q:\n%s", want, c.out.String())
+		}
+	}
+	if strings.Contains(c.out.String(), "ssh-ed25519") {
+		t.Errorf("list should show fingerprints, not whole keys:\n%s", c.out.String())
+	}
+
+	// Withdrawn: refused again, and the record says why.
+	c.mustRun("", "trust", "revoke", "mallory", "-c", c.cfgPath)
+	if code := verify("mallory"); code != cli.ExitFailure || !strings.Contains(c.err.String(), "revoked") {
+		t.Fatalf("after revoking: exit %d\n%s", code, c.err.String())
+	}
+	c.mustRun("", trustArgs("list")...)
+	if !strings.Contains(c.out.String(), "revoked") {
+		t.Errorf("a revoked signer stays listed, marked revoked:\n%s", c.out.String())
+	}
+	// A revoked key cannot be quietly re-trusted under another name.
+	if code := c.run(pub["mallory"]+"\n", trustArgs("add", "--name", "mallory2", "--key", "-")...); code != cli.ExitFailure || !strings.Contains(c.err.String(), "revoked") {
+		t.Errorf("re-adding a revoked key: exit %d\n%s", code, c.err.String())
+	}
+	// The owner's own commit is unaffected.
+	if code := verify("owner"); code != cli.ExitOK {
+		t.Errorf("the owner's commit after revoking someone else: exit %d", code)
+	}
+}
+
+func TestTrustCommandsRefuseMisuse(t *testing.T) {
+	c := newCLIRig(t)
+	_, pub := c.serveCommits()
+	c.mustRun(testrig.Token+"\n", c.initArgs()...)
+	cfg := []string{"-c", c.cfgPath}
+	with := func(args ...string) []string { return append(append([]string{"trust"}, args...), cfg...) }
+
+	// A private key must be refused, not accepted or stored.
+	if code := c.run("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk=\n-----END OPENSSH PRIVATE KEY-----\n", with("add", "--name", "x", "--key", "-")...); code != cli.ExitFailure ||
+		!strings.Contains(c.err.String(), "never send a private key") {
+		t.Errorf("a private key: exit %d\n%s", code, c.err.String())
+	}
+	if strings.Contains(c.err.String(), "b3BlbnNzaC1rZXk") {
+		t.Error("the key material was echoed back")
+	}
+	// Other key types and GPG keys are refused with the supported type named.
+	for _, bad := range []string{"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7 x", "-----BEGIN PGP PUBLIC KEY BLOCK-----"} {
+		if code := c.run(bad+"\n", with("add", "--name", "x", "--key", "-")...); code != cli.ExitFailure || !strings.Contains(c.err.String(), "BR-E066") {
+			t.Errorf("%q: exit %d\n%s", bad, code, c.err.String())
+		}
+	}
+	for name, args := range map[string][]string{
+		"add without a name":    with("add", "--key", "-"),
+		"add without a key":     with("add", "--name", "x"),
+		"add with a bad date":   with("add", "--name", "x", "--key", "-", "--expires", "next week"),
+		"verify without a sha":  with("verify"),
+		"revoke with no target": with("revoke"),
+		"unknown subcommand":    with("frobnicate"),
+		"no subcommand":         {"trust"},
+	} {
+		if code := c.run(pub["owner"]+"\n", args...); code != cli.ExitUsage {
+			t.Errorf("%s: exit %d, want 2\n%s", name, code, c.err.String())
+		}
+	}
+	if code := c.run("", with("add", "--name", "x", "--key", filepath.Join(t.TempDir(), "absent.pub"))...); code != cli.ExitFailure {
+		t.Errorf("a missing key file: exit %d", code)
+	}
+	if code := c.run("", with("revoke", "nobody")...); code != cli.ExitFailure || !strings.Contains(c.err.String(), "BR-E066") {
+		t.Errorf("revoking nobody: exit %d\n%s", code, c.err.String())
+	}
+}
+
+func TestOnlyFullCommitIdsAreAccepted(t *testing.T) {
+	c := newCLIRig(t)
+	commits, pub := c.serveCommits()
+	c.mustRun(testrig.Token+"\n", c.initArgs()...)
+	c.mustRun("", "trust", "add", "--name", "owner", "--key", c.writePub("o", pub["owner"]), "-c", c.cfgPath)
+	if code := c.run("", "trust", "verify", "--sha", commits["owner"].SHA[:10], "-c", c.cfgPath); code != cli.ExitFailure || !strings.Contains(c.err.String(), "full commit id") {
+		t.Errorf("abbreviated id: exit %d\n%s", code, c.err.String())
+	}
+}

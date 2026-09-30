@@ -301,3 +301,49 @@ func TestForkApprovalPolicy(t *testing.T) {
 		t.Errorf("wrong token: %v", err)
 	}
 }
+
+func TestCommitReturnsTheSignedBytesExactlyAsStored(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	sha := strings.Repeat("ab", 20)
+	s.AddCommit("acme/widgets", sha, "tree x\n\nmsg\n", "-----BEGIN SSH SIGNATURE-----\nAAA\n-----END SSH SIGNATURE-----")
+	s.AddCommit("acme/widgets", strings.Repeat("cd", 20), "tree y\n\nunsigned\n", "")
+	c := newClient(s, "ghp_testtoken")
+
+	got, err := c.Commit(ctx, "acme/widgets", sha)
+	if err != nil || got.SHA != sha || got.Payload != "tree x\n\nmsg\n" || !strings.HasPrefix(got.Signature, "-----BEGIN SSH SIGNATURE-----") {
+		t.Fatalf("Commit = %+v, %v", got, err)
+	}
+	unsigned, err := c.Commit(ctx, "acme/widgets", strings.Repeat("cd", 20))
+	if err != nil || unsigned.Signature != "" || unsigned.Payload != "" {
+		t.Errorf("an unsigned commit has no signature or payload to offer: %+v, %v", unsigned, err)
+	}
+}
+
+func TestCommitRefusesAnythingButAFullCommitId(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	c := newClient(s, "ghp_testtoken")
+	for _, bad := range []string{"", "main", "abc123", strings.Repeat("A", 40), strings.Repeat("g", 40), "../../x", strings.Repeat("a", 41), "a/b"} {
+		if _, err := c.Commit(ctx, "acme/widgets", bad); diag.CodeOf(err) != diag.CodeNotAdmitted {
+			t.Errorf("%q: err = %v, want BR-E067", bad, err)
+		}
+	}
+	if n := len(s.Requests()); n != 0 {
+		t.Errorf("a malformed id must be refused before any request (made %d)", n)
+	}
+}
+
+func TestCommitErrorsAreMappedNotSwallowed(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	sha := strings.Repeat("ab", 20)
+	s.AddCommit("acme/widgets", sha, "p", "s")
+	if _, err := newClient(s, "ghp_testtoken").Commit(ctx, "acme/widgets", strings.Repeat("ef", 20)); err == nil {
+		t.Error("an unknown commit must be an error")
+	}
+	s.Down = true
+	if _, err := newClient(s, "ghp_testtoken").Commit(ctx, "acme/widgets", sha); diag.CodeOf(err) != diag.CodeGitHubUnavailable {
+		t.Errorf("GitHub down: %v", err)
+	}
+}
