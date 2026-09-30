@@ -40,6 +40,7 @@ type Deps struct {
 	UserName     string
 	UID          int
 	Getenv       func(string) string
+	Environ      func() []string // the whole environment (the job hook reads GITHUB_*)
 	Hostname     func() (string, error)
 	Exec         execx.Runner
 	Euid         func() int
@@ -56,6 +57,7 @@ type Deps struct {
 	IsTerminal bool                   // stdin is an interactive terminal
 	ReadSecret func() (string, error) // reads a line without echo; needed for interactive token entry
 	Version    string
+	BinaryPath string // this program's own path, for the job hook script
 }
 
 func (d *Deps) fill() {
@@ -86,6 +88,13 @@ func (d *Deps) fill() {
 	if d.Stderr == nil {
 		d.Stderr = io.Discard
 	}
+}
+
+func (d *Deps) environ() []string {
+	if d.Environ != nil {
+		return d.Environ()
+	}
+	return os.Environ()
 }
 
 func (d *Deps) configDefaults() config.Defaults {
@@ -138,6 +147,8 @@ func Run(ctx context.Context, args []string, d Deps) int {
 		err = cmdApply(ctx, rest, &d)
 	case "doctor":
 		err = cmdDoctor(ctx, rest, &d)
+	case "hook":
+		err = cmdHook(ctx, rest, &d)
 	case "remove":
 		err = cmdRemove(ctx, rest, &d)
 	case "version", "--version":
@@ -251,5 +262,15 @@ func loadEnv(d *Deps, path string) (*install.Env, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newEnv(d, cfg)
+	env, err := newEnv(d, cfg)
+	if err != nil {
+		return nil, err
+	}
+	env.BinaryPath = d.BinaryPath
+	// The project is where the config lives: its workflows and git checkout are what the
+	// "only my code runs here" policy inspects.
+	if abs, err := filepath.Abs(path); err == nil {
+		env.ProjectDir = filepath.Dir(abs)
+	}
+	return env, nil
 }

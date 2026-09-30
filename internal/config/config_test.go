@@ -62,7 +62,7 @@ func TestParseSpecExample(t *testing.T) {
 }
 
 func TestDefaults(t *testing.T) {
-	minimal := "version: 1\nrunner:\n  scope: org\n  organization: acme\n"
+	minimal := "version: 1\nrunner:\n  scope: org\n  organization: acme\n  trusted_actors: [alice]\n"
 	tests := []struct {
 		name     string
 		d        Defaults
@@ -105,13 +105,13 @@ func TestProblemsNameTheirKeyPath(t *testing.T) {
 		{"unknown top-level key", base + "runnr: x\n", []string{"runnr: unknown key"}},
 		{"unknown nested key with hint", base + "  tokn:\n    source: file\n", []string{`runner.tokn: unknown key (did you mean "token"?)`}},
 		{"unknown deep key", base + "  token:\n    sorce: file\n", []string{`runner.token.sorce: unknown key (did you mean "source"?)`}},
-		{"bad version", "version: 2\nrunner:\n  scope: org\n  organization: a\n", []string{"version: must be 1"}},
-		{"version not a number", "version: one\nrunner:\n  scope: org\n  organization: a\n", []string{"version: expected a whole number"}},
+		{"bad version", "version: 2\nrunner:\n  scope: org\n  organization: a\n  trusted_actors: [alice]\n", []string{"version: must be 1"}},
+		{"version not a number", "version: one\nrunner:\n  scope: org\n  organization: a\n  trusted_actors: [alice]\n", []string{"version: expected a whole number"}},
 		{"missing scope", "version: 1\n", []string{"runner.scope: required"}},
 		{"bad scope", "version: 1\nrunner:\n  scope: team\n", []string{"runner.scope: must be repo or org"}},
 		{"repo scope needs repository", "version: 1\nrunner:\n  scope: repo\n", []string{"runner.repository: required when runner.scope is repo"}},
 		{"repository shape", "version: 1\nrunner:\n  scope: repo\n  repository: justname\n", []string{"runner.repository"}},
-		{"org with repository", "version: 1\nrunner:\n  scope: org\n  organization: a\n  repository: a/b\n", []string{"runner.repository: not allowed when runner.scope is org"}},
+		{"org with repository", "version: 1\nrunner:\n  scope: org\n  organization: a\n  trusted_actors: [alice]\n  repository: a/b\n", []string{"runner.repository: not allowed when runner.scope is org"}},
 		{"repo with organization", base + "  organization: a\n", []string{"runner.organization: not allowed"}},
 		{"bad name", base + "  name: \"has space\"\n", []string{"runner.name"}},
 		{"label with comma", base + "  labels: [\"a,b\"]\n", []string{"runner.labels[0]"}},
@@ -163,7 +163,7 @@ func TestAllProblemsReportedAtOnce(t *testing.T) {
 }
 
 func TestListenMustBeLoopback(t *testing.T) {
-	base := "version: 1\nrunner:\n  scope: org\n  organization: a\nagent:\n  listen: "
+	base := "version: 1\nrunner:\n  scope: org\n  organization: a\n  trusted_actors: [alice]\nagent:\n  listen: "
 	for _, listen := range []string{"127.0.0.1:7878", "\"[::1]:7878\"", "localhost:9000", "127.0.0.2:1"} {
 		if _, err := Parse([]byte(base+listen+"\n"), macDefaults); err != nil {
 			t.Errorf("listen %q should be accepted: %v", listen, err)
@@ -260,4 +260,54 @@ func TestLoadMissingAndPresent(t *testing.T) {
 	if err != nil || c.Runner.Name != "mac-mini-1" {
 		t.Errorf("Load = %+v, %v", c, err)
 	}
+}
+
+func TestTrustedActors(t *testing.T) {
+	repo := "version: 1\nrunner:\n  scope: repo\n  repository: heron/app\n"
+
+	t.Run("defaults to the repository owner", func(t *testing.T) {
+		c, err := Parse([]byte(repo), macDefaults)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(c.Runner.TrustedActors, []string{"heron"}) {
+			t.Errorf("TrustedActors = %v, want [heron]", c.Runner.TrustedActors)
+		}
+	})
+	t.Run("an explicit list wins over the default", func(t *testing.T) {
+		c, err := Parse([]byte(repo+"  trusted_actors: [alice, bob]\n"), macDefaults)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(c.Runner.TrustedActors, []string{"alice", "bob"}) {
+			t.Errorf("TrustedActors = %v", c.Runner.TrustedActors)
+		}
+	})
+	t.Run("organization scope has no default and requires one", func(t *testing.T) {
+		_, err := Parse([]byte("version: 1\nrunner:\n  scope: org\n  organization: acme\n"), macDefaults)
+		if err == nil || !strings.Contains(err.Error(), "runner.trusted_actors: required") {
+			t.Errorf("err = %v", err)
+		}
+	})
+	t.Run("an empty list is not a way around the default", func(t *testing.T) {
+		c, err := Parse([]byte(repo+"  trusted_actors: []\n"), macDefaults)
+		if err != nil || !reflect.DeepEqual(c.Runner.TrustedActors, []string{"heron"}) {
+			t.Errorf("got %v, %v: an empty list must fall back to the owner, never to 'anyone'", c, err)
+		}
+	})
+	t.Run("logins are validated", func(t *testing.T) {
+		for _, bad := range []string{`"a b"`, `"x[bot]"`, `"-lead"`, `"'; drop"`, `"*"`} {
+			_, err := Parse([]byte(repo+"  trusted_actors: ["+bad+"]\n"), macDefaults)
+			if err == nil || !strings.Contains(err.Error(), "runner.trusted_actors[0]") {
+				t.Errorf("%s: err = %v, want a trusted_actors[0] problem", bad, err)
+			}
+		}
+	})
+	t.Run("rendered and read back", func(t *testing.T) {
+		c, _ := Parse([]byte(repo+"  trusted_actors: [alice, bob]\n"), macDefaults)
+		back, err := Parse(Render(c), macDefaults)
+		if err != nil || !reflect.DeepEqual(back.Runner.TrustedActors, []string{"alice", "bob"}) {
+			t.Errorf("round trip: %v, %v", back, err)
+		}
+	})
 }

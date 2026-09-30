@@ -26,6 +26,7 @@ func cmdInit(ctx context.Context, args []string, d *Deps) error {
 	repo := fs.String("repository", "", "OWNER/REPO (scope repo)")
 	org := fs.String("organization", "", "organization (scope org)")
 	name := fs.String("name", "", "runner name (default: this machine's hostname)")
+	trusted := fs.String("trusted-actors", "", "GitHub logins whose code may run on this machine, comma separated (default: the repository owner; required for scope org)")
 	labels := fs.String("labels", "", "extra runner labels, comma separated")
 	tokenSource := fs.String("token-source", "", "where the token lives: keychain, file or env (default: keychain on macOS, file on Linux)")
 	placement := fs.String("placement-default", "", "default job placement: local, github or auto (default: auto)")
@@ -70,7 +71,7 @@ func cmdInit(ctx context.Context, args []string, d *Deps) error {
 		Version: 1,
 		Runner: config.Runner{
 			Scope: scopeV, Repository: repoV, Organization: orgV, Name: nameV,
-			Labels: splitList(*labels), WorkDir: *workDir,
+			Labels: splitList(*labels), WorkDir: *workDir, TrustedActors: splitList(*trusted),
 			Token: config.Token{Source: *tokenSource},
 		},
 		Placement: config.PlacementConfig{Default: config.Placement(placementV)},
@@ -119,6 +120,8 @@ func cmdInit(ctx context.Context, args []string, d *Deps) error {
 	if err := os.WriteFile(*out, rendered, 0o644); err != nil {
 		return err
 	}
+	fmt.Fprintf(d.Stdout, "only code from %s is allowed to run on this machine: `bladerunner apply` installs a job hook that refuses everyone else, and checks your workflows are locked to them too\n",
+		strings.Join(cfg.Runner.TrustedActors, ", "))
 	fmt.Fprintf(d.Stdout, "wrote %s\n\nNext:\n  bladerunner apply --dry-run   # see what would change\n  bladerunner apply             # install the runner\n  bladerunner doctor            # check it is healthy\n", *out)
 	return nil
 }

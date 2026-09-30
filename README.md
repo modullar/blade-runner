@@ -14,6 +14,13 @@ bladerunner doctor    # prerequisites, token, registration, service, disk
 bladerunner remove    # deregister and delete everything it installed
 ```
 
+**Only your code runs on your machine.** `apply` installs a *job hook* that the runner runs
+before every job and that refuses anyone not in `runner.trusted_actors` (default: the
+repository owner), any other repository, any event outsiders can cause, and any pull request
+from a fork, and refuses whenever it cannot tell. Each person sets up their own runner for
+their own repository: a fork inherits nothing. See [docs/security.md](docs/security.md) for
+the layers, what each can and cannot stop, and what is still assumed rather than verified.
+
 Design in one paragraph: `bladerunner.yaml` is the source of truth. `apply` converges the
 machine to it and is safe to re-run or resume: every step re-reads the machine rather than
 trusting a record. Isolation is the host itself (no VM), the runner runs as you (never root),
@@ -44,7 +51,9 @@ cmd/bladerunner/        main: wires the CLI to the real machine
 internal/cli/           commands (thin: parse, delegate, print)
 internal/config/        bladerunner.yaml: strict loading, validation, defaults, rendering
 internal/yamlsubset/    the strict YAML subset the config uses (standard library only)
-internal/core/          idempotent, resumable step engine; state file
+internal/core/          idempotent, resumable step engine; state file; directory lock
+internal/hook/          the job-started policy: who may run jobs here (the enforcement)
+internal/guard/         workflow scan: defence in depth, not the enforcement
 internal/install/       the gates and steps behind apply and remove
 internal/doctor/        diagnosis
 internal/provider/      CI-provider interface; github/ is the v1 implementation
@@ -62,8 +71,14 @@ docs/                   decisions/, errors/, inventory/
 ```sh
 gofmt -l .                # must print nothing
 go vet ./...
-go test -race ./...
+go test -race ./...       # hermetic: real files, real processes, real git, a fake GitHub
+
+# Needs a real service manager (launchd on a Mac, a systemd user session on Linux):
+go test -tags integration -v -count=1 ./internal/platform/integration
 ```
+
+The integration test skips, saying why, where there is no service manager. The full BR-0
+procedure for a real Mac is in [docs/BR-0-runbook.md](docs/BR-0-runbook.md).
 
 No third-party modules; see [decision 0001](docs/decisions/0001-language-and-dependencies.md).
 CI (`.github/workflows/ci.yml`) runs these on Linux and macOS and cross-compiles darwin and
@@ -86,9 +101,14 @@ end, including failure paths.
   [decision 0002](docs/decisions/0002-token-scope.md) and
   [0003](docs/decisions/0003-registration-and-release.md), and BR-0 must confirm or correct
   them. The token's minimum scope is unknown.
-- **`launchctl`, `systemctl`, `loginctl` and `security` are driven through fakes.** The macOS
-  and Linux service code has never run against a real launchd, systemd user manager or
-  Keychain. The spec's BR-2 gate (a clean machine reaches an online runner; re-running changes
+- **`launchctl`, `systemctl`, `loginctl` and `security` are driven through fakes** in the
+  hermetic tests. The macOS and Linux service code has never run against a real launchd,
+  systemd user manager or Keychain; `go test -tags integration` is written for exactly that and
+  has not yet been run on either.
+- **The job hook's enforcement relies on runner behavior nobody has observed yet** (the runner
+  honoring `ACTIONS_RUNNER_HOOK_JOB_STARTED` and passing it the job's identity). The hook logic,
+  the installed script and its tamper repair are tested by running the real script as a real
+  process; whether the real runner calls it is the first thing the BR-0 runbook checks. The spec's BR-2 gate (a clean machine reaches an online runner; re-running changes
   nothing; `remove` leaves nothing) has not been run on real machines.
 - **Service containers under host isolation.** The forge CI jobs use `services: postgres`,
   which host isolation may not support. See the

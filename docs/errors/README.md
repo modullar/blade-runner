@@ -138,6 +138,56 @@ failure.
 **Blade Runner could not tell whether the repository is public**, so it refuses to go on.
 Fix the problem reported with it (usually connectivity or token scope) and re-run.
 
+### BR-E062
+
+**A workflow would let someone else's code be *sent* to your machine.** A job that can land on
+your runner (`runs-on: self-hosted`, a label of this runner, or an expression that might
+resolve to one) is not locked to the people you trust, or its workflow uses a trigger that
+outsiders can fire (`pull_request_target`, `issue_comment`, `workflow_run` and the like). The
+message lists each job and the exact `if:` line to add:
+
+```yaml
+if: github.actor == 'you' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+```
+
+**This is defence in depth, not the control.** A workflow file is written by whoever opens the
+pull request or pushes the branch, so an attacker can delete the `if:` in their own copy. What
+actually stops them is the job hook on your machine (BR-E065), which they cannot edit. The
+workflow guard still earns its place: it catches honest mistakes, keeps unauthorized jobs from
+being queued for your runner at all, and makes the intent reviewable. The trusted logins are
+`runner.trusted_actors` (default: the repository owner). The check is textual and strict: a
+guard it cannot prove is treated as missing. Jobs that only run on GitHub-hosted images need
+nothing. See [docs/security.md](../security.md).
+
+### BR-E063
+
+**This checkout is not the repository the config registers a runner for.** A runner belongs to
+one person's machine and one repository. If you forked a project that commits a
+`bladerunner.yaml`, run `bladerunner init --force` to set up your own repository with your own
+token; the original owner's runner is not yours to use. `--allow-repo-mismatch` overrides it
+for the rare intentional case.
+
+### BR-E064
+
+**The fork pull request approval setting of a public repository is not strict, or cannot be
+verified.** On a public repository, a first-time contributor's pull request can otherwise start
+running at once. Set Settings > Actions > General > "Fork pull request workflows from outside
+collaborators" to "Require approval for all outside collaborators". If Blade Runner cannot read
+the setting itself (the endpoint it uses is unverified, see
+[decision 0005](../decisions/0005-only-your-code-runs-here.md)), confirm you set it with
+`--fork-approval-confirmed`.
+
+### BR-E065
+
+**The job hook is missing, out of date, or cannot run.** The hook is what keeps other people's
+code off your machine: the runner runs it before every job and a non-zero exit fails the job
+before any step starts. It is a generated script plus a policy file under
+`~/.bladerunner/runners/<name>/hooks/`, and the runner is told about it through
+`ACTIONS_RUNNER_HOOK_JOB_STARTED` in its `.env`. `doctor` reports a missing or edited script
+or policy, a missing `.env` entry, or a `bladerunner` program that has moved (the script calls
+it, and every job is refused while it is gone). Run `bladerunner apply`: it rewrites what is
+wrong and restarts the runner so it picks the hook up.
+
 ### BR-E070
 
 **Low disk space** where the runner works. Below 10 GiB free is a warning and below 2 GiB a

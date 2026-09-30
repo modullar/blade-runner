@@ -14,6 +14,8 @@ func cmdApply(ctx context.Context, args []string, d *Deps) error {
 	cfgPath := configFlag(fs)
 	dry := fs.Bool("dry-run", false, "show what would change, and change nothing")
 	allowPublic := fs.Bool("allow-public-runner", false, "register a runner to a PUBLIC repository (fork pull requests can then run code on this machine)")
+	allowMismatch := fs.Bool("allow-repo-mismatch", false, "proceed although this checkout's git origin is not the repository in bladerunner.yaml")
+	forkConfirmed := fs.Bool("fork-approval-confirmed", false, "I set \"Require approval for all outside collaborators\" in the repository's Actions settings (for when the API cannot confirm it)")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -22,6 +24,8 @@ func cmdApply(ctx context.Context, args []string, d *Deps) error {
 		return err
 	}
 	env.AllowPublic = *allowPublic
+	env.AllowRepoMismatch = *allowMismatch
+	env.ForkApprovalConfirmed = *forkConfirmed
 	engine := install.ApplyEngine(env, printer{d.Stdout})
 
 	if *dry {

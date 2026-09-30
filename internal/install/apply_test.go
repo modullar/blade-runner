@@ -14,7 +14,7 @@ import (
 	"github.com/modullar/blade-runner/internal/provider/github/githubtest"
 )
 
-var allApplySteps = []string{"runner-binary", "work-dir", "runner-registration", "service-definition", "service-running"}
+var allApplySteps = []string{"runner-binary", "work-dir", "runner-registration", "job-hook", "service-definition", "service-running"}
 
 func TestApplyFromACleanMachineYieldsAnOnlineRunner(t *testing.T) {
 	r := testrig.New(t, testrig.BaseConfig)
@@ -193,7 +193,7 @@ func TestResumeAfterAFailedStartDoesNotRedoEarlierSteps(t *testing.T) {
 	if diag.CodeOf(err) != diag.CodeServiceInstall {
 		t.Fatalf("first apply err = %v, want the service failure", err)
 	}
-	if want := allApplySteps[:4]; !reflect.DeepEqual(changed, want) {
+	if want := allApplySteps[:5]; !reflect.DeepEqual(changed, want) {
 		t.Errorf("first apply changed %v, want %v", changed, want)
 	}
 	st, _ := r.Env.State.Load()
@@ -335,7 +335,7 @@ func TestUnsafeWorkDirIsRefused(t *testing.T) {
 }
 
 func TestOrgScopeRegistersAtTheOrganization(t *testing.T) {
-	cfg := strings.Replace(testrig.BaseConfig, "scope: repo\n  repository: acme/widgets", "scope: org\n  organization: acme", 1)
+	cfg := strings.Replace(testrig.BaseConfig, "scope: repo\n  repository: acme/widgets", "scope: org\n  organization: acme\n  trusted_actors: [acme]", 1)
 	r := testrig.New(t, cfg)
 	_, rep, err := r.Apply()
 	if err != nil {
@@ -344,7 +344,7 @@ func TestOrgScopeRegistersAtTheOrganization(t *testing.T) {
 	if got := r.Srv.Runners("acme"); len(got) != 1 {
 		t.Errorf("org runners = %+v", got)
 	}
-	if len(rep.Notes) == 0 || !strings.Contains(rep.Notes[0], "runner group") {
+	if !strings.Contains(strings.Join(rep.Notes, "\n"), "runner group") {
 		t.Errorf("org scope should warn about runner groups and public repos, notes = %v", rep.Notes)
 	}
 }

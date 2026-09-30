@@ -30,6 +30,7 @@ func (l Layout) RunnerDir() string   { return filepath.Join(l.RunnerHome(), "run
 func (l Layout) LogDir() string      { return filepath.Join(l.RunnerHome(), "logs") }
 func (l Layout) DownloadDir() string { return filepath.Join(l.RunnerHome(), "downloads") }
 func (l Layout) StateFile() string   { return filepath.Join(l.RunnerHome(), "state.json") }
+func (l Layout) HooksDir() string    { return filepath.Join(l.RunnerHome(), "hooks") }
 func (l Layout) SecretsDir() string  { return filepath.Join(l.Home, "secrets") }
 
 // ExpandHome turns a leading ~ into the user's home directory.
@@ -58,9 +59,22 @@ type Env struct {
 	Fetcher  *download.Fetcher
 	State    *core.StateStore
 
+	// BinaryPath is this program's own path: the job hook script calls it back (`bladerunner
+	// hook job-started`), so it is recorded in the script and must be stable.
+	BinaryPath string
+
+	// ProjectDir is the directory holding bladerunner.yaml and, usually, the git checkout and
+	// .github/workflows that the policy in policy.go inspects. Empty disables those checks.
+	ProjectDir string
+
 	Euid func() int // effective uid; 0 means root
 	// AllowPublic is the explicit opt-in for registering a runner to a public repository.
 	AllowPublic bool
+	// AllowRepoMismatch lets apply proceed when the checkout's origin is not the configured
+	// repository. ForkApprovalConfirmed is the user's word that the fork-approval setting is
+	// strict, for when the API cannot confirm it.
+	AllowRepoMismatch     bool
+	ForkApprovalConfirmed bool
 	// SkipDeregister makes remove leave the GitHub registration alone, for a machine that
 	// cannot reach GitHub; the runner must then be deleted in GitHub's settings.
 	SkipDeregister bool

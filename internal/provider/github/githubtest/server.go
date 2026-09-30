@@ -39,6 +39,10 @@ type Server struct {
 	Forbidden bool
 	// Down makes every call answer 503.
 	Down bool
+	// ForkApproval is the policy served per repository (default: the strictest).
+	// ForkApprovalUnsupported makes the endpoint answer 404, as an API that lacks it would.
+	ForkApproval            map[string]string
+	ForkApprovalUnsupported bool
 	// Tarball is the runner archive served; ChecksumOverride and OmitChecksum corrupt the
 	// published checksum on purpose.
 	Tarball          []byte
@@ -209,6 +213,21 @@ func (s *Server) scopeTarget(parts []string) (target string, rest []string, ok b
 
 func (s *Server) handleRunners(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) == 6 && parts[0] == "repos" && parts[3] == "actions" && parts[4] == "permissions" && parts[5] == "fork-pr-contributor-approval" {
+		s.mu.Lock()
+		unsupported := s.ForkApprovalUnsupported
+		policy := s.ForkApproval[parts[1]+"/"+parts[2]]
+		s.mu.Unlock()
+		if _, known := s.Repos[parts[1]+"/"+parts[2]]; !known || unsupported {
+			writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+			return
+		}
+		if policy == "" {
+			policy = "all_external_contributors"
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"approval_policy": policy})
+		return
+	}
 	target, rest, ok := s.scopeTarget(parts)
 	if !ok || len(rest) == 0 || rest[0] != "runners" {
 		writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})

@@ -181,6 +181,23 @@ func (c *Client) Visibility(ctx context.Context, repository string) (provider.Vi
 	}
 }
 
+// ForkApprovalPolicy reads the repository's fork-pull-request approval setting. The endpoint
+// and the "approval_policy" field are assumptions to confirm in BR-0; any failure is returned
+// as an error, never guessed, so the caller can fail closed.
+func (c *Client) ForkApprovalPolicy(ctx context.Context, repository string) (string, error) {
+	var out struct {
+		Policy string `json:"approval_policy"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/actions/permissions/fork-pr-contributor-approval", true, &out); err != nil {
+		return "", err
+	}
+	if out.Policy == "" {
+		return "", diag.New(diag.CodeForkApproval, "GitHub did not say what the fork-approval policy is",
+			"the response had no \"approval_policy\" field", "check Settings > Actions > General by hand")
+	}
+	return out.Policy, nil
+}
+
 // RegistrationToken mints a registration token. The token is returned, never stored.
 func (c *Client) RegistrationToken(ctx context.Context, s provider.Scope) (string, error) {
 	base, err := scopePath(s)

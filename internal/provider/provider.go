@@ -61,8 +61,15 @@ type Provider interface {
 	// version means the latest; a version pins one, so a reinstall never drifts from the
 	// release recorded in state.
 	Release(ctx context.Context, goos, goarch, version string) (Release, error)
+	// ForkApprovalPolicy returns the repository's "approval for running fork pull request
+	// workflows" setting (see docs/decisions/0005). The endpoint is an unverified assumption.
+	ForkApprovalPolicy(ctx context.Context, repository string) (string, error)
 	ListRunners(ctx context.Context, scope Scope) ([]Runner, error)
 	RemoveRunner(ctx context.Context, scope Scope, id int64) error
 	// RegistrationURL is the URL handed to the runner's configure script.
 	RegistrationURL(scope Scope) string
 }
+
+// StrictForkApproval is the policy under which every outside contributor's workflow run
+// waits for a maintainer's approval.
+const StrictForkApproval = "all_external_contributors"

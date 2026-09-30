@@ -21,4 +21,8 @@ fake can only confirm the code agrees with itself.
 | A7 | Agent port 7878, polling 10 s / 60 s | **Parsed and validated only**; the agent is BR-4 | `config` |
 | A8 | Pure-Go SQLite driver | **Not reached** (BR-4). Note: stdlib-only (0001) means BR-4 must decide on a dependency | none |
 
-Decisions that depart from or extend the spec are in [0004](0004-deviations-and-choices.md).
+| H1 to H6 | The runner honors a job-started hook and gives it the job's identity; the fork-approval API | **Open**; see [0005](0005-only-your-code-runs-here.md). H1 is what stops other people's code, so it comes first in BR-0 | `internal/hook`, `install/jobhook.go` |
+
+Decisions that depart from or extend the spec are in [0004](0004-deviations-and-choices.md);
+how other people's code is kept off the machine is in [0005](0005-only-your-code-runs-here.md)
+and [../security.md](../security.md).

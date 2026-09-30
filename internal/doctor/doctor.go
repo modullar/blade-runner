@@ -70,6 +70,10 @@ func Run(ctx context.Context, e *install.Env, o Options) []Result {
 	d.token(ctx)
 	d.tokenValid(ctx)
 	d.publicRepo(ctx)
+	d.workflowPolicy()
+	d.checkout(ctx)
+	d.forkApproval(ctx)
+	d.jobHook()
 	d.registration(ctx)
 	d.service(ctx)
 	d.disk()
@@ -195,6 +199,74 @@ func (d *doctor) publicRepo(ctx context.Context) {
 			"use GitHub-hosted runners for it (placement: github) and run `bladerunner remove`")
 	default:
 		d.pass(id, d.e.Cfg.Runner.Repository+" is private")
+	}
+}
+
+func (d *doctor) workflowPolicy() {
+	const id = "workflow-policy"
+	rep, err := d.e.WorkflowReport()
+	if err != nil {
+		d.finding(id, Fail, diag.CodeWorkflowPolicy, "cannot read the workflow files: "+err.Error(), "fix the permissions of .github/workflows")
+		return
+	}
+	if len(rep.Findings) > 0 {
+		d.finding(id, Fail, diag.CodeWorkflowPolicy,
+			fmt.Sprintf("%d workflow problem(s) would let someone else's code run on this machine; first: %s", len(rep.Findings), rep.Findings[0]),
+			"run `bladerunner apply --dry-run` to list every one, with the line to add")
+		return
+	}
+	d.pass(id, fmt.Sprintf("%d job(s) in %d workflow file(s) can run on this runner; all locked to %s",
+		rep.LocalJobs, rep.Files, strings.Join(d.e.Cfg.Runner.TrustedActors, ", ")))
+}
+
+func (d *doctor) checkout(ctx context.Context) {
+	const id = "checkout-matches"
+	note, err := d.e.CheckoutMismatch(ctx)
+	var de *diag.Error
+	switch {
+	case errors.As(err, &de):
+		d.finding(id, Fail, de.Code, de.What, de.Fix)
+	case note != "":
+		d.pass(id, note)
+	default:
+		d.pass(id, "this checkout is the repository the runner is registered for")
+	}
+}
+
+func (d *doctor) forkApproval(ctx context.Context) {
+	const id = "fork-approval"
+	if d.e.Cfg.Runner.Scope != "repo" || !d.authOK {
+		d.skip(id, "needs a repository-scope runner and a valid token")
+		return
+	}
+	vis, err := d.e.Provider.Visibility(ctx, d.e.Cfg.Runner.Repository)
+	if err != nil || vis != provider.Public {
+		d.pass(id, "not a public repository: outside contributors cannot start runs without write access")
+		return
+	}
+	policy, err := d.e.Provider.ForkApprovalPolicy(ctx, d.e.Cfg.Runner.Repository)
+	switch {
+	case err != nil:
+		d.finding(id, Warn, diag.CodeForkApproval, "cannot read the fork pull request approval setting of a public repository",
+			"check Settings > Actions > General: \"Require approval for all outside collaborators\"")
+	case policy != provider.StrictForkApproval:
+		d.finding(id, Fail, diag.CodeForkApproval, "outside contributors' workflows can run without approval (policy: "+policy+")",
+			"set \"Require approval for all outside collaborators\" in Settings > Actions > General")
+	default:
+		d.pass(id, "every outside contributor's run waits for approval")
+	}
+}
+
+func (d *doctor) jobHook() {
+	const id = "job-hook"
+	problem, err := d.e.HookProblem()
+	switch {
+	case err != nil:
+		d.fromErr(id, Fail, err)
+	case problem != "":
+		d.finding(id, Fail, diag.CodeJobHook, problem+": jobs from anyone could run on this machine", "run `bladerunner apply`")
+	default:
+		d.pass(id, "every job is checked against the policy before it starts")
 	}
 }
 

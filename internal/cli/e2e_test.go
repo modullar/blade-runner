@@ -68,6 +68,7 @@ func (c *cliRig) run(stdin string, args ...string) int {
 		IsTerminal: c.terminal,
 		ReadSecret: func() (string, error) { return c.secret, nil },
 		Version:    "0.1.0",
+		BinaryPath: testrig.Binary(c.t),
 	}
 	if c.deps.GOOS != "" {
 		d.GOOS = c.deps.GOOS
@@ -128,8 +129,8 @@ func TestPrimaryFlowInitApplyDoctorRemove(t *testing.T) {
 
 	// apply --dry-run: lists every step, changes nothing.
 	c.mustRun("", "apply", "-c", c.cfgPath, "--dry-run")
-	if n := c.stepLines("would change"); n != 5 {
-		t.Errorf("dry-run lists %d pending steps, want 5:\n%s", n, c.out.String())
+	if n := c.stepLines("would change"); n != 6 {
+		t.Errorf("dry-run lists %d pending steps, want 6:\n%s", n, c.out.String())
 	}
 	if _, err := os.Stat(filepath.Join(c.home(), "runners")); err == nil {
 		t.Error("dry-run created the runner directory")
@@ -140,7 +141,7 @@ func TestPrimaryFlowInitApplyDoctorRemove(t *testing.T) {
 
 	// apply: the runner comes online, and the real run matches the dry-run's prediction.
 	c.mustRun("", "apply", "-c", c.cfgPath)
-	if n := c.stepLines("changed"); n != 5 {
+	if n := c.stepLines("changed"); n != 6 {
 		t.Errorf("apply reports fewer than 5 changes:\n%s", c.out.String())
 	}
 	runners := c.srv.Runners("acme/widgets")

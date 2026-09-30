@@ -3,6 +3,8 @@ package doctor_test
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -48,8 +50,8 @@ func applied(t *testing.T, cfg string) *testrig.Rig {
 func TestHealthyInstallPassesEveryCheck(t *testing.T) {
 	r := applied(t, testrig.BaseConfig)
 	res := doctor.Run(ctx, r.Env, doctor.Options{CLIVersion: "0.1.0-dev", FreeBytes: plenty})
-	if len(res) != 9 {
-		t.Errorf("got %d checks, want 9", len(res))
+	if len(res) != 13 {
+		t.Errorf("got %d checks, want 13", len(res))
 	}
 	for _, x := range res {
 		if x.Level != doctor.Pass {
@@ -260,4 +262,88 @@ func TestEveryFindingHasADocumentedCodeAndDoctorChangesNothing(t *testing.T) {
 			t.Errorf("doctor created %s", l)
 		}
 	}
+}
+
+func TestDoctorPolicyChecks(t *testing.T) {
+	t.Run("an open workflow fails", func(t *testing.T) {
+		r := applied(t, testrig.BaseConfig)
+		r.WriteWorkflow("ci.yml", testrig.OpenWorkflow)
+		got := run(r)
+		wantLevel(t, got, "workflow-policy", doctor.Fail, diag.CodeWorkflowPolicy)
+		if !strings.Contains(got["workflow-policy"].Message, "ci.yml") {
+			t.Errorf("message should name the file: %q", got["workflow-policy"].Message)
+		}
+	})
+	t.Run("a locked workflow passes and says what it checked", func(t *testing.T) {
+		r := applied(t, testrig.BaseConfig)
+		r.WriteWorkflow("ci.yml", testrig.GuardedWorkflow)
+		got := run(r)
+		wantLevel(t, got, "workflow-policy", doctor.Pass, "")
+		if !strings.Contains(got["workflow-policy"].Message, "locked to acme") {
+			t.Errorf("message: %q", got["workflow-policy"].Message)
+		}
+	})
+	t.Run("a forked checkout fails", func(t *testing.T) {
+		r := applied(t, testrig.BaseConfig)
+		r.GitInit(r.Srv.URL + "/mallory/widgets.git")
+		wantLevel(t, run(r), "checkout-matches", doctor.Fail, diag.CodeRepoMismatch)
+	})
+	t.Run("the matching checkout passes", func(t *testing.T) {
+		r := applied(t, testrig.BaseConfig)
+		r.GitInit(r.Srv.URL + "/acme/widgets.git")
+		wantLevel(t, run(r), "checkout-matches", doctor.Pass, "")
+	})
+	t.Run("public repo: strict, weak and unknown approval", func(t *testing.T) {
+		r := testrig.New(t, testrig.BaseConfig)
+		r.Srv.Repos[testrig.Target] = false
+		r.Env.AllowPublic = true
+		if _, _, err := r.Apply(); err != nil {
+			t.Fatal(err)
+		}
+		wantLevel(t, run(r), "fork-approval", doctor.Pass, "")
+		r.Srv.ForkApproval = map[string]string{testrig.Target: "first_time_contributors"}
+		wantLevel(t, run(r), "fork-approval", doctor.Fail, diag.CodeForkApproval)
+		r.Srv.ForkApproval = nil
+		r.Srv.ForkApprovalUnsupported = true
+		wantLevel(t, run(r), "fork-approval", doctor.Warn, diag.CodeForkApproval)
+	})
+	t.Run("private repo needs no approval setting", func(t *testing.T) {
+		r := applied(t, testrig.BaseConfig)
+		wantLevel(t, run(r), "fork-approval", doctor.Pass, "")
+	})
+}
+
+func TestDoctorJobHookCheck(t *testing.T) {
+	t.Run("intact", func(t *testing.T) {
+		wantLevel(t, run(applied(t, testrig.BaseConfig)), "job-hook", doctor.Pass, "")
+	})
+	t.Run("before apply", func(t *testing.T) {
+		got := run(testrig.New(t, testrig.BaseConfig))
+		wantLevel(t, got, "job-hook", doctor.Fail, diag.CodeJobHook)
+	})
+	t.Run("policy edited", func(t *testing.T) {
+		r := applied(t, testrig.BaseConfig)
+		_ = os.WriteFile(filepath.Join(r.Env.Layout.HooksDir(), "policy.json"), []byte(`{"version":1}`), 0o600)
+		got := run(r)
+		wantLevel(t, got, "job-hook", doctor.Fail, diag.CodeJobHook)
+		if !strings.Contains(got["job-hook"].Message, "out of date") || !strings.Contains(got["job-hook"].Message, "jobs from anyone") {
+			t.Errorf("message: %q", got["job-hook"].Message)
+		}
+	})
+	t.Run("the program was deleted", func(t *testing.T) {
+		r := testrig.New(t, testrig.BaseConfig)
+		data, _ := os.ReadFile(testrig.Binary(t))
+		bin := filepath.Join(t.TempDir(), "bladerunner")
+		_ = os.WriteFile(bin, data, 0o755)
+		r.Env.BinaryPath = bin
+		if _, _, err := r.Apply(); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.Remove(bin)
+		got := run(r)
+		wantLevel(t, got, "job-hook", doctor.Fail, diag.CodeJobHook)
+		if !strings.Contains(got["job-hook"].Message, "no longer exists") {
+			t.Errorf("message: %q", got["job-hook"].Message)
+		}
+	})
 }

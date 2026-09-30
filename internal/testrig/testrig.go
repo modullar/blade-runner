@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/modullar/blade-runner/internal/config"
@@ -50,14 +52,19 @@ var ctx = context.Background()
 type FakePlatform struct {
 	Installed, Running bool
 	Installs, Starts   int
+	Stops              int
 	FailStartOnce      bool
 	Prereqs            []platform.Prereq
 }
 
-func (*FakePlatform) OS() string                                { return "fake" }
-func (*FakePlatform) DefinitionPath(platform.Spec) string       { return "/fake/unit" }
-func (*FakePlatform) Render(platform.Spec) ([]byte, error)      { return []byte("unit"), nil }
-func (*FakePlatform) Stop(context.Context, platform.Spec) error { return nil }
+func (*FakePlatform) OS() string                           { return "fake" }
+func (*FakePlatform) DefinitionPath(platform.Spec) string  { return "/fake/unit" }
+func (*FakePlatform) Render(platform.Spec) ([]byte, error) { return []byte("unit"), nil }
+func (f *FakePlatform) Stop(context.Context, platform.Spec) error {
+	f.Stops++
+	f.Running = false
+	return nil
+}
 func (*FakePlatform) Logs(context.Context, platform.Spec, bool, io.Writer) error {
 	return nil
 }
@@ -107,6 +114,9 @@ type Rig struct {
 	Env      *install.Env
 	Plat     *FakePlatform
 	UserHome string
+	// ProjectDir stands for the user's project: where bladerunner.yaml, .github/workflows and
+	// the git checkout live. It starts empty: no workflows, no .git.
+	ProjectDir string
 }
 
 // New builds a Rig for configYAML with the token already stored (except for the env source,
@@ -132,8 +142,12 @@ func New(t *testing.T, configYAML string) *Rig {
 		}
 	}
 	plat := &FakePlatform{Prereqs: []platform.Prereq{{Name: "git", OK: true}}}
+	projectDir := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	env := &install.Env{
-		Cfg: cfg, Layout: layout, UserHome: userHome, GOOS: "linux", GOARCH: "amd64",
+		Cfg: cfg, Layout: layout, UserHome: userHome, GOOS: "linux", GOARCH: "amd64", ProjectDir: projectDir,
 		Provider: &github.Client{
 			APIURL: srv.URL, WebURL: srv.URL,
 			Token: func(ctx context.Context) (string, error) { return store.Get(ctx, cfg.Runner.Name) },
@@ -145,7 +159,8 @@ func New(t *testing.T, configYAML string) *Rig {
 		State:    &core.StateStore{Path: layout.StateFile()},
 		Euid:     func() int { return 1000 },
 	}
-	return &Rig{T: t, Srv: srv, Env: env, Plat: plat, UserHome: userHome}
+	env.BinaryPath = Binary(t)
+	return &Rig{T: t, Srv: srv, Env: env, Plat: plat, UserHome: userHome, ProjectDir: projectDir}
 }
 
 // Apply runs the real apply pipeline.
@@ -177,4 +192,76 @@ func (r *Rig) Leftovers() []string {
 		return nil
 	})
 	return out
+}
+
+// WriteWorkflow writes .github/workflows/<name> in the project.
+func (r *Rig) WriteWorkflow(name, body string) {
+	r.T.Helper()
+	dir := filepath.Join(r.ProjectDir, ".github", "workflows")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		r.T.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+		r.T.Fatal(err)
+	}
+}
+
+// GitInit makes the project a real git checkout whose origin is remote, using the real git.
+func (r *Rig) GitInit(remote string) {
+	r.T.Helper()
+	for _, args := range [][]string{{"init", "-q"}, {"remote", "add", "origin", remote}} {
+		cmd := exec.Command("git", append([]string{"-C", r.ProjectDir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			r.T.Skipf("git is not usable here: %v: %s", err, out)
+		}
+	}
+}
+
+// GuardedWorkflow is a workflow with one job that can run on the local runner and is locked
+// to the trusted actor the way the policy requires.
+const GuardedWorkflow = `name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: self-hosted
+    if: github.actor == 'acme' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      - run: echo ok
+`
+
+// OpenWorkflow is the same job with no guard: anyone's pull request would run on the runner.
+const OpenWorkflow = `name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: self-hosted
+    steps:
+      - run: echo ok
+`
+
+var (
+	binOnce sync.Once
+	binPath string
+	binErr  error
+)
+
+// Binary builds the real bladerunner program once per test process and returns its path. The
+// job hook script calls the program back, so tests that run the hook need the real thing.
+func Binary(t testing.TB) string {
+	t.Helper()
+	binOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "bladerunner-bin-")
+		if err != nil {
+			binErr = err
+			return
+		}
+		binPath = filepath.Join(dir, "bladerunner")
+		if out, err := exec.Command("go", "build", "-o", binPath, "github.com/modullar/blade-runner/cmd/bladerunner").CombinedOutput(); err != nil {
+			binErr = fmt.Errorf("go build: %v\n%s", err, out)
+		}
+	})
+	if binErr != nil {
+		t.Fatalf("cannot build the bladerunner binary: %v", binErr)
+	}
+	return binPath
 }

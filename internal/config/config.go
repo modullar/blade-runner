@@ -52,6 +52,10 @@ type Runner struct {
 	Labels       []string
 	WorkDir      string
 	Token        Token
+	// TrustedActors are the GitHub logins whose code may run on this machine. Every job that
+	// can land on the runner must be locked to them (see internal/guard). Defaults to the
+	// repository's owner; required for organization scope.
+	TrustedActors []string
 }
 
 // Token says how the tool reads its GitHub token. The token itself is never in the file.

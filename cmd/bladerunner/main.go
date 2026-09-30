@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"os/user"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -33,6 +34,10 @@ func systemDeps() cli.Deps {
 		os.Exit(cli.ExitFailure)
 	}
 	uid, _ := strconv.Atoi(u.Uid)
+	self, _ := os.Executable()
+	if resolved, err := filepath.EvalSymlinks(self); err == nil {
+		self = resolved
+	}
 	return cli.Deps{
 		GOOS: runtime.GOOS, GOARCH: runtime.GOARCH,
 		UserHome: u.HomeDir, UserName: u.Username, UID: uid,
@@ -40,6 +45,7 @@ func systemDeps() cli.Deps {
 		IsTerminal: isTerminal(os.Stdin),
 		ReadSecret: readSecret,
 		Version:    version.Version,
+		BinaryPath: self,
 		FreeBytes:  doctor.FreeBytes,
 	}
 }

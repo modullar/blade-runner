@@ -280,3 +280,24 @@ func TestRefusalWithoutATokenIsNotBlamedOnTheToken(t *testing.T) {
 		t.Errorf("authenticated 403: %v, want BR-E021", err)
 	}
 }
+
+func TestForkApprovalPolicy(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	c := newClient(s, "ghp_testtoken")
+
+	if got, err := c.ForkApprovalPolicy(ctx, "acme/widgets"); err != nil || got != provider.StrictForkApproval {
+		t.Fatalf("default = %q, %v", got, err)
+	}
+	s.ForkApproval = map[string]string{"acme/widgets": "first_time_contributors"}
+	if got, _ := c.ForkApprovalPolicy(ctx, "acme/widgets"); got != "first_time_contributors" {
+		t.Errorf("policy = %q", got)
+	}
+	s.ForkApprovalUnsupported = true
+	if _, err := c.ForkApprovalPolicy(ctx, "acme/widgets"); err == nil {
+		t.Error("an endpoint that answers 404 must be an error, never a guessed policy")
+	}
+	if _, err := newClient(s, "ghp_wrong").ForkApprovalPolicy(ctx, "acme/widgets"); diag.CodeOf(err) != diag.CodeTokenRejected {
+		t.Errorf("wrong token: %v", err)
+	}
+}

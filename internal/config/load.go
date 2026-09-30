@@ -182,12 +182,13 @@ func decode(root *yamlsubset.Node) (*Config, []Problem) {
 		},
 		"runner": func(n *yamlsubset.Node, p string) {
 			d.mapping(n, p, map[string]fieldFn{
-				"scope":        func(n *yamlsubset.Node, p string) { c.Runner.Scope = d.str(n, p) },
-				"repository":   func(n *yamlsubset.Node, p string) { c.Runner.Repository = d.str(n, p) },
-				"organization": func(n *yamlsubset.Node, p string) { c.Runner.Organization = d.str(n, p) },
-				"name":         func(n *yamlsubset.Node, p string) { c.Runner.Name = d.str(n, p) },
-				"labels":       func(n *yamlsubset.Node, p string) { c.Runner.Labels = d.strList(n, p) },
-				"work_dir":     func(n *yamlsubset.Node, p string) { c.Runner.WorkDir = d.str(n, p) },
+				"scope":          func(n *yamlsubset.Node, p string) { c.Runner.Scope = d.str(n, p) },
+				"repository":     func(n *yamlsubset.Node, p string) { c.Runner.Repository = d.str(n, p) },
+				"organization":   func(n *yamlsubset.Node, p string) { c.Runner.Organization = d.str(n, p) },
+				"name":           func(n *yamlsubset.Node, p string) { c.Runner.Name = d.str(n, p) },
+				"labels":         func(n *yamlsubset.Node, p string) { c.Runner.Labels = d.strList(n, p) },
+				"work_dir":       func(n *yamlsubset.Node, p string) { c.Runner.WorkDir = d.str(n, p) },
+				"trusted_actors": func(n *yamlsubset.Node, p string) { c.Runner.TrustedActors = d.strList(n, p) },
 				"token": func(n *yamlsubset.Node, p string) {
 					d.mapping(n, p, map[string]fieldFn{
 						"source": func(n *yamlsubset.Node, p string) { c.Runner.Token.Source = d.str(n, p) },
@@ -269,6 +270,11 @@ func applyDefaults(c *Config, d Defaults) {
 		c.Runner.Name = d.Hostname
 		if c.Runner.Name == "" {
 			c.Runner.Name = "runner"
+		}
+	}
+	if len(c.Runner.TrustedActors) == 0 && c.Runner.Scope == ScopeRepo {
+		if owner, _, ok := strings.Cut(c.Runner.Repository, "/"); ok {
+			c.Runner.TrustedActors = []string{owner}
 		}
 	}
 	if c.Runner.WorkDir == "" {

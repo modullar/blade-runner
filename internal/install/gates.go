@@ -15,7 +15,7 @@ import (
 // gate stops the run before anything changes, in dry-run too.
 func ApplyGates(e *Env) []core.Gate {
 	return []core.Gate{
-		notRoot{e}, prereqs{e}, tokenPresent{e}, tokenValid{e}, publicRepo{e},
+		notRoot{e}, prereqs{e}, workflowPolicy{e}, checkoutMatches{e}, tokenPresent{e}, tokenValid{e}, publicRepo{e},
 	}
 }
 
@@ -49,6 +49,47 @@ func (g prereqs) Run(ctx context.Context, _ core.Reporter) error {
 	return diag.New(diag.CodePrereqMissing, "missing prerequisites: "+strings.Join(failed, ", "),
 		"this machine is not set up for a self-hosted runner yet",
 		"\n    "+strings.Join(fixes, "\n    "))
+}
+
+// workflowPolicy refuses to go on while any job that can land on this runner is open to
+// someone else's code.
+type workflowPolicy struct{ e *Env }
+
+func (workflowPolicy) ID() string { return "workflow-policy" }
+func (g workflowPolicy) Run(_ context.Context, rep core.Reporter) error {
+	report, err := g.e.WorkflowReport()
+	if err != nil {
+		return diag.Wrap(err, diag.CodeWorkflowPolicy, "cannot read the project's workflow files",
+			"the .github/workflows directory is unreadable", "fix its permissions; Blade Runner will not guess what is in it")
+	}
+	if err := WorkflowPolicyError(report, g.e.Cfg.Runner.TrustedActors); err != nil {
+		return err
+	}
+	if report.LocalJobs > 0 {
+		rep.Note(fmt.Sprintf("%d job(s) in %d workflow file(s) can run on this runner; all are locked to %s",
+			report.LocalJobs, report.Files, strings.Join(g.e.Cfg.Runner.TrustedActors, ", ")))
+	}
+	return nil
+}
+
+// checkoutMatches refuses a config that belongs to another repository: a fork must set up its
+// own runner, with its own token.
+type checkoutMatches struct{ e *Env }
+
+func (checkoutMatches) ID() string { return "checkout-matches-config" }
+func (g checkoutMatches) Run(ctx context.Context, rep core.Reporter) error {
+	note, err := g.e.CheckoutMismatch(ctx)
+	if err != nil {
+		if g.e.AllowRepoMismatch {
+			rep.Note("continuing although the checkout is a different repository (--allow-repo-mismatch)")
+			return nil
+		}
+		return err
+	}
+	if note != "" {
+		rep.Note(note)
+	}
+	return nil
 }
 
 type tokenPresent struct{ e *Env }
@@ -86,7 +127,13 @@ func (g publicRepo) Run(ctx context.Context, rep core.Reporter) error {
 			"GitHub could not be reached, or the token cannot read the repository",
 			"fix the problem above and re-run: Blade Runner refuses to guess when a public repository is at stake")
 	}
-	return PublicRepoDecision(cfg.Runner.Repository, vis, g.e.AllowPublic)
+	if err := PublicRepoDecision(cfg.Runner.Repository, vis, g.e.AllowPublic); err != nil {
+		return err
+	}
+	if vis == provider.Public {
+		return g.e.ForkApprovalError(ctx, g.e.ForkApprovalConfirmed)
+	}
+	return nil
 }
 
 // PublicRepoDecision is the guard's rule, shared by init and apply: a public repository is

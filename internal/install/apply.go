@@ -18,7 +18,7 @@ import (
 // ApplySteps are the convergent steps of `apply`, in order.
 func ApplySteps(e *Env) []core.Step {
 	return []core.Step{
-		&fetchRunner{e}, &workDir{e}, &registerRunner{e}, &serviceDefinition{e}, &serviceRunning{e},
+		&fetchRunner{e}, &workDir{e}, &registerRunner{e}, &jobHook{e}, &serviceDefinition{e}, &serviceRunning{e},
 	}
 }
 

@@ -66,6 +66,14 @@ func Validate(c *Config) []Problem {
 	for i, l := range r.Labels {
 		checkLabel(fmt.Sprintf("runner.labels[%d]", i), l, add)
 	}
+	if len(r.TrustedActors) == 0 {
+		add("runner.trusted_actors", "required: list the GitHub logins whose code may run on this machine (for scope org there is no default)")
+	}
+	for i, a := range r.TrustedActors {
+		if !orgRe.MatchString(a) {
+			add(fmt.Sprintf("runner.trusted_actors[%d]", i), "%q is not a GitHub login", a)
+		}
+	}
 	if strings.TrimSpace(r.WorkDir) == "" {
 		add("runner.work_dir", "must not be empty")
 	}

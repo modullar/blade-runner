@@ -1,0 +1,234 @@
+name: frontend
+
+on:
+  # Pushes run for main only, the deploy gate. A PR's commits run through
+  # pull_request below; with both triggers, every PR commit ran frontend and e2e
+  # twice and billed both.
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      # The Playwright suite drives the real app against the real API, so a
+      # backend change can break it (chip-audit is a declared cross-cutting
+      # gate). These are the paths the e2e job's server is built from.
+      - "forge_engine/**"
+      - "corpus/**"
+      - "migrations/**"
+      - "scripts/**"
+      # The rate seed the migration bulk-inserts. Every ownership module
+      # resolves against it, so editing a rate moves the numbers the chip-audit
+      # and bands specs assert — but until it was listed here, editing
+      # data/rates/rates_seed.json triggered no suite at all.
+      - "data/**"
+      - "pyproject.toml"
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - "frontend/**"
+      - "forge_engine/**"
+      - "corpus/**"
+      - "migrations/**"
+      - "scripts/**"
+      - "data/**"
+      - "pyproject.toml"
+      - ".github/workflows/**"
+  # By hand, and the fresh-run path runner-failover.yml falls back to when a re-run keeps
+  # routing a stranded job to the Mac (see scripts/ci_failover.py).
+  workflow_dispatch:
+
+# Nothing here writes to the repository (scripts/check_runner_policy.py requires the block).
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels that PR's run still in progress; every other
+# run (main, dispatch) gets a group of its own and is never queued or cancelled. Same
+# rule, and same reasons, as ci.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# `frontend` routes by the same expression as ci.yml: PRs and branches follow FORGE_RUNNER
+# (the self-hosted Mac mini, or GitHub-hosted during a failover), main always runs hosted.
+# `e2e` is always hosted. See "Where CI runs" in CLAUDE.md.
+jobs:
+  frontend:
+    runs-on: ${{ github.ref != 'refs/heads/main' && vars.FORGE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run test
+
+  # The Playwright suite, which ran nowhere but developers' laptops until T11 —
+  # including chip-audit.spec.ts, the cross-cutting provenance gate CLAUDE.md
+  # and the build plan both name, and bands.spec.ts. It needs the whole stack,
+  # so this job reproduces the container entrypoint's boot sequence
+  # (docker/entrypoint.sh) against a Postgres service: extensions → migrations
+  # → corpus prep → demo user → uvicorn. Running the steps directly rather than
+  # `docker compose up` avoids building the dev image (~10 min) and needs no
+  # .env, which is not in the repo.
+  e2e:
+    # Always GitHub-hosted (HOSTED_JOBS in scripts/check_runner_policy.py): the heaviest job
+    # (Postgres, the API, Vite and Chromium in one slot), and the one a busy 8 GB Mac kept
+    # breaking, with a first spec timed out and two runs cut at the limit below. About 13
+    # hosted minutes a run.
+    runs-on: ubuntu-latest
+    # The whole job, not the Playwright step: a stack that never comes up hangs
+    # in "Start the API" just as easily as the suite hangs in a spec. 40+ specs
+    # run serially here (workers: 1 under CI) against a real backend, several
+    # mount WebGL contexts and several wait up to 60 s, so the honest budget is
+    # ~20 min of work — 35 leaves headroom without letting GitHub's 6-hour
+    # default burn a runner on a deadlock.
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: forgedb
+          POSTGRES_USER: forge
+          POSTGRES_PASSWORD: localdev
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U forge -d forgedb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://forge:localdev@localhost:5433/forgedb
+      # CI-only signing key. auth_service refuses to sign without one, so a
+      # deploy that forgets it fails loud rather than open.
+      AUTH_SECRET_KEY: ci-only-secret-not-used-anywhere-else
+      # The one place the demo credentials are stated. `create_user.py` reads
+      # these directly; the Playwright step forwards them to the E2E_USER_*
+      # names global-setup.ts reads (see the Playwright step below) — the two
+      # used to agree only because both fell back to the same compose defaults,
+      # which is not the same as being wired together.
+      DEMO_USER_EMAIL: demo@loopforgelab.dev
+      DEMO_USER_PASSWORD: forge-demo
+      CORS_ORIGINS: http://localhost:5173
+      # Vite exposes VITE_*-prefixed process env to the client bundle; locally
+      # this lives in the gitignored frontend/.env.local.
+      VITE_API_URL: http://localhost:8000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install backend dependencies
+        run: uv sync --group dev
+
+      - name: Ensure PostgreSQL extensions
+        run: |
+          uv run python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+          engine = create_engine(os.environ['DATABASE_URL'])
+          with engine.connect() as conn:
+              for ext in ('ltree', 'pg_trgm', 'vector', '"uuid-ossp"'):
+                  conn.execute(text(f'CREATE EXTENSION IF NOT EXISTS {ext}'))
+              conn.commit()
+          PY
+
+      - name: Migrate
+        run: uv run alembic upgrade head
+
+      # Corpus models 422 until their extracted BOM is persisted; the
+      # extractions are committed. --hero-tolerance 0.6 matches the entrypoint.
+      # NOT tolerated to fail here (unlike the entrypoint's warn-and-continue):
+      # an unprepared corpus makes the journey and chip-audit specs fail with a
+      # confusing 422 instead of naming the real cause.
+      - name: Prepare corpus models
+        run: >-
+          uv run python scripts/prepare_corpus.py --all --no-extract
+          --missing-only --hero-tolerance 0.6
+
+      - name: Provision the demo user
+        run: uv run python scripts/create_user.py "$DEMO_USER_EMAIL" "$DEMO_USER_PASSWORD"
+
+      - name: Start the API
+        run: |
+          uv run uvicorn forge_engine.main:app --host 127.0.0.1 --port 8000 \
+            > "$RUNNER_TEMP/api.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl -sf http://localhost:8000/health > /dev/null; then
+              echo "API up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the API never became healthy"
+          cat "$RUNNER_TEMP/api.log"
+          exit 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      # Chromium only: playwright.config.ts declares no projects, so the suite
+      # runs on the default browser. Installing all three would triple the time
+      # for browsers nothing here uses.
+      #
+      # Deliberately NOT `--with-deps`. That flag shells out to `apt-get
+      # update`, which reads every source the runner image configures —
+      # including Google's Chrome repo. On 2026-09-11 that repo served a
+      # Packages.gz whose hash disagreed with its own Release file ("Hash Sum
+      # mismatch"), apt refused the index, install-deps exited 100, and this
+      # job went red having run no spec at all. The flag was never earning its
+      # keep: the shared libraries Chromium needs are already on both runner
+      # images — `ubuntu-latest` ships Chrome and Edge, and the self-hosted
+      # Mac's image (ci/self-hosted/Dockerfile) installs them once, at image
+      # build, for the Playwright version in package-lock.json. All
+      # `--with-deps` added was a hard dependency on a third-party apt mirror
+      # nobody here controls, on every run. If a library ever IS genuinely
+      # missing, the browser fails to launch on the next run and names it —
+      # add that one library (or rebuild the Mac's image after a Playwright
+      # bump) rather than restoring this flag and the mirror with it.
+      - name: Install Playwright browser
+        run: npx playwright install chromium
+        working-directory: frontend
+
+      - name: Playwright
+        run: npm run e2e
+        working-directory: frontend
+        env:
+          # global-setup.ts reads E2E_USER_*; the user was provisioned from
+          # DEMO_USER_*. Forwarding one to the other is what makes a change to
+          # the credentials above reach the login, instead of failing the whole
+          # suite on an auth error two steps later.
+          E2E_USER_EMAIL: ${{ env.DEMO_USER_EMAIL }}
+          E2E_USER_PASSWORD: ${{ env.DEMO_USER_PASSWORD }}
+
+      - name: API log
+        if: failure()
+        run: cat "$RUNNER_TEMP/api.log"
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            frontend/playwright-report/
+            frontend/test-results/
+          retention-days: 7

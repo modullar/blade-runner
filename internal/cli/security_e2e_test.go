@@ -1,0 +1,230 @@
+package cli_test
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/modullar/blade-runner/internal/cli"
+	"github.com/modullar/blade-runner/internal/testrig"
+)
+
+// projectDir is where the config (and so the project's workflows and checkout) lives.
+func (c *cliRig) projectDir() string { return filepath.Dir(c.cfgPath) }
+
+func (c *cliRig) writeWorkflow(name, body string) {
+	c.t.Helper()
+	dir := filepath.Join(c.projectDir(), ".github", "workflows")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		c.t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+		c.t.Fatal(err)
+	}
+}
+
+func (c *cliRig) gitInit(remote string) {
+	c.t.Helper()
+	for _, args := range [][]string{{"init", "-q"}, {"remote", "add", "origin", remote}} {
+		if out, err := exec.Command("git", append([]string{"-C", c.projectDir()}, args...)...).CombinedOutput(); err != nil {
+			c.t.Skipf("git unusable: %s", out)
+		}
+	}
+}
+
+func (c *cliRig) assertUntouched() {
+	c.t.Helper()
+	if len(c.srv.Runners("acme/widgets")) != 0 || c.plat.Installed {
+		c.t.Error("the machine or GitHub was changed although the run was refused")
+	}
+	if _, err := os.Stat(filepath.Join(c.home(), "runners")); err == nil {
+		c.t.Error("runner files were created although the run was refused")
+	}
+}
+
+// The scenario the security requirement is about: a stranger's pull request must not be able
+// to run on this machine, however the repository is set up.
+func TestStrangersCodeCannotReachTheRunner(t *testing.T) {
+	c := newCLIRig(t)
+	c.mustRun(testrig.Token+"\n", c.initArgs()...) // the repository owner is "acme": the only trusted actor
+
+	// An open workflow (any pull request would run on the runner): refused, with the fix.
+	c.writeWorkflow("ci.yml", testrig.OpenWorkflow)
+	for _, args := range [][]string{{"apply", "-c", c.cfgPath, "--dry-run"}, {"apply", "-c", c.cfgPath}} {
+		if code := c.run("", args...); code != cli.ExitFailure || !strings.Contains(c.err.String(), "BR-E062") {
+			t.Fatalf("%v: exit %d, stderr:\n%s", args, code, c.err.String())
+		}
+		for _, want := range []string{"ci.yml", "job test", "if: github.actor == 'acme'", "fork"} {
+			if !strings.Contains(c.err.String(), want) {
+				t.Errorf("%v: the refusal should contain %q:\n%s", args, want, c.err.String())
+			}
+		}
+		c.assertUntouched()
+	}
+
+	// The same workflow on a trigger that strangers can fire is refused even with the guard.
+	c.writeWorkflow("ci.yml", strings.Replace(testrig.GuardedWorkflow, "on: [push, pull_request]", "on: [push, issue_comment]", 1))
+	if code := c.run("", "apply", "-c", c.cfgPath); code != cli.ExitFailure || !strings.Contains(c.err.String(), "issue_comment") {
+		t.Fatalf("exit %d, stderr:\n%s", code, c.err.String())
+	}
+	c.assertUntouched()
+
+	// Locked to the owner: apply proceeds and says what it verified.
+	c.writeWorkflow("ci.yml", testrig.GuardedWorkflow)
+	c.mustRun("", "apply", "-c", c.cfgPath)
+	if !strings.Contains(c.out.String(), "all are locked to acme") {
+		t.Errorf("apply should report what it verified:\n%s", c.out.String())
+	}
+	if len(c.srv.Runners("acme/widgets")) != 1 {
+		t.Error("the runner was not registered")
+	}
+
+	// A new, unguarded workflow appears later: doctor notices.
+	c.writeWorkflow("deploy.yml", strings.Replace(testrig.OpenWorkflow, "name: ci", "name: deploy", 1))
+	if code := c.run("", "doctor", "-c", c.cfgPath); code != cli.ExitFailure {
+		t.Errorf("doctor exit %d, want 1", code)
+	}
+	if out := c.out.String(); !strings.Contains(out, "workflow-policy") || !strings.Contains(out, "BR-E062") || !strings.Contains(out, "deploy.yml") {
+		t.Errorf("doctor should flag the new workflow:\n%s", out)
+	}
+}
+
+func TestAForkMustSetUpItsOwnRunner(t *testing.T) {
+	c := newCLIRig(t)
+	c.mustRun(testrig.Token+"\n", c.initArgs()...) // a config for acme/widgets, as committed by its owner
+	c.gitInit(c.srv.URL + "/mallory/widgets.git")  // ...now in mallory's fork
+
+	for _, args := range [][]string{{"apply", "-c", c.cfgPath, "--dry-run"}, {"apply", "-c", c.cfgPath}} {
+		if code := c.run("", args...); code != cli.ExitFailure || !strings.Contains(c.err.String(), "BR-E063") {
+			t.Fatalf("%v: exit %d, stderr:\n%s", args, code, c.err.String())
+		}
+		if !strings.Contains(c.err.String(), "bladerunner init --force --repository mallory/widgets") {
+			t.Errorf("the fork's owner needs to be told what to do:\n%s", c.err.String())
+		}
+		c.assertUntouched()
+	}
+
+	// What the fork owner does: their own init for their own repository, with their token.
+	c.srv.Repos["mallory/widgets"] = true
+	c.mustRun(testrig.Token+"\n", "init", "-c", c.cfgPath, "--force", "--scope", "repo", "--repository", "mallory/widgets",
+		"--name", "mallory-runner", "--token-stdin")
+	cfg, _ := os.ReadFile(c.cfgPath)
+	if !strings.Contains(string(cfg), "trusted_actors: [mallory]") {
+		t.Errorf("the fork's config must trust only the fork's owner, not acme:\n%s", cfg)
+	}
+	c.mustRun("", "apply", "-c", c.cfgPath)
+	if len(c.srv.Runners("mallory/widgets")) != 1 || len(c.srv.Runners("acme/widgets")) != 0 {
+		t.Errorf("the fork registered a runner in the wrong place: mallory=%v acme=%v", c.srv.Runners("mallory/widgets"), c.srv.Runners("acme/widgets"))
+	}
+}
+
+func TestAllowRepoMismatchFlag(t *testing.T) {
+	c := newCLIRig(t)
+	c.mustRun(testrig.Token+"\n", c.initArgs()...)
+	c.gitInit(c.srv.URL + "/mallory/widgets.git")
+	c.mustRun("", "apply", "-c", c.cfgPath, "--allow-repo-mismatch")
+	if !strings.Contains(c.out.String(), "--allow-repo-mismatch") {
+		t.Errorf("the override must be announced:\n%s", c.out.String())
+	}
+}
+
+func TestPublicRepositoryNeedsEveryLayer(t *testing.T) {
+	c := newCLIRig(t)
+	c.srv.Repos["acme/widgets"] = false // public
+	c.mustRun(testrig.Token+"\n", c.initArgs("--allow-public-runner")...)
+	c.writeWorkflow("ci.yml", testrig.GuardedWorkflow)
+
+	// 1. no opt-in flag
+	if code := c.run("", "apply", "-c", c.cfgPath); code != cli.ExitFailure || !strings.Contains(c.err.String(), "BR-E060") {
+		t.Fatalf("without --allow-public-runner: exit %d, stderr:\n%s", code, c.err.String())
+	}
+	// 2. opt-in, but outside contributors' runs do not need approval
+	c.srv.ForkApproval = map[string]string{"acme/widgets": "first_time_contributors"}
+	if code := c.run("", "apply", "-c", c.cfgPath, "--allow-public-runner"); code != cli.ExitFailure || !strings.Contains(c.err.String(), "BR-E064") {
+		t.Fatalf("weak approval policy: exit %d, stderr:\n%s", code, c.err.String())
+	}
+	c.assertUntouched()
+	// 3. the API cannot tell: the user must confirm by hand
+	c.srv.ForkApproval = nil
+	c.srv.ForkApprovalUnsupported = true
+	if code := c.run("", "apply", "-c", c.cfgPath, "--allow-public-runner"); code != cli.ExitFailure || !strings.Contains(c.err.String(), "--fork-approval-confirmed") {
+		t.Fatalf("unverifiable: exit %d, stderr:\n%s", code, c.err.String())
+	}
+	c.assertUntouched()
+	// 4. everything in place
+	c.mustRun("", "apply", "-c", c.cfgPath, "--allow-public-runner", "--fork-approval-confirmed")
+	if len(c.srv.Runners("acme/widgets")) != 1 {
+		t.Error("with every layer satisfied the runner should be registered")
+	}
+}
+
+func TestInitRecordsWhoIsTrusted(t *testing.T) {
+	t.Run("the repository owner by default", func(t *testing.T) {
+		c := newCLIRig(t)
+		c.mustRun(testrig.Token+"\n", c.initArgs()...)
+		cfg, _ := os.ReadFile(c.cfgPath)
+		if !strings.Contains(string(cfg), "trusted_actors: [acme]") {
+			t.Errorf("config:\n%s", cfg)
+		}
+		if !strings.Contains(c.out.String(), "only code from acme is allowed to run on this machine") {
+			t.Errorf("init should say who is trusted:\n%s", c.out.String())
+		}
+	})
+	t.Run("an explicit list", func(t *testing.T) {
+		c := newCLIRig(t)
+		c.mustRun(testrig.Token+"\n", c.initArgs("--trusted-actors", "acme, alice")...)
+		cfg, _ := os.ReadFile(c.cfgPath)
+		if !strings.Contains(string(cfg), "trusted_actors: [acme, alice]") {
+			t.Errorf("config:\n%s", cfg)
+		}
+	})
+	t.Run("organization scope must name them", func(t *testing.T) {
+		c := newCLIRig(t)
+		code := c.run(testrig.Token+"\n", "init", "-c", c.cfgPath, "--scope", "org", "--organization", "acme", "--token-stdin")
+		if code != cli.ExitFailure || !strings.Contains(c.err.String(), "runner.trusted_actors") {
+			t.Errorf("exit %d, stderr:\n%s", code, c.err.String())
+		}
+	})
+}
+
+func TestHookCommandDecidesLikeThePolicy(t *testing.T) {
+	c := newCLIRig(t)
+	policy := filepath.Join(t.TempDir(), "policy.json")
+	if err := os.WriteFile(policy, []byte(`{"version":1,"scope":"repo","repository":"acme/widgets","trusted_actors":["acme"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hook := func(env map[string]string, args ...string) int {
+		c.out.Reset()
+		c.err.Reset()
+		var environ []string
+		for k, v := range env {
+			environ = append(environ, k+"="+v)
+		}
+		d := cli.Deps{Stdout: &c.out, Stderr: &c.err, Environ: func() []string { return environ }}
+		return cli.Run(context.Background(), append([]string{"hook"}, args...), d)
+	}
+	owner := map[string]string{"GITHUB_REPOSITORY": "acme/widgets", "GITHUB_ACTOR": "acme", "GITHUB_EVENT_NAME": "push"}
+	stranger := map[string]string{"GITHUB_REPOSITORY": "acme/widgets", "GITHUB_ACTOR": "mallory", "GITHUB_EVENT_NAME": "push"}
+
+	if code := hook(owner, "job-started", "--policy", policy); code != cli.ExitOK || !strings.Contains(c.out.String(), "allowed") {
+		t.Errorf("owner: exit %d out=%q err=%q", code, c.out.String(), c.err.String())
+	}
+	if code := hook(stranger, "job-started", "--policy", policy); code != cli.ExitFailure || !strings.Contains(c.err.String(), "REFUSED") {
+		t.Errorf("stranger: exit %d err=%q", code, c.err.String())
+	}
+	if code := hook(owner, "job-started"); code != cli.ExitFailure || !strings.Contains(c.err.String(), "no policy file") {
+		t.Errorf("no --policy must refuse: exit %d err=%q", code, c.err.String())
+	}
+	if code := hook(owner, "job-started", "--policy", filepath.Join(t.TempDir(), "absent.json")); code != cli.ExitFailure || !strings.Contains(c.err.String(), "cannot be read") {
+		t.Errorf("a missing policy must refuse: exit %d err=%q", code, c.err.String())
+	}
+	if code := hook(owner); code != cli.ExitUsage {
+		t.Errorf("`hook` with no subcommand: exit %d, want 2", code)
+	}
+	if code := hook(owner, "other"); code != cli.ExitUsage {
+		t.Errorf("an unknown hook: exit %d, want 2", code)
+	}
+}

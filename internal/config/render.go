@@ -43,6 +43,7 @@ func Render(c *Config) []byte {
 	if len(c.Runner.Labels) > 0 {
 		fmt.Fprintf(&b, "  labels: %s\n", list(c.Runner.Labels))
 	}
+	fmt.Fprintf(&b, "  trusted_actors: %s\n", list(c.Runner.TrustedActors))
 	fmt.Fprintf(&b, "  work_dir: %s\n", q(c.Runner.WorkDir))
 	fmt.Fprintf(&b, "  token:\n    source: %s\n", q(c.Runner.Token.Source))
 

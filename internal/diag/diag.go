@@ -32,6 +32,10 @@ const (
 	CodeRunnerOffline       = "BR-E052"
 	CodePublicRepoRefused   = "BR-E060"
 	CodeVisibilityUnknown   = "BR-E061"
+	CodeWorkflowPolicy      = "BR-E062"
+	CodeRepoMismatch        = "BR-E063"
+	CodeForkApproval        = "BR-E064"
+	CodeJobHook             = "BR-E065"
 	CodeDiskLow             = "BR-E070"
 	CodeCLIOutdated         = "BR-E071"
 	CodeStateCorrupt        = "BR-E080"
@@ -47,7 +51,7 @@ func All() []string {
 		CodeTokenStoreFailed, CodeReleaseUnresolved, CodeChecksumMismatch, CodeDownloadFailed,
 		CodeRegistrationFailed, CodeRunnerNotRegistered, CodeServiceInstall,
 		CodeServiceNotRunning, CodeRunnerOffline, CodePublicRepoRefused,
-		CodeVisibilityUnknown, CodeDiskLow, CodeCLIOutdated, CodeStateCorrupt,
+		CodeVisibilityUnknown, CodeWorkflowPolicy, CodeRepoMismatch, CodeForkApproval, CodeJobHook, CodeDiskLow, CodeCLIOutdated, CodeStateCorrupt,
 		CodeConfirmRequired, CodeLocalPlacement,
 	}
 }
