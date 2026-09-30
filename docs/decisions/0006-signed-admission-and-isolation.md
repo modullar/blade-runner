@@ -60,9 +60,39 @@ why a revoked key is refused at once and forever.
 | Increment | State |
 |-----------|-------|
 | 1. Admission: SSH signature verification, trust store, `bladerunner trust add/list/revoke/verify`, provider `Commit` | **Built and tested** against real `git` and `ssh-keygen` output and a fake GitHub |
-| 2. Isolation runtime: hardened ephemeral containers | Not built |
+| 2. Isolation runtime: hardened ephemeral containers (`internal/isolation`) | **Built and tested against a real Docker daemon**; not yet connected to anything that starts jobs |
 | 3. Supervisor: polling, admission, just-in-time runner, job binding | Not built |
 | 4. Retire the host-installed runner, `trusted_actors`, the login-based hook and the workflow guard's actor rule | Not built |
+
+### What the real-Docker tests showed (increment 2)
+
+Run against Docker 29.3.1 (runc, builtin seccomp profile). A probe program inside the container
+tried each of these; **blocked** means the kernel refused it:
+
+| A hostile job tries to | Result |
+|------------------------|--------|
+| write the root filesystem | blocked (read-only) |
+| execute a file it wrote to `/tmp` | blocked (`noexec`) |
+| `mount`, `chroot`, raw sockets, become root, create a user namespace | blocked (no capabilities, seccomp, no-new-privileges) |
+| read a host file (`/etc/shadow`, a file in the host's temp dir) | blocked (nothing is mounted) |
+| reach a host service, network `none` | blocked |
+| fork without end | stopped by the process limit |
+| allocate without end | killed at the memory limit (exit 137, `OOMKilled`) |
+| run forever | killed at the timeout; container removed |
+| print without end | output capped at 4 MiB per stream |
+| **reach a host service, network `bridge`** | **allowed: a known limit** (below) |
+
+The container is created, read back with `docker inspect`, audited, and started only if it is as
+confined as specified; a runtime that ignores a flag gets no job (tested by making the real
+Docker CLI drop `--read-only`). Every run leaves no container behind, including on timeout and on
+refusal. The real test also found, and this increment fixed, a bug the mocks could not: the job
+could not write to its own work area because the tmpfs was root-owned.
+
+**Known limit, recorded as a test:** `bridge` network mode reaches whatever the host network
+reaches, including services on the host and the LAN. Blocking that needs firewall rules inside
+the Docker host (on a Mac, inside its VM), which this package does not install. Until they
+exist, a job that needs no network must use `none`, and a runner that must reach GitHub should be
+treated as able to reach the host's network.
 
 Until 3 and 4 land, **the trust store is not yet consulted when a job runs**: `apply` still
 installs the login-based hook of 0005. `trust verify` only reports what admission would decide.

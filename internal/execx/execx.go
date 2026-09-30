@@ -26,6 +26,8 @@ type Cmd struct {
 	// Stdout, when set, receives the command's output as it is produced (for `logs -f`)
 	// instead of it being collected in Result.Stdout.
 	Stdout io.Writer
+	// Stderr, when set, receives the command's error output as it is produced.
+	Stderr io.Writer
 }
 
 // Result is what a command printed and how it exited.
@@ -85,6 +87,9 @@ func (OS) Run(ctx context.Context, c Cmd) (Result, error) {
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if c.Stdout != nil {
 		cmd.Stdout = c.Stdout
+	}
+	if c.Stderr != nil {
+		cmd.Stderr = c.Stderr
 	}
 	err := cmd.Run()
 	res := Result{Stdout: stdout.String(), Stderr: stderr.String()}

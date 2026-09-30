@@ -34,6 +34,10 @@ func (f *Fake) Run(_ context.Context, c Cmd) (Result, error) {
 		_, _ = c.Stdout.Write([]byte(res.Stdout))
 		res.Stdout = ""
 	}
+	if c.Stderr != nil {
+		_, _ = c.Stderr.Write([]byte(res.Stderr))
+		res.Stderr = ""
+	}
 	return res, err
 }
 

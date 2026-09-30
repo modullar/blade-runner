@@ -61,6 +61,7 @@ internal/yamlsubset/    the strict YAML subset the config uses (standard library
 internal/core/          idempotent, resumable step engine; state file; directory lock
 internal/hook/          the job-started policy: who may run jobs here (the enforcement)
 internal/guard/         workflow scan: defence in depth, not the enforcement
+internal/isolation/     hardened, audited, ephemeral containers for jobs (tested on real Docker)
 internal/trust/         ed25519 SSH-signature verification of commits; the trust store
 internal/admit/         "may this commit run here?": provider bytes checked by internal/trust
 internal/install/       the gates and steps behind apply and remove

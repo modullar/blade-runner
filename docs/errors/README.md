@@ -208,6 +208,16 @@ alice.pub`; they sign commits with the matching private key (`git config gpg.for
 `git commit -S`). To take it back: `bladerunner trust revoke alice`. Only SSH signatures with
 ed25519 keys are supported.
 
+### BR-E068
+
+**A job's container was refused.** Either the job description is unsafe (an image that is not
+pinned by content, an unknown network mode, a bad name), or Docker applied a configuration
+that is less confined than required: it runs as root, is privileged, adds capabilities, has a
+writable root filesystem, can gain privileges, shares a host namespace, mounts host paths,
+publishes ports, or lacks memory, CPU or process limits. Blade Runner creates the container,
+reads back what Docker actually applied, and starts it only if every invariant holds, so an
+unconfined job never runs. The message lists each violation. Update Docker, or report it.
+
 ### BR-E070
 
 **Low disk space** where the runner works. Below 10 GiB free is a warning and below 2 GiB a
