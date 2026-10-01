@@ -77,6 +77,7 @@ type Server struct {
 	nextID    int64
 	regTokens map[string]string // registration token -> scope target
 	requests  []string
+	uris      []string // "METHOD /path?query"
 	// ReleaseAuthHeader is the Authorization header seen on the release lookup.
 	ReleaseAuthHeader string
 }
@@ -350,6 +351,13 @@ func (s *Server) Requests() []string {
 	return append([]string(nil), s.requests...)
 }
 
+// URIs returns "METHOD /path?query" for every request so far, to assert how a client paged.
+func (s *Server) URIs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.uris...)
+}
+
 // Runners returns a copy of the runners registered at target.
 func (s *Server) Runners(target string) []Runner {
 	s.mu.Lock()
@@ -393,6 +401,7 @@ func (s *Server) register(target, name string, labels []string, online bool) {
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.requests = append(s.requests, r.Method+" "+r.URL.Path)
+	s.uris = append(s.uris, r.Method+" "+r.URL.RequestURI())
 	down := s.Down
 	failPath := s.FailPathContains
 	s.mu.Unlock()

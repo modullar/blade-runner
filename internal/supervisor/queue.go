@@ -18,10 +18,19 @@ const (
 	statusCompleted  = "completed"
 )
 
-// pendingRunStatuses are the run statuses scanned for jobs a runner could still take. A run that
-// is in progress can still have a job that is not yet queued (it waits for another job), so
-// "queued" alone would miss it: that gap is exactly how an unadmitted job could slip in.
-var pendingRunStatuses = []string{"queued", "in_progress", "waiting", "pending", "requested"}
+// pendingRunStatuses are the run statuses scanned for jobs a runner could still take, in REVERSE
+// lifecycle order: a run only moves requested, pending, waiting, queued, in_progress, completed,
+// so a run that advances while the statuses are being read moves into a status that has not been
+// read yet, never into one already read. Read the other way round (queued first), a run that
+// goes from waiting to queued between two listings is in neither, and an unadmitted job slips
+// past the scan. A run that is in progress can still have a job that is not yet queued (it waits
+// for another job), so "queued" alone would miss it as well.
+var pendingRunStatuses = []string{"requested", "pending", "waiting", "queued", "in_progress"}
+
+// scanPasses is how many times the pending statuses are read. The order above makes one pass
+// consistent for runs that advance; a run CREATED after its status was read is only caught by
+// reading again, and the union of the passes is the picture.
+const scanPasses = 2
 
 // observed is a job together with the run it belongs to.
 type observed struct {
@@ -37,32 +46,48 @@ const completedRunsScanned = 30
 // time, never trusted from disk. withCompleted adds the newest finished runs, to see which job a
 // runner that has already exited took. Any provider failure is an error: a partial picture must
 // never be mistaken for an empty queue.
+//
+// A listing is not an atomic snapshot (each status is a separate request), so the picture is the
+// union of two passes read in reverse lifecycle order (see pendingRunStatuses). A run seen in the
+// first pass is not read again in the second: only runs that are new then cost a jobs request.
 func (s *Supervisor) scan(ctx context.Context, withCompleted bool) ([]observed, error) {
-	statuses := pendingRunStatuses
-	if withCompleted {
-		statuses = append(append([]string(nil), statuses...), "completed")
-	}
 	seen := map[int64]bool{}
 	var out []observed
-	for _, st := range statuses {
-		runs, err := s.cfg.Provider.ListRuns(ctx, s.cfg.Scope.Repository, st)
-		if err != nil {
-			return nil, queueErr(err, "cannot list "+st+" runs")
+	read := func(r provider.Run) error {
+		if seen[r.ID] {
+			return nil
 		}
-		if st == "completed" && len(runs) > completedRunsScanned {
-			runs = runs[:completedRunsScanned]
+		seen[r.ID] = true
+		jobs, err := s.cfg.Provider.ListJobs(ctx, s.cfg.Scope.Repository, r.ID)
+		if err != nil {
+			return queueErr(err, "cannot list the jobs of run "+itoa(r.ID))
+		}
+		for _, j := range jobs {
+			out = append(out, observed{Run: r, Job: j})
+		}
+		return nil
+	}
+	for pass := 0; pass < scanPasses; pass++ {
+		for _, st := range pendingRunStatuses {
+			runs, err := s.cfg.Provider.ListRuns(ctx, s.cfg.Scope.Repository, st)
+			if err != nil {
+				return nil, queueErr(err, "cannot list "+st+" runs")
+			}
+			for _, r := range runs {
+				if err := read(r); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	if withCompleted { // last: completed is the end of the lifecycle
+		runs, err := s.cfg.Provider.ListRecentRuns(ctx, s.cfg.Scope.Repository, statusCompleted, completedRunsScanned)
+		if err != nil {
+			return nil, queueErr(err, "cannot list completed runs")
 		}
 		for _, r := range runs {
-			if seen[r.ID] {
-				continue
-			}
-			seen[r.ID] = true
-			jobs, err := s.cfg.Provider.ListJobs(ctx, s.cfg.Scope.Repository, r.ID)
-			if err != nil {
-				return nil, queueErr(err, "cannot list the jobs of run "+itoa(r.ID))
-			}
-			for _, j := range jobs {
-				out = append(out, observed{Run: r, Job: j})
+			if err := read(r); err != nil {
+				return nil, err
 			}
 		}
 	}

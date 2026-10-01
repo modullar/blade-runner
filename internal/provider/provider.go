@@ -72,6 +72,9 @@ type Provider interface {
 	// ListRuns returns recent workflow runs, newest first. status filters (queued, in_progress,
 	// completed); "" means any.
 	ListRuns(ctx context.Context, repository, status string) ([]Run, error)
+	// ListRecentRuns returns at most the newest limit runs with that status, reading no more
+	// pages than that takes. limit must be positive.
+	ListRecentRuns(ctx context.Context, repository, status string, limit int) ([]Run, error)
 	// ListJobs returns every job of one workflow run.
 	ListJobs(ctx context.Context, repository string, runID int64) ([]Job, error)
 	// CancelRun asks the provider to cancel a workflow run. Cancelling is a request, not a fact:

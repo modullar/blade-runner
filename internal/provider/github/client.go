@@ -300,10 +300,29 @@ var repoURLRe = regexp.MustCompile(`/repos/([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9.
 // ListRuns returns workflow runs, newest first, following pagination. The field names are
 // assumptions to confirm in BR-0 (C3). A listing longer than listMaxPages pages is an error.
 func (c *Client) ListRuns(ctx context.Context, repository, status string) ([]provider.Run, error) {
+	return c.listRuns(ctx, repository, status, 0)
+}
+
+// ListRecentRuns returns the newest limit runs (fewer if fewer exist), reading only as many
+// pages as that takes: a caller that wants "the latest 30" must not pay for every page of a long
+// history. A list that stops short of both limit and total_count is an error, as in ListRuns.
+func (c *Client) ListRecentRuns(ctx context.Context, repository, status string, limit int) ([]provider.Run, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("ListRecentRuns: limit %d is not positive", limit)
+	}
+	return c.listRuns(ctx, repository, status, limit)
+}
+
+// listRuns reads runs; limit 0 means all of them.
+func (c *Client) listRuns(ctx context.Context, repository, status string, limit int) ([]provider.Run, error) {
 	var runs []provider.Run
 	total := 0
+	perPage := listPerPage
+	if limit > 0 && limit < perPage {
+		perPage = limit
+	}
 	for page := 1; page <= listMaxPages; page++ {
-		q := url.Values{"per_page": {strconv.Itoa(listPerPage)}, "page": {strconv.Itoa(page)}}
+		q := url.Values{"per_page": {strconv.Itoa(perPage)}, "page": {strconv.Itoa(page)}}
 		if status != "" {
 			q.Set("status", status)
 		}
@@ -360,6 +379,12 @@ func (c *Client) ListRuns(ctx context.Context, repository, status string) ([]pro
 		if len(runs) >= total {
 			break
 		}
+		if limit > 0 && len(runs) >= limit {
+			return runs[:limit], nil // asked for the newest few, and has them
+		}
+	}
+	if limit > 0 && len(runs) >= limit {
+		return runs[:limit], nil
 	}
 	if len(runs) != total {
 		return nil, incompleteList("workflow runs", len(runs), total, "a very long queue (GitHub lists at most 1000 results), or a runaway workflow", "clear the queue (cancel old runs), then re-run")

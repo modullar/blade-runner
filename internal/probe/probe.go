@@ -170,7 +170,7 @@ func checkCommits(ctx context.Context, p provider.Provider, repo string) []Findi
 
 func checkRuns(ctx context.Context, p provider.Provider, repo string) []Finding {
 	f := Finding{ID: "C3", Assumption: "a workflow run says which commit it executes, for which event, from which repository, on behalf of whom"}
-	runs, err := p.ListRuns(ctx, repo, "")
+	runs, err := p.ListRecentRuns(ctx, repo, "", 30)
 	if err != nil {
 		f.Status, f.Detail = Fail, "cannot list runs: "+describe(err)
 		return []Finding{f}
