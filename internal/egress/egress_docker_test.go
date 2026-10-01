@@ -963,18 +963,21 @@ func TestRealDocker_ADenialFloodIsCountedNotItemisedAndTheAllowedRecordSurvives(
 	if err != nil {
 		t.Fatal(err)
 	}
-	var allowed, itemised, summaries int
+	var allowed, itemised, lastSummary int
 	for _, d := range ds {
 		switch {
 		case d.Allowed && d.Host == "allowed.test":
 			allowed++
 		case d.Reason == ReasonSuppressed:
-			summaries++
-		case !d.Allowed:
+			lastSummary = d.Count
+		case d.Reason == ReasonNotAllowlist:
 			itemised++
 		}
 	}
-	if allowed != 1 || itemised != 3 || summaries == 0 {
-		t.Errorf("allowed=%d itemised denials=%d summaries=%d, want 1, 3 (the cap) and at least one summary: %+v", allowed, itemised, summaries, ds)
+	// The budget is per reason (the readiness probe's own "method" refusal does not use it up),
+	// and Decisions asked the proxy to flush first: the newest summary carries the FINAL count,
+	// not the count at the moment the first summary was written.
+	if allowed != 1 || itemised != 3 || lastSummary != 5 {
+		t.Errorf("allowed=%d itemised not-allowlisted=%d final summary count=%d, want 1, 3 (the budget) and 5 (8 refused - 3 itemised): %+v", allowed, itemised, lastSummary, ds)
 	}
 }

@@ -146,6 +146,7 @@ func TestPublicOnlyRefusesEveryInternalAddress(t *testing.T) {
 		"2001:10::1", "2001:1f::1", // ORCHID
 		"3fff::1", "3fff:fff::1", // documentation
 		"5f00::1", "5f00:ffff::1", // SRv6 segment identifiers
+		"64:ff9b:1::1", "64:ff9b:1::a00:1", "64:ff9b:1:ffff:ffff:ffff:ffff:ffff", // local-use NAT64 (RFC 8215), the whole /48
 	}
 	for _, s := range refused {
 		if err := (PublicOnly{}).Check(netip.MustParseAddr(s)); err == nil {
@@ -158,7 +159,7 @@ func TestPublicOnlyRefusesEveryInternalAddress(t *testing.T) {
 	if err := (PublicOnly{}).Check(netip.MustParseAddr("fe80::1%eth0")); err == nil {
 		t.Error("a zoned address must be refused")
 	}
-	for _, s := range []string{"8.8.8.8", "1.1.1.1", "140.82.112.3", "93.184.216.34", "172.32.0.1", "172.15.255.255", "100.63.255.255", "100.128.0.1", "2606:4700:4700::1111", "2a00:1450:4001::1", "192.88.98.1", "192.88.100.1", "2001:3::1", "5e00::1", "5f01::1", "3ffe::1"} {
+	for _, s := range []string{"8.8.8.8", "1.1.1.1", "140.82.112.3", "93.184.216.34", "172.32.0.1", "172.15.255.255", "100.63.255.255", "100.128.0.1", "2606:4700:4700::1111", "2a00:1450:4001::1", "192.88.98.1", "192.88.100.1", "2001:3::1", "5e00::1", "5f01::1", "3ffe::1", "64:ff9b:2::1", "64:ff9a:1::1"} {
 		if err := (PublicOnly{}).Check(netip.MustParseAddr(s)); err != nil {
 			t.Errorf("%s is a public address and must be allowed: %v", s, err)
 		}

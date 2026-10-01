@@ -36,6 +36,9 @@ const (
 	ReasonTooMany       = "too-many-connections"
 	// ReasonSuppressed marks a summary line from DecisionLog: denials past its itemising cap.
 	ReasonSuppressed = "denials-not-itemised"
+	// ReasonFlushed marks the acknowledgement of a flush request (SIGUSR1): Count is how many
+	// have been answered. It is bookkeeping, not a decision, and Session.Decisions hides it.
+	ReasonFlushed = "flushed"
 )
 
 // Limits on the text a Decision may carry, so what a client sends cannot make log lines large.
@@ -43,7 +46,25 @@ const (
 	maxLoggedHost   = 64
 	maxLoggedPort   = 8
 	maxLoggedDetail = 200
+	// A name may resolve to dozens of addresses; the log needs a few to show where it pointed.
+	maxLoggedResolved      = 8
+	maxLoggedResolvedBytes = 256
 )
+
+// clipResolved keeps at most maxLoggedResolved addresses and maxLoggedResolvedBytes of text,
+// and says how many were left out.
+func clipResolved(rs []string) []string {
+	var out []string
+	size := 0
+	for i, r := range rs {
+		if len(out) >= maxLoggedResolved || size+len(r) > maxLoggedResolvedBytes {
+			return append(out, fmt.Sprintf("+%d more", len(rs)-i))
+		}
+		out = append(out, clip(r, 64))
+		size += len(r)
+	}
+	return out
+}
 
 // clip shortens s to at most n bytes, marking the cut, and keeps it valid UTF-8.
 func clip(s string, n int) string {
@@ -64,6 +85,9 @@ type Decision struct {
 	Reason   string    `json:"reason"`
 	Detail   string    `json:"detail,omitempty"`
 	Resolved []string  `json:"resolved,omitempty"`
+	// Count is set on aggregate lines (ReasonSuppressed, and repeated allowed decisions): how many
+	// requests the line stands for.
+	Count int `json:"count,omitempty"`
 }
 
 // Proxy is an HTTP CONNECT forward proxy that tunnels only to allowlisted hostnames.
@@ -167,6 +191,7 @@ func (p *Proxy) Close() error {
 func (p *Proxy) observe(d Decision) {
 	d.Time = time.Now().UTC()
 	d.Host, d.Port, d.Detail = clip(d.Host, maxLoggedHost), clip(d.Port, maxLoggedPort), clip(d.Detail, maxLoggedDetail)
+	d.Resolved = clipResolved(d.Resolved)
 	if p.Observe != nil {
 		p.Observe(d)
 	}
