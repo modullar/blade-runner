@@ -36,6 +36,22 @@ type Config struct {
 	Placement   PlacementConfig
 	Workflows   []string
 	Agent       Agent
+	Supervisor  Supervisor
+}
+
+// Supervisor configures `bladerunner supervise` (decision 0007). All keys are optional in the
+// file; the command requires an image from here or from --image.
+type Supervisor struct {
+	// Image is the runner image, pinned by content: name@sha256:<hex> or sha256:<hex>. Its
+	// entrypoint reads the just-in-time runner config from standard input.
+	Image string
+	// Network is "bridge" (default: the runner must reach GitHub) or "none".
+	Network        string
+	MemoryMiB      int
+	TimeoutMinutes int
+	// CancelUnadmitted lets the supervisor ask GitHub to cancel runs it refused, so a refused
+	// job cannot block the queue forever. Off by default: cancelling is visible to others.
+	CancelUnadmitted bool
 }
 
 // BladeRunner carries the tool's own pin.

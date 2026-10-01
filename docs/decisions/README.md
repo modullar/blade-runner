@@ -25,6 +25,8 @@ fake can only confirm the code agrees with itself.
 
 | C1 to C3 | GitHub exposes a commit's signed bytes, supports one-job just-in-time runners, and names the commit a job would run | **Open**; see [0006](0006-signed-admission-and-isolation.md) | `provider/github`, future supervisor |
 
+| C4 to C9 | The supervisor's further assumptions: run cancellation, `runner_name` on jobs, job statuses, JIT labels, pagination, the runner image reading its config from stdin | **Open**; see [0007](0007-supervisor.md), which also states the shared-queue race it narrows but does not close | `provider/github`, `internal/supervisor` |
+
 The current direction, cryptographic admission plus isolated runners, is
 [0006](0006-signed-admission-and-isolation.md); it supersedes the login-based hook of 0005 once built.
 

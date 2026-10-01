@@ -311,3 +311,49 @@ func TestTrustedActors(t *testing.T) {
 		}
 	})
 }
+
+const supervisorBase = `version: 1
+runner:
+  scope: repo
+  repository: acme/widgets
+  name: mini
+`
+
+func TestSupervisorSection(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("ab", 32)
+	cfg, err := Parse([]byte(supervisorBase+"supervisor:\n  image: ghcr.io/acme/runner@"+digest+"\n  network: none\n  memory_mib: 2048\n  timeout_minutes: 30\n  cancel_unadmitted: true\n"), macDefaults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := cfg.Supervisor
+	if s.Image != "ghcr.io/acme/runner@"+digest || s.Network != "none" || s.MemoryMiB != 2048 || s.TimeoutMinutes != 30 || !s.CancelUnadmitted {
+		t.Errorf("supervisor = %+v", s)
+	}
+	// Everything is optional, and cancelling refused runs is off unless asked for.
+	cfg, err = Parse([]byte(supervisorBase), macDefaults)
+	if err != nil || cfg.Supervisor.Image != "" || cfg.Supervisor.CancelUnadmitted {
+		t.Errorf("defaults: %+v, %v", cfg, err)
+	}
+	// An image id (what `docker image inspect` prints) is content-pinned too.
+	if _, err := Parse([]byte(supervisorBase+"supervisor:\n  image: "+digest+"\n"), macDefaults); err != nil {
+		t.Errorf("an image id must be accepted: %v", err)
+	}
+}
+
+func TestSupervisorSectionProblemsNameTheirKeyPath(t *testing.T) {
+	for name, tc := range map[string]struct{ yaml, want string }{
+		"a tag that can move":    {"supervisor:\n  image: ghcr.io/acme/runner:latest\n", "supervisor.image"},
+		"host networking":        {"supervisor:\n  network: host\n", "supervisor.network"},
+		"negative memory":        {"supervisor:\n  memory_mib: -1\n", "supervisor.memory_mib"},
+		"negative timeout":       {"supervisor:\n  timeout_minutes: -5\n", "supervisor.timeout_minutes"},
+		"a flag that is no bool": {"supervisor:\n  cancel_unadmitted: maybe\n", "supervisor.cancel_unadmitted"},
+		"a typo":                 {"supervisor:\n  imag: x\n", "did you mean \"image\""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte(supervisorBase+tc.yaml), macDefaults)
+			if diag.CodeOf(err) != diag.CodeConfigInvalid || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}

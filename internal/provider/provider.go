@@ -72,8 +72,12 @@ type Provider interface {
 	// ListRuns returns recent workflow runs, newest first. status filters (queued, in_progress,
 	// completed); "" means any.
 	ListRuns(ctx context.Context, repository, status string) ([]Run, error)
-	// ListJobs returns the jobs of one workflow run.
+	// ListJobs returns every job of one workflow run.
 	ListJobs(ctx context.Context, repository string, runID int64) ([]Job, error)
+	// CancelRun asks the provider to cancel a workflow run. Cancelling is a request, not a fact:
+	// the run may stay queued for a while or not stop at all, so the caller must read the run
+	// back (ListRuns) before relying on it. Assumption C4, unverified: see decision 0007.
+	CancelRun(ctx context.Context, repository string, runID int64) error
 	// GenerateJITConfig registers a single-use runner and returns the config that starts it.
 	// The runner is registered the moment this returns: remove it if it is not used.
 	GenerateJITConfig(ctx context.Context, scope Scope, name string, labels []string) (JITConfig, error)
@@ -94,12 +98,25 @@ type Commit struct {
 
 // Run is a workflow run: what would execute, and on whose behalf.
 type Run struct {
-	ID             int64
-	HeadSHA        string // the commit the run executes (for a pull request, the merge commit)
+	ID int64
+	// HeadSHA is the commit the run was triggered for. ASSUMPTION C3 (unverified): for a pull
+	// request this is the pull request's HEAD commit, not GitHub's synthetic merge commit. If
+	// it is the merge commit, admission refuses it (nobody signed it): that fails closed.
+	HeadSHA        string
 	Event          string
 	Status         string
 	HeadRepository string // where the commit lives: differs from the repository for a fork
 	Actor          string
+	// PullRequests are the pull requests the provider links to the run, when it says. A fork's
+	// pull request may list none; the supervisor cross-checks HeadSHA against them when present.
+	PullRequests []PullRequest
+}
+
+// PullRequest is a pull request linked to a run.
+type PullRequest struct {
+	Number         int
+	HeadSHA        string
+	HeadRepository string // OWNER/REPO, or "" when the provider did not say
 }
 
 // Job is one job of a run.

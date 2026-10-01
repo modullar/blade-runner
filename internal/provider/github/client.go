@@ -287,67 +287,120 @@ func (c *Client) ListCommits(ctx context.Context, repository string, limit int) 
 	return shas, nil
 }
 
-// ListRuns returns recent workflow runs. The field names are assumptions to confirm in BR-0.
+// Pagination bounds for the run and job listings. The supervisor decides whether it is safe to
+// start a runner from these lists, so a list that was cut short must be an error, never a
+// silently shorter answer.
+const (
+	listPerPage  = 100
+	listMaxPages = 20
+)
+
+var repoURLRe = regexp.MustCompile(`/repos/([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)$`)
+
+// ListRuns returns workflow runs, newest first, following pagination. The field names are
+// assumptions to confirm in BR-0 (C3). A listing longer than listMaxPages pages is an error.
 func (c *Client) ListRuns(ctx context.Context, repository, status string) ([]provider.Run, error) {
-	q := url.Values{"per_page": {"30"}}
-	if status != "" {
-		q.Set("status", status)
-	}
-	var out struct {
-		Runs []struct {
-			ID       int64  `json:"id"`
-			HeadSHA  string `json:"head_sha"`
-			Event    string `json:"event"`
-			Status   string `json:"status"`
-			HeadRepo *struct {
-				FullName string `json:"full_name"`
-			} `json:"head_repository"`
-			Actor *struct {
-				Login string `json:"login"`
-			} `json:"actor"`
-		} `json:"workflow_runs"`
-	}
-	if _, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/actions/runs?"+q.Encode(), true, &out); err != nil {
-		return nil, err
-	}
-	runs := make([]provider.Run, 0, len(out.Runs))
-	for _, r := range out.Runs {
-		run := provider.Run{ID: r.ID, HeadSHA: r.HeadSHA, Event: r.Event, Status: r.Status}
-		if r.HeadRepo != nil {
-			run.HeadRepository = r.HeadRepo.FullName
+	var runs []provider.Run
+	for page := 1; page <= listMaxPages; page++ {
+		q := url.Values{"per_page": {strconv.Itoa(listPerPage)}, "page": {strconv.Itoa(page)}}
+		if status != "" {
+			q.Set("status", status)
 		}
-		if r.Actor != nil {
-			run.Actor = r.Actor.Login
+		var out struct {
+			Total int `json:"total_count"`
+			Runs  []struct {
+				ID       int64  `json:"id"`
+				HeadSHA  string `json:"head_sha"`
+				Event    string `json:"event"`
+				Status   string `json:"status"`
+				HeadRepo *struct {
+					FullName string `json:"full_name"`
+				} `json:"head_repository"`
+				Actor *struct {
+					Login string `json:"login"`
+				} `json:"actor"`
+				PullRequests []struct {
+					Number int `json:"number"`
+					Head   *struct {
+						SHA  string `json:"sha"`
+						Repo *struct {
+							URL string `json:"url"`
+						} `json:"repo"`
+					} `json:"head"`
+				} `json:"pull_requests"`
+			} `json:"workflow_runs"`
 		}
-		runs = append(runs, run)
+		if _, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/actions/runs?"+q.Encode(), true, &out); err != nil {
+			return nil, err
+		}
+		for _, r := range out.Runs {
+			run := provider.Run{ID: r.ID, HeadSHA: r.HeadSHA, Event: r.Event, Status: r.Status}
+			if r.HeadRepo != nil {
+				run.HeadRepository = r.HeadRepo.FullName
+			}
+			if r.Actor != nil {
+				run.Actor = r.Actor.Login
+			}
+			for _, pr := range r.PullRequests {
+				ref := provider.PullRequest{Number: pr.Number}
+				if pr.Head != nil {
+					ref.HeadSHA = pr.Head.SHA
+					if pr.Head.Repo != nil {
+						if m := repoURLRe.FindStringSubmatch(pr.Head.Repo.URL); m != nil {
+							ref.HeadRepository = m[1]
+						}
+					}
+				}
+				run.PullRequests = append(run.PullRequests, ref)
+			}
+			runs = append(runs, run)
+		}
+		if len(out.Runs) < listPerPage || len(runs) >= out.Total {
+			return runs, nil
+		}
 	}
-	return runs, nil
+	return nil, diag.New(diag.CodeGitHubUnavailable, fmt.Sprintf("more than %d workflow runs match; the list cannot be read completely", listPerPage*listMaxPages),
+		"a very long queue, or a runaway workflow", "clear the queue (cancel old runs), then re-run")
 }
 
-// ListJobs returns the jobs of a run.
+// ListJobs returns every job of a run, following pagination.
 func (c *Client) ListJobs(ctx context.Context, repository string, runID int64) ([]provider.Job, error) {
-	var out struct {
-		Jobs []struct {
-			ID         int64    `json:"id"`
-			RunID      int64    `json:"run_id"`
-			Status     string   `json:"status"`
-			Labels     []string `json:"labels"`
-			RunnerName *string  `json:"runner_name"`
-			HeadSHA    string   `json:"head_sha"`
-		} `json:"jobs"`
-	}
-	if _, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs/%d/jobs", repository, runID), true, &out); err != nil {
-		return nil, err
-	}
-	jobs := make([]provider.Job, 0, len(out.Jobs))
-	for _, j := range out.Jobs {
-		job := provider.Job{ID: j.ID, RunID: j.RunID, Status: j.Status, Labels: j.Labels, HeadSHA: j.HeadSHA}
-		if j.RunnerName != nil {
-			job.RunnerName = *j.RunnerName
+	var jobs []provider.Job
+	for page := 1; page <= listMaxPages; page++ {
+		q := url.Values{"per_page": {strconv.Itoa(listPerPage)}, "page": {strconv.Itoa(page)}}
+		var out struct {
+			Total int `json:"total_count"`
+			Jobs  []struct {
+				ID         int64    `json:"id"`
+				RunID      int64    `json:"run_id"`
+				Status     string   `json:"status"`
+				Labels     []string `json:"labels"`
+				RunnerName *string  `json:"runner_name"`
+				HeadSHA    string   `json:"head_sha"`
+			} `json:"jobs"`
 		}
-		jobs = append(jobs, job)
+		if _, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs/%d/jobs?%s", repository, runID, q.Encode()), true, &out); err != nil {
+			return nil, err
+		}
+		for _, j := range out.Jobs {
+			job := provider.Job{ID: j.ID, RunID: j.RunID, Status: j.Status, Labels: j.Labels, HeadSHA: j.HeadSHA}
+			if j.RunnerName != nil {
+				job.RunnerName = *j.RunnerName
+			}
+			jobs = append(jobs, job)
+		}
+		if len(out.Jobs) < listPerPage || len(jobs) >= out.Total {
+			return jobs, nil
+		}
 	}
-	return jobs, nil
+	return nil, diag.New(diag.CodeGitHubUnavailable, fmt.Sprintf("run %d has more than %d jobs; they cannot be read completely", runID, listPerPage*listMaxPages),
+		"an unusually large matrix", "cancel the run")
+}
+
+// CancelRun asks GitHub to cancel a run. The endpoint (POST .../actions/runs/{id}/cancel,
+// answering 202) is assumption C4, to confirm in BR-0.
+func (c *Client) CancelRun(ctx context.Context, repository string, runID int64) error {
+	return c.send(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/actions/runs/%d/cancel", repository, runID), struct{}{}, nil)
 }
 
 // GenerateJITConfig registers a single-use runner. The endpoint and fields are assumptions to

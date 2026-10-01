@@ -51,6 +51,14 @@ type Server struct {
 	// JITUnsupported makes generate-jitconfig answer 404, as an API without it would.
 	JITUnsupported          bool
 	ForkApprovalUnsupported bool
+	// CancelIgnored makes the cancel endpoint answer 202 without cancelling anything, as a
+	// cancellation that is slow or never takes effect would look. CancelUnsupported answers 404.
+	CancelIgnored     bool
+	CancelUnsupported bool
+	// JobRunIDOffset is added to the run_id the jobs endpoint reports, as inconsistent data would.
+	JobRunIDOffset int64
+	// FailPathContains makes every request whose path contains it answer 500.
+	FailPathContains string
 	// Tarball is the runner archive served; ChecksumOverride and OmitChecksum corrupt the
 	// published checksum on purpose.
 	Tarball          []byte
@@ -128,43 +136,159 @@ func (s *Server) AddJob(repo string, j provider.Job) {
 	s.jobs[repo] = append(s.jobs[repo], j)
 }
 
+// page returns the slice of n items that the request's page/per_page select (default: all).
+func page(r *http.Request, n int) (lo, hi int) {
+	perPage, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
+	pg, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if perPage < 1 {
+		return 0, n
+	}
+	if pg < 1 {
+		pg = 1
+	}
+	lo, hi = (pg-1)*perPage, pg*perPage
+	if lo > n {
+		lo = n
+	}
+	if hi > n {
+		hi = n
+	}
+	return lo, hi
+}
+
 func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request, repo string, rest []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(rest) == 1 { // GET .../actions/runs[?status=]
-		status := r.URL.Query().Get("status")
-		out := []map[string]any{}
-		all := s.runs[repo]
-		for i := len(all) - 1; i >= 0; i-- { // newest first
-			run := all[i]
-			if status != "" && run.Status != status {
-				continue
-			}
-			out = append(out, map[string]any{
-				"id": run.ID, "head_sha": run.HeadSHA, "event": run.Event, "status": run.Status,
-				"head_repository": map[string]string{"full_name": run.HeadRepository},
-				"actor":           map[string]string{"login": run.Actor},
-			})
+	if r.Method == http.MethodPost && len(rest) == 3 && rest[2] == "cancel" { // POST .../actions/runs/{id}/cancel
+		id, _ := strconv.ParseInt(rest[1], 10, 64)
+		if s.CancelUnsupported {
+			writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(out), "workflow_runs": out})
+		found := false
+		for i := range s.runs[repo] {
+			if s.runs[repo][i].ID == id {
+				found = true
+				if !s.CancelIgnored {
+					s.runs[repo][i].Status = "completed"
+					for j := range s.jobs[repo] {
+						if s.jobs[repo][j].RunID == id && s.jobs[repo][j].Status != "in_progress" {
+							s.jobs[repo][j].Status = "completed"
+						}
+					}
+				}
+			}
+		}
+		if !found {
+			writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{})
 		return
 	}
-	if len(rest) == 3 && rest[2] == "jobs" { // GET .../actions/runs/{id}/jobs
-		id, _ := strconv.ParseInt(rest[1], 10, 64)
-		out := []map[string]any{}
-		for _, j := range s.jobs[repo] {
-			if j.RunID == id {
-				var runner any
-				if j.RunnerName != "" {
-					runner = j.RunnerName
-				}
-				out = append(out, map[string]any{"id": j.ID, "run_id": j.RunID, "status": j.Status, "labels": j.Labels, "runner_name": runner, "head_sha": j.HeadSHA})
+	if r.Method == http.MethodGet && len(rest) == 1 { // GET .../actions/runs[?status=]
+		status := r.URL.Query().Get("status")
+		var matching []provider.Run
+		all := s.runs[repo]
+		for i := len(all) - 1; i >= 0; i-- { // newest first
+			if status == "" || all[i].Status == status {
+				matching = append(matching, all[i])
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(out), "jobs": out})
+		lo, hi := page(r, len(matching))
+		out := []map[string]any{}
+		for _, run := range matching[lo:hi] {
+			prs := []map[string]any{}
+			for _, pr := range run.PullRequests {
+				prs = append(prs, map[string]any{"number": pr.Number, "head": map[string]any{
+					"sha": pr.HeadSHA, "repo": map[string]string{"url": s.URL + "/repos/" + pr.HeadRepository}}})
+			}
+			entry := map[string]any{
+				"id": run.ID, "head_sha": run.HeadSHA, "event": run.Event, "status": run.Status,
+				"actor": map[string]string{"login": run.Actor}, "pull_requests": prs,
+			}
+			if run.HeadRepository != "" {
+				entry["head_repository"] = map[string]string{"full_name": run.HeadRepository}
+			}
+			out = append(out, entry)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(matching), "workflow_runs": out})
+		return
+	}
+	if r.Method == http.MethodGet && len(rest) == 3 && rest[2] == "jobs" { // GET .../actions/runs/{id}/jobs
+		id, _ := strconv.ParseInt(rest[1], 10, 64)
+		var mine []provider.Job
+		for _, j := range s.jobs[repo] {
+			if j.RunID == id {
+				mine = append(mine, j)
+			}
+		}
+		lo, hi := page(r, len(mine))
+		out := []map[string]any{}
+		for _, j := range mine[lo:hi] {
+			var runner any
+			if j.RunnerName != "" {
+				runner = j.RunnerName
+			}
+			out = append(out, map[string]any{"id": j.ID, "run_id": j.RunID + s.JobRunIDOffset, "status": j.Status, "labels": j.Labels, "runner_name": runner, "head_sha": j.HeadSHA})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(mine), "jobs": out})
 		return
 	}
 	writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+}
+
+// SetFailPath sets FailPathContains safely while requests are in flight.
+func (s *Server) SetFailPath(contains string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.FailPathContains = contains
+}
+
+// SetRunStatus changes a run's status, as GitHub does when a run starts or finishes.
+func (s *Server) SetRunStatus(repo string, runID int64, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.runs[repo] {
+		if s.runs[repo][i].ID == runID {
+			s.runs[repo][i].Status = status
+		}
+	}
+}
+
+// UpdateJob edits a job in place, as GitHub does when a runner takes it or it finishes.
+func (s *Server) UpdateJob(repo string, jobID int64, edit func(*provider.Job)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.jobs[repo] {
+		if s.jobs[repo][i].ID == jobID {
+			edit(&s.jobs[repo][i])
+		}
+	}
+}
+
+// Job returns a copy of a job, and whether it exists.
+func (s *Server) Job(repo string, jobID int64) (provider.Job, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, j := range s.jobs[repo] {
+		if j.ID == jobID {
+			return j, true
+		}
+	}
+	return provider.Job{}, false
+}
+
+// Run returns a copy of a run, and whether it exists.
+func (s *Server) Run(repo string, runID int64) (provider.Run, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.runs[repo] {
+		if r.ID == runID {
+			return r, true
+		}
+	}
+	return provider.Run{}, false
 }
 
 func (s *Server) handleCommitList(w http.ResponseWriter, r *http.Request, repo string) {
@@ -252,7 +376,12 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.requests = append(s.requests, r.Method+" "+r.URL.Path)
 	down := s.Down
+	failPath := s.FailPathContains
 	s.mu.Unlock()
+	if failPath != "" && strings.Contains(r.URL.Path, failPath) {
+		http.Error(w, `{"message":"Internal Server Error"}`, http.StatusInternalServerError)
+		return
+	}
 	if down {
 		http.Error(w, `{"message":"Service Unavailable"}`, http.StatusServiceUnavailable)
 		return
@@ -359,7 +488,7 @@ func (s *Server) handleRunners(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	target, rest, ok := s.scopeTarget(parts)
-	if ok && len(rest) >= 1 && rest[0] == "runs" && r.Method == http.MethodGet {
+	if ok && len(rest) >= 1 && rest[0] == "runs" && (r.Method == http.MethodGet || r.Method == http.MethodPost) {
 		s.handleRuns(w, r, parts[1]+"/"+parts[2], rest)
 		return
 	}

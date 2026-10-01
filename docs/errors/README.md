@@ -227,6 +227,72 @@ failure; jobs fail confusingly when the work directory fills up. Free space.
 
 **This `bladerunner` is older than `bladerunner.min_version`.** Upgrade it.
 
+The codes BR-E072 to BR-E079 belong to the supervisor (`bladerunner supervise`, see
+[decision 0007](../decisions/0007-supervisor.md)). BR-E070 and BR-E071 above were already taken
+by the doctor, so the supervisor's range starts at 072. Every refusal below is also written to the
+audit log, `~/.bladerunner/audit/supervisor.jsonl`, and nothing was started for the job.
+
+### BR-E072
+
+**A queued job was refused: its commit is not admitted.** The supervisor verified the job's head
+commit (for a pull request, the pull request's head commit and the repository it lives in, never
+GitHub's merge commit) against this machine's trust store and the commit failed (BR-E067 explains
+which check). No runner and no container was started for it. To allow it, trust the signer
+(`bladerunner trust add`) or have them sign the commit; to get rid of a job nobody should run,
+cancel its run, or start the supervisor with `--cancel-unadmitted`.
+
+### BR-E073
+
+**A queued job was refused because GitHub's description of it is missing a field or contradicts
+itself**: no head commit or repository, a commit id that is not 40 hex digits, a head commit that
+differs from the one the job or the pull request names, a job with no labels, or a status the
+supervisor does not know. When it cannot tell what would run, it does not run it. If this appears
+for every job, GitHub's data differs from what Blade Runner assumes (C3): see decision 0007.
+
+### BR-E074
+
+**A queued job was refused because of the event that caused it.** Only `push`,
+`pull_request`, `workflow_dispatch` and `schedule` are accepted: for the others (for example
+`pull_request_target`, `issue_comment`, `workflow_run`) the code that runs is not the commit that
+was verified, or a stranger chose the moment. Change the workflow's trigger.
+
+### BR-E075
+
+**A runner was not started because a queued job that this runner could take is not admitted (or
+cannot be judged).** A just-in-time runner takes any queued job with matching labels, so starting
+one for an admitted job while an unadmitted one waits could run the unadmitted code. The
+supervisor starts nothing until every matching waiting job is admitted. Cancel the offending run,
+or start the supervisor with `--cancel-unadmitted` (or `supervisor.cancel_unadmitted: true`) so it
+asks GitHub to. The same code is used when a job appeared while a runner was already waiting: the
+runner is stopped and its registration removed.
+
+### BR-E076
+
+**The supervisor could not read the queue** (a GitHub error, a rate limit, or a list too long to
+read completely). It starts nothing and tries again at the next poll. Check the token
+(`bladerunner doctor`) and the network.
+
+### BR-E077
+
+**ALARM: a runner started by the supervisor was handed a job that was not admitted.** The
+supervisor stops the container at once and records what it saw, but code may already have
+started. Treat it as an incident: check the audit log, revoke what needs revoking, and report it:
+it means the "one runner, one admitted job" assumption failed (decision 0007).
+
+### BR-E078
+
+**Starting, running or cleaning up a runner failed**: GitHub would not issue the just-in-time
+config, the container could not be started (BR-E068 gives Docker's reasons), or the runner's
+registration could not be removed afterwards. The message says which; a registration that could
+not be removed is removed at the next start. A job that fails to start three times is left alone
+until the supervisor is restarted.
+
+### BR-E079
+
+**The audit log cannot be written.** Every decision (refusal, launch, outcome) is appended to
+`~/.bladerunner/audit/supervisor.jsonl` before it takes effect, and the supervisor refuses to
+start a job it cannot record. Fix the directory's permissions or free disk space.
+
 ### BR-E080
 
 **The local state file is unreadable, corrupt, or from a newer `bladerunner`.** State is a

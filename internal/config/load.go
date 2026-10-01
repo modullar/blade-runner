@@ -217,6 +217,23 @@ func decode(root *yamlsubset.Node) (*Config, []Problem) {
 			})
 		},
 		"workflows": func(n *yamlsubset.Node, p string) { c.Workflows = d.strList(n, p) },
+		"supervisor": func(n *yamlsubset.Node, p string) {
+			d.mapping(n, p, map[string]fieldFn{
+				"image":           func(n *yamlsubset.Node, p string) { c.Supervisor.Image = d.str(n, p) },
+				"network":         func(n *yamlsubset.Node, p string) { c.Supervisor.Network = d.str(n, p) },
+				"memory_mib":      func(n *yamlsubset.Node, p string) { c.Supervisor.MemoryMiB = d.integer(n, p) },
+				"timeout_minutes": func(n *yamlsubset.Node, p string) { c.Supervisor.TimeoutMinutes = d.integer(n, p) },
+				"cancel_unadmitted": func(n *yamlsubset.Node, p string) {
+					switch v := d.str(n, p); v {
+					case "", "false":
+					case "true":
+						c.Supervisor.CancelUnadmitted = true
+					default:
+						d.add(p, "must be true or false (got %q)", v)
+					}
+				},
+			})
+		},
 		"agent": func(n *yamlsubset.Node, p string) {
 			d.mapping(n, p, map[string]fieldFn{
 				"listen":              func(n *yamlsubset.Node, p string) { c.Agent.Listen = d.str(n, p) },

@@ -422,3 +422,70 @@ func TestGenerateJITConfigRegistersAnOfflineSingleUseRunner(t *testing.T) {
 		t.Errorf("wrong token: %v", err)
 	}
 }
+
+func TestListRunsAndJobsFollowPaginationAndRefuseAListTooLongToRead(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	for i := 1; i <= 250; i++ {
+		s.AddRun("acme/widgets", provider.Run{ID: int64(i), HeadSHA: strings.Repeat("a", 40), Event: "push", Status: "queued", HeadRepository: "acme/widgets"})
+		s.AddJob("acme/widgets", provider.Job{ID: int64(1000 + i), RunID: 1, Status: "queued", Labels: []string{"self-hosted"}})
+	}
+	c := newClient(s, "ghp_testtoken")
+	runs, err := c.ListRuns(ctx, "acme/widgets", "queued")
+	if err != nil || len(runs) != 250 || runs[0].ID != 250 || runs[249].ID != 1 {
+		t.Fatalf("runs: %d, %v (every page must be read; a short list would hide a queued job)", len(runs), err)
+	}
+	jobs, err := c.ListJobs(ctx, "acme/widgets", 1)
+	if err != nil || len(jobs) != 250 {
+		t.Fatalf("jobs: %d, %v", len(jobs), err)
+	}
+
+	for i := 251; i <= 2001; i++ {
+		s.AddRun("acme/widgets", provider.Run{ID: int64(i), HeadSHA: strings.Repeat("a", 40), Event: "push", Status: "queued"})
+	}
+	if _, err := c.ListRuns(ctx, "acme/widgets", "queued"); diag.CodeOf(err) != diag.CodeGitHubUnavailable {
+		t.Errorf("a list too long to read completely must be an error, got %v", err)
+	}
+}
+
+func TestListRunsDecodesPullRequestsAndAMissingHeadRepository(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	sha := strings.Repeat("d", 40)
+	s.AddRun("acme/widgets", provider.Run{ID: 1, HeadSHA: sha, Event: "pull_request", Status: "queued", HeadRepository: "mallory/widgets",
+		PullRequests: []provider.PullRequest{{Number: 7, HeadSHA: sha, HeadRepository: "mallory/widgets"}}})
+	s.AddRun("acme/widgets", provider.Run{ID: 2, HeadSHA: sha, Event: "push", Status: "queued"}) // no head_repository at all
+	runs, err := newClient(s, "ghp_testtoken").ListRuns(ctx, "acme/widgets", "")
+	if err != nil || len(runs) != 2 {
+		t.Fatalf("%+v, %v", runs, err)
+	}
+	if got := runs[1].PullRequests; len(got) != 1 || got[0] != (provider.PullRequest{Number: 7, HeadSHA: sha, HeadRepository: "mallory/widgets"}) {
+		t.Errorf("pull requests = %+v", got)
+	}
+	if runs[0].HeadRepository != "" {
+		t.Errorf("a missing head_repository must decode as empty, got %q", runs[0].HeadRepository)
+	}
+}
+
+func TestCancelRun(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	s.AddRun("acme/widgets", provider.Run{ID: 5, HeadSHA: strings.Repeat("a", 40), Event: "push", Status: "queued"})
+	c := newClient(s, "ghp_testtoken")
+	if err := c.CancelRun(ctx, "acme/widgets", 5); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := s.Run("acme/widgets", 5); r.Status != "completed" {
+		t.Errorf("run status = %q", r.Status)
+	}
+	if err := c.CancelRun(ctx, "acme/widgets", 99); diag.CodeOf(err) != diag.CodeTokenRejected {
+		t.Errorf("an unknown run: %v", err)
+	}
+	if err := newClient(s, "ghp_wrong").CancelRun(ctx, "acme/widgets", 5); diag.CodeOf(err) != diag.CodeTokenRejected {
+		t.Errorf("wrong token: %v", err)
+	}
+	s.CancelUnsupported = true
+	if err := c.CancelRun(ctx, "acme/widgets", 5); err == nil {
+		t.Error("an endpoint GitHub does not have must be an error")
+	}
+}
