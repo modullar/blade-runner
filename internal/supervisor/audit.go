@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -56,9 +57,23 @@ type Entry struct {
 	OOMKilled bool    `json:"oom_killed,omitempty"`
 	JobsRun   []int64 `json:"jobs_run,omitempty"` // jobs the provider says this runner took
 
-	// Fragment is set only on a KindRecovered entry: the sha256 of the torn line the entry
-	// accounts for, so verification accepts that one unparseable line and no other.
-	Fragment string `json:"fragment_sha256,omitempty"`
+	// Fragment is set only on a KindRecovered entry that accounts for a torn line: the sha256 of
+	// that line, so verification accepts that one unparseable line and no other. When two lines
+	// are accounted for at once (a crash while the first recovery record was being written),
+	// Fragments lists both, in file order, and Fragment is the last of them.
+	Fragment  string   `json:"fragment_sha256,omitempty"`
+	Fragments []string `json:"fragments_sha256,omitempty"`
+}
+
+// frags returns the torn lines a recovery entry accounts for.
+func (e Entry) frags() []string {
+	if len(e.Fragments) > 0 {
+		return e.Fragments
+	}
+	if e.Fragment != "" {
+		return []string{e.Fragment}
+	}
+	return nil
 }
 
 // ErrTornTail is wrapped by VerifyAuditLog's error when the log ends in a line that is not an
@@ -66,6 +81,13 @@ type Entry struct {
 // OpenAuditLog is the explicit recovery: it records a KindRecovered entry that names the torn
 // line by hash, and the chain then verifies again.
 var ErrTornTail = errors.New("the audit log ends in a torn line")
+
+// ErrEmptyAnchor is wrapped by VerifyAuditLog's error when the head anchor exists but holds
+// nothing. That is what a power cut leaves when the anchor's rename reached the disk before its
+// data did, so it is not taken for tampering: reopening the log with OpenAuditLog, when the log
+// itself verifies, records a KindRecovered entry saying the anchor was empty and writes a fresh
+// one. (An anchor that is missing altogether is the documented limit: see AuditLog.)
+var ErrEmptyAnchor = errors.New("the audit log's head anchor is empty")
 
 // Recorder is where decisions are written. The supervisor starts nothing it could not record.
 type Recorder interface {
@@ -104,6 +126,10 @@ type AuditLog struct {
 	// SyncFn flushes the file to disk; nil means (*os.File).Sync. It exists so a test can make
 	// the flush fail the way a failing disk would.
 	SyncFn func() error
+	// AnchorSyncFn flushes the head anchor's temporary file (before it is renamed into place) and
+	// then its directory (after); it is called with the path of each. nil means a real fsync of
+	// that path. It exists so a test can see the order, or make a flush fail.
+	AnchorSyncFn func(path string) error
 
 	mu       sync.Mutex
 	f        *os.File
@@ -132,11 +158,19 @@ type parsedLog struct {
 	lines   [][]byte // the trimmed line of each entry, what the next entry's prev_hash covers
 	tail    []byte   // a last line that is not an entry (an interrupted write), or nil
 	tailNo  int      // its line number
+	// earlier holds the hash of the unaccounted line just before the tail, if there is one: a
+	// crash while the recovery record for a torn line was being written leaves two torn lines.
+	earlier []string
 }
 
+// maxTornLines is how many unparseable lines in a row one recovery record may account for: the
+// torn line and the torn recovery record written after it.
+const maxTornLines = 2
+
 // parseLog splits data into entries. A line that is not an entry is accepted only when it is the
-// last line (a torn tail, reported in tail) or when the very next entry is a KindRecovered
-// record naming it by hash. Anything else is damage and an error.
+// last line (a torn tail, reported in tail), or when the next entry is a KindRecovered record
+// naming it by hash. Up to maxTornLines such lines in a row may share one recovery record (the
+// first torn line and a torn recovery record after it). Anything else is damage and an error.
 func parseLog(data []byte) (parsedLog, error) {
 	var p parsedLog
 	raw := bytes.Split(data, []byte("\n"))
@@ -146,7 +180,11 @@ func parseLog(data []byte) (parsedLog, error) {
 			last = i
 		}
 	}
-	pending, pendingNo := "", 0
+	var pending []string
+	firstNo := 0
+	unaccounted := func() error {
+		return fmt.Errorf("line %d is not an entry and no recovery record accounts for it", firstNo)
+	}
 	for i, l := range raw {
 		line := bytes.TrimSpace(l)
 		if len(line) == 0 {
@@ -154,27 +192,31 @@ func parseLog(data []byte) (parsedLog, error) {
 		}
 		var e Entry
 		if err := json.Unmarshal(line, &e); err != nil {
-			if pending != "" {
-				return p, fmt.Errorf("line %d is not an entry and no recovery record accounts for it", pendingNo)
+			if len(pending) >= maxTornLines {
+				return p, unaccounted()
+			}
+			if len(pending) == 0 {
+				firstNo = i + 1
 			}
 			if i == last {
-				p.tail, p.tailNo = line, i+1
+				p.tail, p.tailNo, p.earlier = line, i+1, pending
+				pending = nil
 				break
 			}
-			pending, pendingNo = lineHash(line), i+1
+			pending = append(pending, lineHash(line))
 			continue
 		}
-		if pending != "" {
-			if e.Kind != KindRecovered || e.Fragment != pending {
-				return p, fmt.Errorf("line %d is not an entry and no recovery record accounts for it", pendingNo)
+		if len(pending) > 0 {
+			if e.Kind != KindRecovered || !slices.Equal(e.frags(), pending) {
+				return p, unaccounted()
 			}
-			pending = ""
+			pending = nil
 		}
 		p.entries = append(p.entries, e)
 		p.lines = append(p.lines, append([]byte(nil), line...))
 	}
-	if pending != "" {
-		return p, fmt.Errorf("line %d is not an entry and no recovery record accounts for it", pendingNo)
+	if len(pending) > 0 {
+		return p, unaccounted()
 	}
 	return p, nil
 }
@@ -211,6 +253,9 @@ func readAnchor(path string) (*anchor, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, fmt.Errorf("the head anchor %s is empty: %w", anchorPath(path), ErrEmptyAnchor)
+	}
 	var a anchor
 	if err := json.Unmarshal(raw, &a); err != nil || a.Seq < 1 || a.Hash == "" {
 		return nil, fmt.Errorf("the head anchor %s is not valid", anchorPath(path))
@@ -218,13 +263,37 @@ func readAnchor(path string) (*anchor, error) {
 	return &a, nil
 }
 
-func writeAnchor(path string, seq int64, hash string) error {
+// writeAnchor replaces the anchor atomically and durably: the new content is written to a
+// temporary file and fsynced BEFORE the rename (otherwise a power cut can leave the renamed
+// file empty), and the directory is fsynced AFTER it (otherwise the rename itself may not
+// survive). syncPath flushes the file or directory at a path; nil means a real fsync, and a test
+// replaces it to see the order or to make the flush fail.
+func writeAnchor(path string, seq int64, hash string, syncPath func(string) error) error {
+	if syncPath == nil {
+		syncPath = fsyncPath
+	}
 	raw, _ := json.Marshal(anchor{Seq: seq, Hash: hash})
 	tmp := anchorPath(path) + ".tmp"
 	if err := os.WriteFile(tmp, append(raw, '\n'), 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, anchorPath(path))
+	if err := syncPath(tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, anchorPath(path)); err != nil {
+		return err
+	}
+	return syncPath(filepath.Dir(path))
+}
+
+// fsyncPath flushes the file or directory at path to disk.
+func fsyncPath(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 // checkAnchor compares the log with its head anchor, if there is one.
@@ -283,17 +352,34 @@ func OpenAuditLog(path string, now func() time.Time) (*AuditLog, error) {
 	if err != nil {
 		return fail(err, "the audit log's chain is broken; move it aside to start a new one")
 	}
-	if err := p.checkAnchor(path); err != nil {
-		return fail(err, "the audit log does not match its head anchor; move both aside to start a new one")
+	anchorErr := p.checkAnchor(path)
+	emptyAnchor := errors.Is(anchorErr, ErrEmptyAnchor)
+	if anchorErr != nil && !emptyAnchor {
+		return fail(anchorErr, "the audit log does not match its head anchor; move both aside to start a new one")
 	}
 	l := &AuditLog{Path: path, Now: now, f: f, seq: int64(len(p.entries)), prev: prev}
 	if len(data) > 0 && data[len(data)-1] != '\n' {
 		l.fixNL = true
 	}
 	if p.tail != nil {
+		frags := append(slices.Clone(p.earlier), lineHash(p.tail))
 		msg := fmt.Sprintf("recovered: a torn last line of %d bytes (line %d, sha256 %s) was left by an interrupted write; it is kept in the file and the chain continues from the last complete entry",
 			len(p.tail), p.tailNo, lineHash(p.tail))
-		if err := l.append(Entry{Kind: KindRecovered, Message: msg, Fragment: lineHash(p.tail)}); err != nil {
+		e := Entry{Kind: KindRecovered, Message: msg, Fragment: frags[len(frags)-1]}
+		if len(frags) > 1 {
+			e.Fragments = frags
+			e.Message = fmt.Sprintf("recovered: %d torn lines in a row (the interrupted write, and the interrupted recovery record after it; sha256 %v) were left by crashes; they are kept in the file and the chain continues from the last complete entry", len(frags), frags)
+		}
+		if err := l.append(e); err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+	if emptyAnchor {
+		// The log verifies, and the anchor holds nothing: what a power cut leaves when the rename
+		// reached the disk before the data. Say so on the record, then write a real anchor.
+		msg := fmt.Sprintf("recovered: the head anchor was empty (a crash while it was being replaced); the log's %d entries verify by their chain, and the anchor is rewritten", len(p.entries))
+		if err := l.append(Entry{Kind: KindRecovered, Message: msg}); err != nil {
 			f.Close()
 			return nil, err
 		}
@@ -351,7 +437,7 @@ func (l *AuditLog) append(e Entry) error {
 		l.poisoned = err
 		return auditErr(err, "cannot flush the audit log to disk")
 	}
-	if err := writeAnchor(l.Path, l.seq, l.prev); err != nil {
+	if err := writeAnchor(l.Path, l.seq, l.prev, l.AnchorSyncFn); err != nil {
 		return auditErr(err, "cannot write the audit log's head anchor")
 	}
 	return nil
@@ -403,6 +489,9 @@ func VerifyAuditLog(path string) (int, error) {
 		return n, err
 	}
 	if err := p.checkAnchor(path); err != nil {
+		if errors.Is(err, ErrEmptyAnchor) {
+			return n, fmt.Errorf("%w; reopen the log to record the recovery", err)
+		}
 		return n, err
 	}
 	if p.tail != nil {

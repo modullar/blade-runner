@@ -48,22 +48,44 @@ const completedRunsScanned = 30
 // never be mistaken for an empty queue.
 //
 // A listing is not an atomic snapshot (each status is a separate request), so the picture is the
-// union of two passes read in reverse lifecycle order (see pendingRunStatuses). A run seen in the
-// first pass is not read again in the second: only runs that are new then cost a jobs request.
+// union of two passes read in reverse lifecycle order (see pendingRunStatuses). A run's jobs are
+// read once per status it is listed in (so a run that advances is judged on what it holds now, not
+// on what it held when first seen), and once more in the second pass if the first reading found
+// no job; otherwise only runs that are new in the second pass cost a jobs request.
 func (s *Supervisor) scan(ctx context.Context, withCompleted bool) ([]observed, error) {
-	seen := map[int64]bool{}
+	type listing struct {
+		run    int64
+		status string
+	}
+	seen := map[listing]bool{}
+	retried := map[int64]bool{}
+	empty := map[int64]bool{} // runs whose last read held no job
+	at := map[int64]int{}     // job id -> index in out
 	var out []observed
-	read := func(r provider.Run) error {
-		if seen[r.ID] {
+	read := func(r provider.Run, status string) error {
+		k := listing{r.ID, status}
+		if seen[k] {
 			return nil
 		}
-		seen[r.ID] = true
+		// A run is read again whenever it turns up in a status it was not read in: its jobs are
+		// created and change as it advances (a run listed while still empty in "waiting" gets its
+		// jobs by the time it is "queued"), so the first reading must not stand for the later one.
+		// Within one status it is read once, except that a run read with no job at all gets one more
+		// look (a job list is not part of the run's creation).
+		seen[k] = true
 		jobs, err := s.cfg.Provider.ListJobs(ctx, s.cfg.Scope.Repository, r.ID)
 		if err != nil {
 			return queueErr(err, "cannot list the jobs of run "+itoa(r.ID))
 		}
+		empty[r.ID] = len(jobs) == 0
 		for _, j := range jobs {
-			out = append(out, observed{Run: r, Job: j})
+			o := observed{Run: r, Job: j}
+			if i, ok := at[j.ID]; ok {
+				out[i] = o // the later reading is the newer
+				continue
+			}
+			at[j.ID] = len(out)
+			out = append(out, o)
 		}
 		return nil
 	}
@@ -74,7 +96,11 @@ func (s *Supervisor) scan(ctx context.Context, withCompleted bool) ([]observed, 
 				return nil, queueErr(err, "cannot list "+st+" runs")
 			}
 			for _, r := range runs {
-				if err := read(r); err != nil {
+				if pass > 0 && empty[r.ID] && !retried[r.ID] {
+					retried[r.ID] = true
+					delete(seen, listing{r.ID, st})
+				}
+				if err := read(r, st); err != nil {
 					return nil, err
 				}
 			}
@@ -86,7 +112,7 @@ func (s *Supervisor) scan(ctx context.Context, withCompleted bool) ([]observed, 
 			return nil, queueErr(err, "cannot list completed runs")
 		}
 		for _, r := range runs {
-			if err := read(r); err != nil {
+			if err := read(r, statusCompleted); err != nil {
 				return nil, err
 			}
 		}

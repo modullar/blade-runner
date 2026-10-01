@@ -20,6 +20,20 @@ type listHook struct {
 	mu    sync.Mutex
 	calls int
 	after func(call int, status string)
+	// afterJobs runs after the jobs of a run were read (and before the scan sees the answer's
+	// consequences): the world changes between two readings of the same run.
+	afterJobs func(runID int64)
+}
+
+func (h *listHook) ListJobs(c context.Context, repoName string, runID int64) ([]provider.Job, error) {
+	jobs, err := h.Provider.ListJobs(c, repoName, runID)
+	h.mu.Lock()
+	f := h.afterJobs
+	h.mu.Unlock()
+	if f != nil {
+		f(runID)
+	}
+	return jobs, err
 }
 
 func (h *listHook) tick(status string) {
@@ -116,5 +130,101 @@ func TestThePostRunScanDoesNotReadTheWholeHistoryToKeepThirtyRuns(t *testing.T) 
 	u, _ := url.Parse(strings.TrimPrefix(completed[0], "GET "))
 	if u.Query().Get("page") != "1" || u.Query().Get("per_page") != "30" {
 		t.Errorf("finished runs were read with %s", u.RawQuery)
+	}
+}
+
+func TestARunReadWhileEmptyThatLaterHoldsARealJobIsJudgedOnThatJob(t *testing.T) {
+	// A stranger's run is listed as "waiting" before GitHub has created its job, so the jobs
+	// request answers nothing. By the time the run is listed as "queued" its job exists. Reading
+	// each run once and remembering its id for the rest of the scan would keep the empty answer and
+	// let the owner's job start with the stranger's job waiting for the same runner.
+	h := &listHook{}
+	r := newRig(t, hooked(h))
+	r.queue(q{run: 1, job: 10})
+	r.srv.AddRun(repo, provider.Run{ID: 2, HeadSHA: r.commits["mallory"].SHA, Event: "pull_request", Status: "waiting", HeadRepository: fork, Actor: "mallory"})
+	var once sync.Once
+	h.afterJobs = func(run int64) {
+		if run == 2 {
+			once.Do(func() { // the run advances, and its job appears, right after the empty reading
+				r.srv.SetRunStatus(repo, 2, "queued")
+				r.srv.AddJob(repo, provider.Job{ID: 20, RunID: 2, Status: "queued", Labels: []string{"self-hosted", "gpu"}, HeadSHA: r.commits["mallory"].SHA})
+			})
+		}
+	}
+	out, err := r.sup.Tick(ctx)
+	if err != nil || out.Launched || !out.Withheld || len(out.Refused) != 1 || out.Refused[0].JobID != 20 {
+		t.Fatalf("outcome = %+v, err = %v: the job that appeared after the empty reading was never judged", out, err)
+	}
+	r.mustStartNothing()
+}
+
+func TestARunWhoseFirstReadingWasEmptyIsReadOnceMoreInTheSecondPass(t *testing.T) {
+	// Same status the whole time, but the job is created between the first pass and the second.
+	h := &listHook{}
+	r := newRig(t, hooked(h))
+	r.queue(q{run: 1, job: 10})
+	r.srv.AddRun(repo, provider.Run{ID: 2, HeadSHA: r.commits["mallory"].SHA, Event: "pull_request", Status: "queued", HeadRepository: fork, Actor: "mallory"})
+	var once sync.Once
+	h.after = func(call int, _ string) {
+		if call == 5 { // the last listing of the first pass
+			once.Do(func() {
+				r.srv.AddJob(repo, provider.Job{ID: 20, RunID: 2, Status: "queued", Labels: []string{"self-hosted", "gpu"}, HeadSHA: r.commits["mallory"].SHA})
+			})
+		}
+	}
+	out, err := r.sup.Tick(ctx)
+	if err != nil || out.Launched || len(out.Refused) != 1 || out.Refused[0].JobID != 20 {
+		t.Fatalf("outcome = %+v, err = %v", out, err)
+	}
+	r.mustStartNothing()
+}
+
+func TestARunThatIsNotEmptyIsNotReadAgainInTheSecondPass(t *testing.T) {
+	// The cost stays: a run with jobs, listed in one status in both passes, costs one jobs request.
+	r := newRig(t)
+	r.queue(q{run: 1, job: 10})
+	r.rt.OnRun = r.takes(repo, 10, 1)
+	if _, err := r.sup.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	jobsReads := 0
+	for _, u := range r.srv.URIs() {
+		if strings.Contains(u, "/runs/1/jobs") {
+			jobsReads++
+		}
+	}
+	// assess + re-check after registering + post-run scan = 3 scans, one read of run 1 each.
+	if jobsReads != 3 {
+		t.Errorf("%d jobs reads of run 1 for 3 scans: a run seen in both passes must be read once per scan", jobsReads)
+	}
+}
+
+func TestTheRunStatusesAreReadInReverseLifecycleOrderInTwoPasses(t *testing.T) {
+	// The order is the guarantee that a run advancing between two listings lands in a status not
+	// read yet: requested, pending, waiting, queued, in_progress, then the same again for runs
+	// created after their status was read. Two passes would hide a reversed first pass from a
+	// behavioural test (the second pass catches what the first missed), so the order itself is
+	// pinned, as GitHub sees it.
+	r := newRig(t)
+	r.queue(q{run: 1, job: 10})
+	if _, err := r.sup.Tick(ctx); err != nil { // withholds nothing, starts a runner: only the first scan matters
+		t.Fatal(err)
+	}
+	var seq []string
+	for _, u := range r.srv.URIs() {
+		if !strings.HasPrefix(u, "GET /repos/"+repo+"/actions/runs?") {
+			continue
+		}
+		parsed, _ := url.Parse(strings.TrimPrefix(u, "GET "))
+		seq = append(seq, parsed.Query().Get("status"))
+	}
+	want := []string{"requested", "pending", "waiting", "queued", "in_progress", "requested", "pending", "waiting", "queued", "in_progress"}
+	if len(seq) < len(want) {
+		t.Fatalf("listings = %v", seq)
+	}
+	for i, st := range want {
+		if seq[i] != st {
+			t.Fatalf("first scan read the statuses in the order %v, want %v: a run that advances between listings can then be missed", seq[:len(want)], want)
+		}
 	}
 }

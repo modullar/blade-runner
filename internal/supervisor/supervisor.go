@@ -100,9 +100,14 @@ type Supervisor struct {
 	cfg    Config
 	labels map[string]bool
 
-	noted    map[int64]string // job id -> the last refusal recorded for it
-	runNoted map[string]bool  // run-level notes already recorded
+	noted    *lru[int64, string] // job id -> the last refusal recorded for it
+	runNoted *lru[string, bool]  // run-level notes already recorded
 	attempts map[int64]int
+	// refunds counts, per job, the launches in a row that were called off or stopped without the
+	// job having failed (see refundAttempt); absent counts the scans in a row a given-up job was
+	// missing from (see prune).
+	refunds map[int64]int
+	absent  map[int64]int
 }
 
 // New validates cfg and returns a Supervisor.
@@ -157,7 +162,8 @@ func New(cfg Config) (*Supervisor, error) {
 	}
 	return &Supervisor{
 		cfg: cfg, labels: labelSet(cfg.Labels),
-		noted: map[int64]string{}, runNoted: map[string]bool{}, attempts: map[int64]int{},
+		noted: newLRU[int64, string](maxNoted), runNoted: newLRU[string, bool](maxNoted),
+		attempts: map[int64]int{}, refunds: map[int64]int{}, absent: map[int64]int{},
 	}, nil
 }
 
@@ -215,8 +221,9 @@ func (s *Supervisor) Reconcile(ctx context.Context) error {
 	return s.cfg.Audit.Record(Entry{Kind: KindStartup, Message: msg, Repository: s.cfg.Scope.Repository})
 }
 
-// Run reconciles, then polls until ctx ends. A failed cycle starts nothing and is retried after
-// the poll interval; after a launch the next cycle starts at once, so a queue drains quickly.
+// Run reconciles, then polls until ctx ends. A failed or withheld cycle starts nothing and is
+// retried after the poll interval; after a launch that ran its job the next cycle starts at once,
+// so a queue drains quickly.
 func (s *Supervisor) Run(ctx context.Context) error {
 	if err := s.Reconcile(ctx); err != nil {
 		return err
@@ -231,7 +238,10 @@ func (s *Supervisor) Run(ctx context.Context) error {
 				return err
 			}
 		}
-		if out.Launched && err == nil {
+		// After a runner that ran its job, the next cycle starts at once so a queue drains. A launch
+		// that was withheld or whose runner was stopped did not do the job: starting again at once
+		// would loop on it, registering and tearing down a runner as fast as GitHub answers.
+		if out.Launched && !out.Withheld && err == nil {
 			continue
 		}
 		s.cfg.Sleep(ctx, s.cfg.PollInterval)
@@ -312,7 +322,7 @@ func (s *Supervisor) Tick(ctx context.Context) (Outcome, error) {
 		}
 	}
 	for _, jd := range a.Admitted {
-		delete(s.noted, jd.Obs.Job.ID) // admitted now: a later refusal is news again
+		s.noted.Delete(jd.Obs.Job.ID) // admitted now: a later refusal is news again
 	}
 	if len(a.Transient) > 0 {
 		out.Withheld = true
@@ -347,7 +357,7 @@ func (s *Supervisor) Tick(ctx context.Context) (Outcome, error) {
 		if s.attempts[id] >= s.cfg.MaxAttempts {
 			if err := s.recordOnce(fmt.Sprintf("gaveup|%d", id), Entry{
 				Kind: KindGaveUp, Code: diag.CodeLaunchFailed,
-				Message: fmt.Sprintf("a runner for this job failed to start or take it %d times; leaving it alone until the supervisor restarts", s.attempts[id]),
+				Message: fmt.Sprintf("a runner for this job failed to start or take it, or was stopped before it had a job, %d times; leaving it alone until the supervisor restarts", s.attempts[id]),
 				RunID:   jd.Obs.Run.ID, JobID: id, Repository: jd.Subject.Repository, SHA: jd.Subject.SHA,
 			}); err != nil {
 				return out, err
@@ -400,10 +410,22 @@ func (s *Supervisor) recordFailure(e Entry, primary error) error {
 	return primary
 }
 
+// maxRefunds is how many launches in a row for one job may be called off (or stopped by the
+// watcher) without counting against it. A refund exists because the admitted job did not fail;
+// but a job that is called off over and over is not getting its runner either, and without a
+// bound the supervisor would register and tear down runners for it for ever. Past the bound the
+// job is given up on until the supervisor restarts, like one whose runner kept failing.
+const maxRefunds = 3
+
 // refundAttempt takes back one attempt for a launch that was only called off (a job that is not
 // admitted was waiting, or the queue could not be read): the admitted job did not fail to start,
-// so it must not move towards being given up on.
+// so it must not move towards being given up on. The refunds are capped (maxRefunds in a row).
 func (s *Supervisor) refundAttempt(jobID int64) {
+	s.refunds[jobID]++
+	if s.refunds[jobID] > maxRefunds {
+		s.attempts[jobID] = s.cfg.MaxAttempts // give up: Tick records it and leaves the job alone
+		return
+	}
 	if s.attempts[jobID] > 0 {
 		s.attempts[jobID]--
 	}
@@ -416,26 +438,55 @@ func (s *Supervisor) noteError(err error) error {
 	return err
 }
 
-// maxNoted bounds each of the in-memory "already recorded" sets: a long-lived supervisor must not
-// grow without limit. When a set is full it is emptied, which can repeat a record once and can
-// never lose one.
+// maxNoted is the least each in-memory "already recorded" set may hold. A long-lived supervisor
+// must not grow without limit, so a full set evicts its oldest entry (see lru): that can repeat
+// one record for a job not seen for a long while, and can never lose a record. The bound is raised
+// (see prune) to twice the number of jobs currently waiting, so that a queue larger than the base
+// bound does not evict the entries it is still using on every poll.
 const maxNoted = 4096
+
+// giveUpForgetScans is how many scans in a row a job that was given up on must be missing from
+// the queue before the supervisor forgets that it gave up. One scan that misses a job (the
+// listings are not an atomic snapshot) must not hand it a fresh set of attempts.
+const giveUpForgetScans = 5
 
 // prune forgets bookkeeping about jobs that are no longer waiting: a job that has left the queue
 // has no use for its remembered refusal or failed attempts (and an id that comes back is news).
+// A job that was given up on is kept for giveUpForgetScans missing scans first.
 func (s *Supervisor) prune(a assessment) {
 	waiting := make(map[int64]bool, len(a.Waiting))
 	for _, jd := range a.Waiting {
 		waiting[jd.Obs.Job.ID] = true
 	}
-	for id := range s.noted {
+	limit := max(maxNoted, 2*len(waiting))
+	s.noted.SetMax(limit)
+	s.runNoted.SetMax(limit)
+	for _, id := range s.noted.Keys() {
 		if !waiting[id] {
-			delete(s.noted, id)
+			s.noted.Delete(id)
+		}
+	}
+	for id := range s.absent {
+		if waiting[id] {
+			delete(s.absent, id)
 		}
 	}
 	for id := range s.attempts {
-		if !waiting[id] {
+		switch {
+		case waiting[id]:
+		case s.attempts[id] >= s.cfg.MaxAttempts && s.absent[id]+1 < giveUpForgetScans:
+			s.absent[id]++
+		default:
 			delete(s.attempts, id)
+			delete(s.refunds, id)
+			delete(s.absent, id)
+		}
+	}
+	for id := range s.refunds {
+		if !waiting[id] {
+			if _, kept := s.attempts[id]; !kept {
+				delete(s.refunds, id)
+			}
 		}
 	}
 }
@@ -444,7 +495,7 @@ func (s *Supervisor) prune(a assessment) {
 // every poll, but the audit log is not told every fifteen seconds).
 func (s *Supervisor) recordRefusal(jd judgement) error {
 	key := jd.Code + "|" + jd.Reason + "|" + jd.Subject.SHA
-	if s.noted[jd.Obs.Job.ID] == key {
+	if prev, ok := s.noted.Get(jd.Obs.Job.ID); ok && prev == key {
 		return nil
 	}
 	run, job := jd.Obs.Run, jd.Obs.Job
@@ -456,25 +507,19 @@ func (s *Supervisor) recordRefusal(jd judgement) error {
 	}); err != nil {
 		return err
 	}
-	if len(s.noted) >= maxNoted {
-		s.noted = map[int64]string{}
-	}
-	s.noted[jd.Obs.Job.ID] = key
+	s.noted.Put(jd.Obs.Job.ID, key)
 	return nil
 }
 
 // recordOnce records e unless the same key was already recorded.
 func (s *Supervisor) recordOnce(key string, e Entry) error {
-	if s.runNoted[key] {
+	if _, ok := s.runNoted.Get(key); ok {
 		return nil
 	}
 	if err := s.cfg.Audit.Record(e); err != nil {
 		return err
 	}
-	if len(s.runNoted) >= maxNoted {
-		s.runNoted = map[string]bool{} // bounded: forgetting costs one repeated record, never a lost one
-	}
-	s.runNoted[key] = true
+	s.runNoted.Put(key, true) // bounded: evicting the oldest costs one repeated record, never a lost one
 	return nil
 }
 

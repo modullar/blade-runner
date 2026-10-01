@@ -61,7 +61,9 @@ poll ──▶ read the queue ──▶ for every waiting job this runner could 
   and nothing starts if the record cannot be written** (BR-E079), and the supervisor loop stops on
   an audit failure instead of polling on. Failures to record an alarm, a launch failure or a
   withheld launch are returned together with the failure they describe, never dropped.
-  Repeated polls of the same refusal are written once. This is evidence against accident and
+  Repeated polls of the same refusal are written once: the "already recorded" sets are bounded
+  by evicting the least recently used entry (never by emptying the set, which refired every
+  refusal on the next poll), and the bound grows to twice the number of jobs currently waiting. This is evidence against accident and
   casual tampering; someone who can write the file can rewrite the chain, so it is not a defence
   against root.
   - *Write failures.* A line that reached the disk is part of the chain even if the flush after it
@@ -71,6 +73,17 @@ poll ──▶ read the queue ──▶ for every waiting job this runner could 
     fragment stays in the file and a `recovered` entry names it by hash, so the chain verifies
     again and the damage stays on record. `VerifyAuditLog` on a not-yet-recovered log reports
     `ErrTornTail` after verifying everything before it. Any other unparseable line is an error.
+  - *The head anchor is replaced durably.* The new anchor is written to a temporary file that is
+    **fsynced before the rename**, and the directory is **fsynced after it**; without both, a
+    power cut can leave a renamed but empty anchor, or no rename at all. An anchor that is
+    **empty** is therefore read as exactly that power cut, not as tampering, but only when the log
+    itself verifies: `VerifyAuditLog` reports `ErrEmptyAnchor` and reopening the log records a
+    `recovered` entry saying the anchor was empty and writes a new one. (An empty anchor is also
+    what someone who wanted to disable it would leave, so it is on the record, and an anchor that
+    was *deleted* stays the limit stated below.)
+  - *Two torn lines.* A crash while the `recovered` entry itself was being written leaves two
+    unparseable lines in a row. The next open records a second `recovered` entry that names both
+    by hash (`fragments_sha256`, in file order); a third unparseable line in a row is damage.
   - *The last entry has no successor,* so the chain alone cannot see it edited or the tail cut
     off. A head anchor `<log>.head` (number and hash of the newest entry, rewritten after every
     entry) covers that while it survives: verification and opening refuse a log shorter than its
@@ -95,15 +108,28 @@ unless every job the runner could take is admitted.
    `requested` and statuses this code has never heard of, and including jobs of runs that are
    already `in_progress` (a later job of a run whose first job runs on a hosted runner is the
    classic gap). A job that cannot be judged (GitHub unreachable while fetching its commit) also
-   withholds (BR-E075/E076); a commit GitHub says does not exist (404/422) is different: that is
-   a refusal (BR-E072), so `--cancel-unadmitted` can clear it, and the two are told apart by diag
-   code (BR-E067 versus anything else), never by the wording of an error. Runs and jobs are read
+   withholds (BR-E075/E076). A commit that **provably does not exist** is different: that is a
+   refusal (BR-E072), so `--cancel-unadmitted` can clear it. "Provably" is narrow, because GitHub
+   answers 404 for a repository the token cannot see and for a commit or fork that was only just
+   pushed or created: only HTTP 422 "No commit found for SHA", or a 404 **after a second
+   `GET /repos/{repo}` shows the repository itself reads fine with the same token**, is a
+   refusal. A 404 with an unreadable repository is "not now": withheld, recorded as such, never
+   a refusal and never grounds to cancel anyone's run. (What remains: a commit pushed a moment ago, in a repository that reads fine, whose object GitHub has not made visible yet, answers 404 and is refused until the next poll sees it; that costs one audit record, and a cancel only if `--cancel-unadmitted` is on.) The two are told apart by diag code
+   (BR-E067 versus anything else), never by the wording of an error. Runs and jobs are read
    with full pagination, and a list that ends short of its `total_count` (GitHub caps these lists
-   at 1000 results, and a page can be short) is an error, never a shorter answer. The run
+   at 1000 results, and a page can be short) is an error, never a shorter answer: reading stops
+   after one empty page while the total promises more, and then it is an error. The reverse
+   (a `total_count` that lags behind the list, say a run created after the count) is not an
+   error and never cuts the list at the total: a full page is followed by another until a short or
+   empty page, so the extra runs are seen. The run
    statuses are read in **reverse lifecycle order** (requested, pending, waiting, queued,
    in_progress) and in **two passes**, taking the union: a run only moves forward, so one that
    advances between two listings lands in a status not yet read, and one created after its status
-   was read is caught by the second pass. (The listings are still not an atomic snapshot: a run
+   was read is caught by the second pass. A run's jobs are read **once per status it is listed
+   in** (not once per run id for the whole scan: a run listed while still empty in `waiting` has
+   its jobs by the time it is `queued`, and the empty first reading must not stand for it), and
+   once more in the second pass if the first reading found no job; the later reading of a job
+   wins. (The listings are still not an atomic snapshot: a run
    that appears and is taken between the last check and the runner connecting is R1 below.)
 2. **Cancel (opt-in).** `--cancel-unadmitted` or `supervisor.cancel_unadmitted: true` makes the
    supervisor ask GitHub to cancel each refused run (`Provider.CancelRun`), so a stranger's
@@ -119,8 +145,13 @@ unless every job the runner could take is admitted.
 4. **Watch while waiting.** While the runner has not been handed a job, the queue is polled; any
    new takeable job that was not admitted at launch stops the container (registration removed,
    recorded as withheld). Every waiting job it could take is **judged again each poll**, so a key
-   revoked (or a commit that stops being readable three polls running) while the runner waits
-   stops it too; a commit is fetched once per poll however many jobs share it. A single-use runner takes exactly one job, so once it has one the
+   revoked or a commit that is definitively gone (a refusal) while the runner waits stops it too;
+   a commit is fetched once per poll however many jobs share it. A job that **cannot be judged**
+   (GitHub answers 404 or 5xx) does not by itself kill an admitted runner: it is stopped only after
+   three polls in a row **and** only when `GET /repos/{repo}` succeeds in that poll, which makes
+   the failure a statement about the commit and not about the connection or the token. While the
+   repository cannot be read either, the runner keeps waiting (a hiccup must not cost an admitted
+   job its runner; the queue-unreadable rule below still bounds a blind watcher). A single-use runner takes exactly one job, so once it has one the
    exposure ends and the watch stops: a running admitted job is never killed because something
    else arrived. If the queue cannot be read three times in a row while the runner still has no
    job, it is stopped: its exposure is unknown.
@@ -132,8 +163,16 @@ unless every job the runner could take is admitted.
    exit (BR-E076), not a note. This is detection, not prevention.
 6. **A job that keeps failing** to start or to be taken is attempted three times, then left alone
    until the supervisor restarts, so a broken image cannot spin the loop. A launch that was only
-   withheld (re-check failed, queue unreadable, runner stopped for someone else's job) does not
-   count: the admitted job did not fail.
+   withheld (re-check failed, queue unreadable, runner stopped for someone else's job) is
+   **refunded, but only three times in a row per job**: the fourth gives the job up until a
+   restart, because a job whose runner is called off over and over is not getting one either, and
+   the loop would otherwise register and tear down runners for it for ever. (The count restarts
+   when a launch is not called off.) The loop also **backs off**: after a launch that ran its job
+   it starts the next cycle at once, but after one that was withheld or whose runner was stopped
+   it sleeps the poll interval like any other idle cycle. A job that was given up on stays given
+   up across a scan that happens to miss it (the listings are not an atomic snapshot): it is
+   forgotten only after being absent for five scans in a row, or on restart. The audit trail is
+   one `gave_up` record.
 
 ### What is NOT solved (BR-0 must verify; do not read this ADR as "closed")
 

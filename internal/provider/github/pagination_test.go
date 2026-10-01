@@ -87,3 +87,40 @@ func TestListRunnersErrorsWhenTheListCannotBeReadCompletely(t *testing.T) {
 		t.Errorf("%d runners and no error: a list cut off at the page limit must not look complete", len(got))
 	}
 }
+
+func TestAListThatEndsShortOfItsTotalStopsAfterOneEmptyPageThenErrors(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	addQueuedRuns(s, 1500)
+	s.ResultCap = 1000
+	if _, err := newClient(s, "ghp_testtoken").ListRuns(ctx, "acme/widgets", "queued"); err == nil {
+		t.Fatal("a capped list must be an error")
+	}
+	pages := 0
+	for _, u := range s.URIs() {
+		if strings.Contains(u, "/actions/runs?") {
+			pages++
+		}
+	}
+	if pages != 11 { // ten full pages and the one empty page that shows the cap
+		t.Errorf("%d page requests, want 11: reading on after an empty page only repeats the answer", pages)
+	}
+}
+
+func TestATotalCountThatLagsBehindTheListDoesNotBlindTheCaller(t *testing.T) {
+	// A run created after total_count was counted: the list holds more than the total says. The
+	// extra runs must be returned (a queue that hides a run is unsafe), not turned into an error,
+	// and not cut at the total (which would hide the last of them).
+	s := githubtest.New()
+	defer s.Close()
+	addQueuedRuns(s, 250)
+	addJobs(s, 250)
+	s.TotalCountOffset = -200 // total_count says 50 while 250 exist
+	c := newClient(s, "ghp_testtoken")
+	if runs, err := c.ListRuns(ctx, "acme/widgets", "queued"); err != nil || len(runs) != 250 {
+		t.Errorf("%d runs, %v: want all 250", len(runs), err)
+	}
+	if jobs, err := c.ListJobs(ctx, "acme/widgets", 1); err != nil || len(jobs) != 250 {
+		t.Errorf("%d jobs, %v: want all 250", len(jobs), err)
+	}
+}

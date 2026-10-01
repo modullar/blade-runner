@@ -257,13 +257,27 @@ func (c *Client) Commit(ctx context.Context, repository, sha string) (provider.C
 		} `json:"verification"`
 	}
 	if resp, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/git/commits/"+sha, c.Token != nil, &out); err != nil {
-		if resp != nil && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusUnprocessableEntity) {
-			// GitHub says there is no such commit. Retrying will not change that, so this is a
-			// definitive "not admitted", not "GitHub could not be reached": a caller that treated
-			// it as transient would wait on it for ever.
-			return provider.Commit{}, diag.Wrap(err, diag.CodeNotAdmitted, fmt.Sprintf("commit %s cannot be fetched from %s (HTTP %d)", sha, repository, resp.StatusCode),
-				"the commit was deleted or force-pushed away, or its fork was deleted (or the token cannot see the repository: GitHub answers 404 to hide private ones)",
-				"nothing can run from a commit that does not exist; push the change again")
+		if resp == nil {
+			return provider.Commit{}, err
+		}
+		switch resp.StatusCode {
+		case http.StatusUnprocessableEntity:
+			// GitHub's own words for a commit id it has no object for. Any other 422 is not a
+			// statement about the commit and stays the generic (transient) error.
+			if strings.Contains(strings.ToLower(err.Error()), "no commit found") {
+				return provider.Commit{}, notFound(err, sha, repository, "GitHub says it has no such commit (HTTP 422)")
+			}
+		case http.StatusNotFound:
+			// A 404 alone proves nothing: GitHub answers it for a repository the token cannot see
+			// and for a commit that was only just pushed or whose fork is still being set up. It
+			// is a refusal only when the repository itself reads fine with the same token, so the
+			// 404 is about the commit. Otherwise it is "not now", never a verdict.
+			if _, verr := c.Visibility(ctx, repository); verr != nil {
+				return provider.Commit{}, diag.Wrap(err, diag.CodeGitHubUnavailable, fmt.Sprintf("commit %s cannot be fetched from %s: GitHub answered 404 and the repository is not readable either", sha, repository),
+					"the token cannot see the repository, or GitHub has not caught up with a fresh push or fork (GitHub answers 404 to hide private repositories)",
+					"nothing was decided about the commit; it is tried again at the next poll")
+			}
+			return provider.Commit{}, notFound(err, sha, repository, "GitHub answered 404 for it although the repository itself is readable")
 		}
 		return provider.Commit{}, err
 	}
@@ -275,6 +289,15 @@ func (c *Client) Commit(ctx context.Context, repository, sha string) (provider.C
 		cm.Payload = *out.Verification.Payload
 	}
 	return cm, nil
+}
+
+// notFound is the definitive "not admitted" for a commit that does not exist for a token that can
+// see its repository: retrying will not change it, so a caller that treated it as transient would
+// wait on it for ever.
+func notFound(err error, sha, repository, how string) error {
+	return diag.Wrap(err, diag.CodeNotAdmitted, fmt.Sprintf("commit %s cannot be fetched from %s: %s", sha, repository, how),
+		"the commit was deleted or force-pushed away, or its fork's branch was",
+		"nothing can run from a commit that does not exist; push the change again")
 }
 
 // ListCommits returns recent commit ids of the default branch.
@@ -325,6 +348,7 @@ func (c *Client) ListRecentRuns(ctx context.Context, repository, status string, 
 func (c *Client) listRuns(ctx context.Context, repository, status string, limit int) ([]provider.Run, error) {
 	var runs []provider.Run
 	total := 0
+	complete := false
 	perPage := listPerPage
 	if limit > 0 && limit < perPage {
 		perPage = limit
@@ -384,20 +408,30 @@ func (c *Client) listRuns(ctx context.Context, repository, status string, limit 
 			runs = append(runs, run)
 		}
 		total = out.Total
-		if len(runs) >= total {
-			break
-		}
 		if limit > 0 && len(runs) >= limit {
 			return runs[:limit], nil // asked for the newest few, and has them
+		}
+		if endOfList(len(out.Runs), perPage, len(runs), total) {
+			complete = true
+			break
 		}
 	}
 	if limit > 0 && len(runs) >= limit {
 		return runs[:limit], nil
 	}
-	if len(runs) != total {
+	if !complete || len(runs) < total {
 		return nil, incompleteList("workflow runs", len(runs), total, "a very long queue (GitHub lists at most 1000 results), or a runaway workflow", "clear the queue (cancel old runs), then re-run")
 	}
 	return runs, nil
+}
+
+// endOfList says whether the page just read ended the listing: it was empty (GitHub's cap stops
+// a list short of total_count, and asking further only repeats the answer), or it was a short page
+// and everything promised has been read. A total_count that lags behind the list (more results
+// than it says) does not end the list by itself: a full page may still have a successor, so
+// the list is never cut at total_count, which would blind the caller to the rest.
+func endOfList(pageLen, perPage, have, total int) bool {
+	return pageLen == 0 || (pageLen < perPage && have >= total)
 }
 
 // incompleteList is the error for a listing whose results do not add up to its total_count.
@@ -411,6 +445,7 @@ func incompleteList(what string, got, total int, cause, fix string) error {
 func (c *Client) ListJobs(ctx context.Context, repository string, runID int64) ([]provider.Job, error) {
 	var jobs []provider.Job
 	total := 0
+	complete := false
 	for page := 1; page <= listMaxPages; page++ {
 		q := url.Values{"per_page": {strconv.Itoa(listPerPage)}, "page": {strconv.Itoa(page)}}
 		var out struct {
@@ -435,11 +470,12 @@ func (c *Client) ListJobs(ctx context.Context, repository string, runID int64) (
 			jobs = append(jobs, job)
 		}
 		total = out.Total
-		if len(jobs) >= total {
+		if endOfList(len(out.Jobs), listPerPage, len(jobs), total) {
+			complete = true
 			break
 		}
 	}
-	if len(jobs) != total {
+	if !complete || len(jobs) < total {
 		return nil, incompleteList(fmt.Sprintf("jobs of run %d", runID), len(jobs), total, "an unusually large matrix, or GitHub cutting the list short", "cancel the run")
 	}
 	return jobs, nil
@@ -513,6 +549,7 @@ func (c *Client) ListRunners(ctx context.Context, s provider.Scope) ([]provider.
 	const perPage, maxPages = 100, 50
 	var all []provider.Runner
 	total := 0
+	complete := false
 	for page := 1; page <= maxPages; page++ {
 		var out struct {
 			TotalCount int          `json:"total_count"`
@@ -530,11 +567,12 @@ func (c *Client) ListRunners(ctx context.Context, s provider.Scope) ([]provider.
 			all = append(all, pr)
 		}
 		total = out.TotalCount
-		if len(all) >= total {
+		if endOfList(len(out.Runners), perPage, len(all), total) {
+			complete = true
 			break
 		}
 	}
-	if len(all) != total {
+	if !complete || len(all) < total {
 		return nil, incompleteList("runners", len(all), total, "more runners than the page limit allows, or GitHub cutting the list short", "remove runners you no longer use")
 	}
 	return all, nil

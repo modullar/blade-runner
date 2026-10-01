@@ -2,12 +2,14 @@ package admit_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/modullar/blade-runner/internal/admit"
 	"github.com/modullar/blade-runner/internal/diag"
+	"github.com/modullar/blade-runner/internal/provider"
 	"github.com/modullar/blade-runner/internal/testrig"
 	"github.com/modullar/blade-runner/internal/trust"
 )
@@ -122,5 +124,51 @@ func TestAnEmptyOrMissingTrustStoreAdmitsNothing(t *testing.T) {
 		if _, err := a.Admit(ctx, subject(c)); err == nil {
 			t.Errorf("%s was admitted with nobody trusted", who)
 		}
+	}
+}
+
+// brokenProvider is a provider whose commit lookup fails with a plain error (no diag code), as a
+// transport failure inside a custom Provider would. Everything else is the real client.
+type brokenProvider struct {
+	provider.Provider
+	err error
+}
+
+func (b brokenProvider) Commit(context.Context, string, string) (provider.Commit, error) {
+	return provider.Commit{}, b.err
+}
+
+func TestAnAdmissionFailureIsToldFromARefusalByItsCode(t *testing.T) {
+	r, a, commits, pub := rig(t)
+	trustKey(t, r, "owner", pub["owner"], time.Time{})
+
+	// GitHub down (503): "could not ask" is BR-E022, never BR-E067 (callers read E067 as "this
+	// commit may not run" and would cancel or refuse on an outage).
+	r.Srv.Down = true
+	if _, err := a.Admit(ctx, subject(commits["owner"])); diag.CodeOf(err) != diag.CodeGitHubUnavailable {
+		t.Errorf("GitHub down: %v, want BR-E022", err)
+	}
+	r.Srv.Down = false
+
+	// A repository the token cannot read: a 404 that says nothing about the commit.
+	if _, err := a.Admit(ctx, admit.Subject{Repository: "ghost/hidden", SHA: commits["owner"].SHA}); err == nil || diag.CodeOf(err) == diag.CodeNotAdmitted {
+		t.Errorf("a repository the token cannot read: %v, want an error that is not BR-E067", err)
+	}
+
+	// A commit GitHub has no object for, in a repository it can read: a real refusal, BR-E067.
+	if _, err := a.Admit(ctx, admit.Subject{Repository: testrig.Target, SHA: strings.Repeat("c", 40)}); diag.CodeOf(err) != diag.CodeNotAdmitted {
+		t.Errorf("a commit that does not exist: %v, want BR-E067", err)
+	}
+
+	// A provider error with no code at all is wrapped as BR-E022, not passed on bare.
+	b := &admit.Admitter{Provider: brokenProvider{Provider: r.Env.Provider, err: errors.New("connection reset")}, Verifier: a.Verifier}
+	if _, err := b.Admit(ctx, subject(commits["owner"])); diag.CodeOf(err) != diag.CodeGitHubUnavailable {
+		t.Errorf("an uncoded provider error: %v, want BR-E022", err)
+	}
+	// ...and a coded refusal from a provider is passed on untouched.
+	refusal := diag.New(diag.CodeNotAdmitted, "no such commit", "x", "y")
+	b = &admit.Admitter{Provider: brokenProvider{Provider: r.Env.Provider, err: refusal}, Verifier: a.Verifier}
+	if _, err := b.Admit(ctx, subject(commits["owner"])); diag.CodeOf(err) != diag.CodeNotAdmitted {
+		t.Errorf("a coded refusal: %v, want BR-E067", err)
 	}
 }

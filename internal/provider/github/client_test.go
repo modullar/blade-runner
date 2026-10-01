@@ -489,3 +489,38 @@ func TestCancelRun(t *testing.T) {
 		t.Error("an endpoint GitHub does not have must be an error")
 	}
 }
+
+func TestCommit404IsARefusalOnlyWhenTheRepositoryItselfIsReadable(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	c := newClient(s, "ghp_testtoken")
+	missing := strings.Repeat("ef", 20)
+
+	// The repository reads fine with this token, and GitHub has no such commit: definitive.
+	_, err := c.Commit(ctx, "acme/widgets", missing)
+	if diag.CodeOf(err) != diag.CodeNotAdmitted {
+		t.Errorf("a 404 for a commit in a readable repository: %v, want BR-E067", err)
+	}
+
+	// GitHub answers 404 for a repository the token cannot see (and for a fork that is not there
+	// yet): that says nothing about the commit, so it must not be a verdict on it.
+	before := len(s.Requests())
+	_, err = c.Commit(ctx, "ghost/hidden", missing)
+	if err == nil || diag.CodeOf(err) == diag.CodeNotAdmitted {
+		t.Errorf("a 404 for a repository the token cannot read: %v, want a non-BR-E067 error", err)
+	}
+	if got := s.Requests()[before:]; len(got) != 2 {
+		t.Errorf("the 404 must be confirmed with a second read of the repository, requests: %v", got)
+	}
+}
+
+func TestCommit422IsARefusalOnlyWhenGitHubSaysThereIsNoSuchCommit(t *testing.T) {
+	s := githubtest.New()
+	defer s.Close()
+	sha := strings.Repeat("ab", 20)
+	s.AddCommit("acme/widgets", sha, "p", "s")
+	s.SetCommitStatus(sha, 422) // the fake words it as GitHub does: "No commit found for SHA"
+	if _, err := newClient(s, "ghp_testtoken").Commit(ctx, "acme/widgets", sha); diag.CodeOf(err) != diag.CodeNotAdmitted {
+		t.Errorf("422 No commit found: %v, want BR-E067", err)
+	}
+}

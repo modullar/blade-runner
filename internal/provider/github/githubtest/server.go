@@ -47,6 +47,7 @@ type Server struct {
 	commits      map[string]commitData // "owner/repo@sha"
 	commitOrder  map[string][]string   // repo -> shas, oldest first
 	commitStatus map[string]int        // sha -> forced HTTP status
+	repoStatus   map[string]int        // repo -> forced HTTP status of GET /repos/{repo}
 	runs         map[string][]provider.Run
 	jobs         map[string][]provider.Job
 	// JITUnsupported makes generate-jitconfig answer 404, as an API without it would.
@@ -63,6 +64,9 @@ type Server struct {
 	// MaxPerPage makes a listing page hold at most this many items even when per_page asks for
 	// more (a short page that is not the last one). 0 means no limit.
 	MaxPerPage int
+	// TotalCountOffset is added to total_count in the run and job listings: negative, it models
+	// a total that lags behind the list (a run was created after the count was taken).
+	TotalCountOffset int
 	// JobRunIDOffset is added to the run_id the jobs endpoint reports, as inconsistent data would.
 	JobRunIDOffset int64
 	// FailPathContains makes every request whose path contains it answer 500.
@@ -138,6 +142,21 @@ func (s *Server) SetCommitStatus(sha string, status int) {
 		s.commitStatus = map[string]int{}
 	}
 	s.commitStatus[sha] = status
+}
+
+// SetRepoStatus (status 0 clears it) makes GET /repos/{repo} answer with this HTTP status, whatever
+// else it knows: 404 is what GitHub says for a repository the token cannot see.
+func (s *Server) SetRepoStatus(repo string, status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if status == 0 {
+		delete(s.repoStatus, repo)
+		return
+	}
+	if s.repoStatus == nil {
+		s.repoStatus = map[string]int{}
+	}
+	s.repoStatus[repo] = status
 }
 
 // AddRun makes a workflow run visible for repo (newest last; the API lists newest first).
@@ -247,7 +266,7 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request, repo string,
 			}
 			out = append(out, entry)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(matching), "workflow_runs": out})
+		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(matching) + s.TotalCountOffset, "workflow_runs": out})
 		return
 	}
 	if r.Method == http.MethodGet && len(rest) == 3 && rest[2] == "jobs" { // GET .../actions/runs/{id}/jobs
@@ -267,7 +286,7 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request, repo string,
 			}
 			out = append(out, map[string]any{"id": j.ID, "run_id": j.RunID + s.JobRunIDOffset, "status": j.Status, "labels": j.Labels, "runner_name": runner, "head_sha": j.HeadSHA})
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(mine), "jobs": out})
+		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(mine) + s.TotalCountOffset, "jobs": out})
 		return
 	}
 	writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
@@ -349,7 +368,11 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, repo, sha 
 	status, forced := s.commitStatus[sha]
 	s.mu.Unlock()
 	if forced {
-		writeJSON(w, status, map[string]string{"message": http.StatusText(status)})
+		msg := http.StatusText(status)
+		if status == http.StatusUnprocessableEntity {
+			msg = "No commit found for SHA: " + sha // GitHub's own wording
+		}
+		writeJSON(w, status, map[string]string{"message": msg})
 		return
 	}
 	if !known || !have || (private && !authed) {
@@ -488,6 +511,13 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (s *Server) handleRepo(w http.ResponseWriter, r *http.Request, repo string) {
+	s.mu.Lock()
+	forced, isForced := s.repoStatus[repo]
+	s.mu.Unlock()
+	if isForced {
+		writeJSON(w, forced, map[string]string{"message": http.StatusText(forced)})
+		return
+	}
 	private, ok := s.Repos[repo]
 	authed := r.Header.Get("Authorization") == "Bearer "+s.Token
 	if !ok || (private && !authed) {

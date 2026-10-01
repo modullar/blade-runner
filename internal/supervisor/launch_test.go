@@ -140,8 +140,9 @@ func TestALaunchThatWasOnlyWithheldDoesNotUseUpTheJobsAttempts(t *testing.T) {
 		stranger++
 		r.stranger(stranger, stranger*10)
 	}
-	// Five launches in a row are called off at the re-check. None of them failed the admitted job.
-	for i := 0; i < 5; i++ {
+	// Launches in a row are called off at the re-check (up to the refund cap). None of them failed
+	// the admitted job.
+	for i := 0; i < 3; i++ {
 		out, err := r.sup.Tick(ctx)
 		if err != nil || !out.Withheld || out.Launched {
 			t.Fatalf("round %d: %+v, %v", i, out, err)
@@ -152,7 +153,7 @@ func TestALaunchThatWasOnlyWithheldDoesNotUseUpTheJobsAttempts(t *testing.T) {
 	hp.afterJIT = nil
 	out, err := r.sup.Tick(ctx)
 	if err != nil || !out.Launched || out.JobID != 10 {
-		t.Fatalf("after five withheld launches the admitted job must still run: %+v, %v", out, err)
+		t.Fatalf("after three withheld launches the admitted job must still run: %+v, %v", out, err)
 	}
 	if n := len(r.entriesOfKind(supervisor.KindGaveUp)); n != 0 {
 		t.Errorf("gave up on a job that never failed: %d entries", n)

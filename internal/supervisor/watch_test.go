@@ -95,3 +95,56 @@ func TestACommitTheWatcherCannotReJudgeEventuallyStopsAWaitingRunner(t *testing.
 		t.Errorf("finished = %+v", f)
 	}
 }
+
+func TestATransientFailureNeverKillsAnAlreadyAdmittedRunner(t *testing.T) {
+	// While the runner waits, GitHub starts answering 404 for its job's commit AND for the
+	// repository itself (a token that cannot see it, or a hiccup). Many polls go by. The runner
+	// was admitted; "cannot tell" is not a reason to kill it.
+	r := newRig(t)
+	r.queue(q{run: 1, job: 10})
+	sha := r.commits["owner"].SHA
+	stopped := false
+	r.rt.OnRun = func(c context.Context, spec isolation.Spec) (isolation.Result, error) {
+		r.srv.SetCommitStatus(sha, 404)
+		r.srv.SetRepoStatus(repo, 404)
+		select {
+		case <-c.Done():
+			stopped = true
+		case <-time.After(300 * time.Millisecond): // thirty polls at 10ms
+		}
+		r.srv.SetCommitStatus(sha, 0)
+		r.srv.SetRepoStatus(repo, 0)
+		return r.takes(repo, 10, 1)(c, spec)
+	}
+	out, err := r.sup.Tick(ctx)
+	if err != nil || !out.Launched || out.Withheld {
+		t.Fatalf("outcome = %+v, err = %v", out, err)
+	}
+	if stopped {
+		t.Fatal("an admitted runner was stopped over failures that say nothing about its commit")
+	}
+	if f := r.entriesOfKind(supervisor.KindFinished); len(f) != 1 || len(f[0].JobsRun) != 1 {
+		t.Errorf("finished = %+v", f)
+	}
+}
+
+func TestACommitThatIsGoneFromAReadableRepositoryStopsAWaitingRunner(t *testing.T) {
+	// The other side: the repository reads fine and GitHub has no such commit any more (force
+	// pushed away): the job cannot be vouched for, so the runner that has no job yet is stopped.
+	r := newRig(t)
+	r.queue(q{run: 1, job: 10})
+	stopped := false
+	r.rt.OnRun = func(c context.Context, spec isolation.Spec) (isolation.Result, error) {
+		r.srv.SetCommitStatus(r.commits["owner"].SHA, 404)
+		select {
+		case <-c.Done():
+			stopped = true
+		case <-time.After(3 * time.Second):
+		}
+		return isolation.Result{}, nil
+	}
+	out, err := r.sup.Tick(ctx)
+	if err != nil || !stopped || !out.Withheld {
+		t.Fatalf("stopped = %v, outcome = %+v, err = %v", stopped, out, err)
+	}
+}

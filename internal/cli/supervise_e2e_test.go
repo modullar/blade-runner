@@ -260,3 +260,51 @@ func TestSuperviseRejectsBadFlags(t *testing.T) {
 		t.Errorf("stray argument: exit %d", code)
 	}
 }
+
+// queuePR puts a queued pull_request run from a fork at the fake GitHub, its head commit signed by
+// who. A pull request run executes GitHub's merge commit, which nobody here verified.
+func (s *superviseRig) queuePR(run, job int64, who string) {
+	s.t.Helper()
+	sha := s.commits[who].SHA
+	s.srv.AddRun("acme/widgets", provider.Run{ID: run, HeadSHA: sha, Event: "pull_request", Status: "queued", HeadRepository: "acme/widgets", Actor: who})
+	s.srv.AddJob("acme/widgets", provider.Job{ID: job, RunID: run, Status: "queued", Labels: []string{"self-hosted", "gpu"}, HeadSHA: sha})
+}
+
+func TestSuperviseWithADefaultConfigRefusesAPullRequestRunSignedByTheOwner(t *testing.T) {
+	// No supervisor.allow_pull_request_merge in the config: the default must be "refuse", all the
+	// way from the config file through the command's wiring to the judgement, because a pull
+	// request run executes a merge commit that was never verified.
+	s := newSuperviseRig(t)
+	s.trustOwner()
+	s.queuePR(1, 10, "owner")
+
+	if code := s.run("", "supervise", "-c", s.cfgPath, "--once"); code != cli.ExitOK {
+		t.Fatalf("a refusal is correct behaviour: exit %d\n%s", code, s.err.String())
+	}
+	if s.requestedJIT() {
+		t.Error("a runner was registered for a pull_request run under the default configuration")
+	}
+	var refused []supervisor.Entry
+	for _, e := range s.audit() {
+		if e.Kind == supervisor.KindLaunching {
+			t.Errorf("launched: %+v", e)
+		}
+		if e.Kind == supervisor.KindRefused {
+			refused = append(refused, e)
+		}
+	}
+	if len(refused) != 1 || refused[0].Code != "BR-E074" || !strings.Contains(refused[0].Message, "merge") {
+		t.Errorf("refused entries = %+v, want one BR-E074 naming the merge commit", refused)
+	}
+	s.noContainers("1")
+
+	// Opting in is what lets it through.
+	cfg, _ := os.ReadFile(s.cfgPath)
+	if err := os.WriteFile(s.cfgPath, append(cfg, []byte("  allow_pull_request_merge: true\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.mustRun("", "supervise", "-c", s.cfgPath, "--once")
+	if !strings.Contains(s.out.String(), "ran run 1 job 10") {
+		t.Errorf("after opting in:\n%s", s.out.String())
+	}
+}

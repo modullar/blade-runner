@@ -90,3 +90,50 @@ func TestARefusalIsToldFromAFailureByItsCodeNotByItsWording(t *testing.T) {
 		}
 	})
 }
+
+func TestA404ForARepositoryTheTokenCannotReadIsOnlyWithheldAndNeverCancelsAnything(t *testing.T) {
+	// GitHub answers 404 for a repository the token cannot see, for a fork that is still being
+	// created and for a commit that was only just pushed. None of that is a verdict on the commit,
+	// so it must neither be recorded as a refusal nor ask GitHub to cancel someone's run.
+	r := newRig(t, withConfig(func(c *supervisor.Config) { c.CancelUnadmitted = true }))
+	r.queue(q{run: 1, job: 10})
+	sha := r.commits["owner"].SHA
+	r.srv.SetCommitStatus(sha, 404)
+	r.srv.SetRepoStatus(repo, 404)
+
+	for i := 0; i < 3; i++ {
+		out, err := r.sup.Tick(ctx)
+		if err == nil || diag.CodeOf(err) != diag.CodeQueueUnreadable || len(out.Refused) != 0 || !out.Withheld || out.Launched {
+			t.Fatalf("round %d: outcome = %+v, err = %v", i, out, err)
+		}
+	}
+	if n := len(r.cancelRequests()); n != 0 {
+		t.Errorf("%d cancel request(s) after a 404 that says nothing about the commit", n)
+	}
+	if got := r.entriesOfKind(supervisor.KindRefused); len(got) != 0 {
+		t.Errorf("refused entries = %+v", got)
+	}
+	r.mustStartNothing()
+
+	// Once the repository reads and the commit is there, the very same job runs: nothing was
+	// decided against it.
+	r.srv.SetCommitStatus(sha, 0)
+	r.srv.SetRepoStatus(repo, 0)
+	r.rt.OnRun = r.takes(repo, 10, 1)
+	if out, err := r.sup.Tick(ctx); err != nil || !out.Launched {
+		t.Fatalf("after GitHub recovered: %+v, %v", out, err)
+	}
+}
+
+func TestA404ForACommitInAReadableRepositoryIsStillARefusalCancelCanClear(t *testing.T) {
+	r := newRig(t, withConfig(func(c *supervisor.Config) { c.CancelUnadmitted = true }))
+	r.queue(q{run: 1, job: 10})
+	r.srv.SetCommitStatus(r.commits["owner"].SHA, 404) // the repository itself still reads fine
+	out, err := r.sup.Tick(ctx)
+	if err != nil || len(out.Refused) != 1 || out.Refused[0].Code != diag.CodeJobRefused {
+		t.Fatalf("outcome = %+v, err = %v", out, err)
+	}
+	if c := r.cancelRequests(); len(c) != 1 {
+		t.Errorf("cancel requests = %v", c)
+	}
+}

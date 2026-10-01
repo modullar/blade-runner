@@ -179,6 +179,9 @@ func (s *Supervisor) launch(ctx context.Context, cand judgement, a assessment) (
 				"check the provider's job list for this runner by hand, and treat it as an incident until you have"))
 		firstErr = errors.Join(firstErr, alarmErr)
 	}
+	if !w.stopped {
+		delete(s.refunds, job.ID) // the launch ran: the next called-off launch starts a new count
+	}
 	s.logf("%s", fin.Message)
 	if err := s.cfg.Audit.Record(fin); err != nil {
 		firstErr = errors.Join(firstErr, err)
@@ -233,7 +236,7 @@ func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]boo
 	defer close(w.done)
 	t := time.NewTicker(s.cfg.WatchInterval)
 	defer t.Stop()
-	failures := 0
+	scanFailures, judgeFailures := 0, 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -245,15 +248,16 @@ func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]boo
 			if ctx.Err() != nil {
 				return
 			}
-			failures++
-			if failures >= watchErrorLimit {
+			scanFailures++
+			if scanFailures >= watchErrorLimit {
 				w.stopped, w.code = true, diag.CodeQueueUnreadable
-				w.reason = fmt.Sprintf("the queue could not be read %d times in a row (%s), so what the runner might be given is unknown", failures, what(err))
+				w.reason = fmt.Sprintf("the queue could not be read %d times in a row (%s), so what the runner might be given is unknown", scanFailures, what(err))
 				stop()
 				return
 			}
 			continue
 		}
+		scanFailures = 0
 		assigned := false
 		for _, o := range obs {
 			if o.Job.RunnerName != name {
@@ -274,7 +278,7 @@ func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]boo
 		// while the runner waits. So every waiting job it could take is judged again each poll
 		// (a commit is fetched once per poll however many jobs share it), not only the new ones.
 		j := &judger{s: s, cache: map[string]admission{}}
-		cannotJudge := ""
+		cannotJudge, cannotJudgeRepo := "", ""
 		for _, o := range obs {
 			if !stillWaiting(o.Job) || !couldTake(s.labels, o.Job) {
 				continue
@@ -296,18 +300,28 @@ func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]boo
 					return
 				}
 				cannotJudge = fmt.Sprintf("job %d of run %d could not be judged again: %s", o.Job.ID, o.Run.ID, jd.Reason)
+				cannotJudgeRepo = jd.Subject.Repository
 			}
 		}
 		if cannotJudge != "" {
-			failures++
-			if failures >= watchErrorLimit {
-				w.stopped, w.code = true, diag.CodeQueueUnreadable
-				w.reason = fmt.Sprintf("a waiting job could not be judged %d times in a row (%s), so whether the runner may take it is unknown", failures, cannotJudge)
-				stop()
-				return
+			// A runner that was admitted must not be killed by a hiccup: GitHub answering 404 or 5xx
+			// for a commit says nothing about the commit while the repository itself cannot be read
+			// (a token that cannot see it, a fork not there yet, an outage). So it is stopped only
+			// after several polls in a row AND once the repository reads fine, which makes
+			// "the commit cannot be judged" a statement about the commit and not about the link.
+			judgeFailures++
+			if judgeFailures >= watchErrorLimit {
+				if _, verr := s.cfg.Provider.Visibility(ctx, cannotJudgeRepo); verr == nil {
+					w.stopped, w.code = true, diag.CodeQueueUnreadable
+					w.reason = fmt.Sprintf("a waiting job could not be judged %d times in a row although its repository reads fine (%s), so whether the runner may take it is unknown", judgeFailures, cannotJudge)
+					stop()
+					return
+				} else if ctx.Err() != nil {
+					return
+				}
 			}
 			continue
 		}
-		failures = 0
+		judgeFailures = 0
 	}
 }
