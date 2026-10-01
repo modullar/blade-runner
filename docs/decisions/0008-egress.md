@@ -42,8 +42,13 @@ and **nothing else**: not the host, the host's LAN or loopback services, cloud m
    socket really connects to. This is what makes DNS rebinding irrelevant: a later, different
    answer is never asked for. The address policy has no configuration in the production binary.
    The name is resolved as an absolute name (trailing dot), so the resolver's search list cannot
-   turn an allowlisted `github.com` into `github.com.<search domain>`, and `/etc/hosts` is not
-   consulted. Every client connection, tunnelled or not, counts against the connection cap, and
+   turn an allowlisted `github.com` into `github.com.<search domain>`. That is all the trailing
+   dot does: **`/etc/hosts` is still consulted** for an absolute name (Go's resolver reads it
+   first), so an entry there can answer for an allowlisted name. It cannot widen anything,
+   because `AddressPolicy` gates every address the resolver returns, wherever the answer came
+   from, and the dial-time check backs it up. On the way in, a client's target may carry one
+   trailing dot (`github.com.` is the same host as `github.com`, logged without the dot); two
+   (`github.com..`), an empty label, or a dot in an allowlist entry are refused. Every client connection, tunnelled or not, counts against the connection cap, and
    idle ones (kept alive, or tunnels with no traffic) are closed after `IdleTimeout`.
 4. **The audit** (`internal/isolation`, network mode `allowlist`). After `docker create` and
    before `docker start` the job is refused (BR-E082) unless: its network mode is the egress
@@ -58,17 +63,42 @@ and **nothing else**: not the host, the host's LAN or loopback services, cloud m
    container that was created but not started) and refuses any besides the proxy and this job.
    The same audit repeats every 500 ms while the job runs and kills the job, failing the run
    with BR-E082, if an unexpected container appears (a container created and started in the gap
-   between two checks can have reached the job for up to that long). The container named as the
+   between two checks can have reached the job for up to that long). A violation that was READ
+   kills the job at once; a pass whose docker commands failed (the topology could not be read)
+   counts only when it happens twice in a row, because one hiccup of the daemon is not a
+   finding but not knowing twice running is. The kill is retried (up to 10 attempts, growing
+   pause) until `docker inspect` says the container is no longer running, not fired once. One
+   more audit runs after the job exits. A job that was killed or flagged after it started is
+   reported as one that **RAN** (BR-E082, "its result is not to be trusted"), never as "NOT
+   started"; "NOT started" is only for a refusal before `docker start`, and an audit that
+   cannot read the topology before start is BR-E082 too, not BR-E068. The container named as the
    proxy must be **the one `egress.Open` built**: it carries the manager's labels with the same
    session id as the network, is the container the network lists under that name, is running,
    and passes the same hardening audit as a job (a name and an address are not an identity). The
    proxy container is also held to the hardening audit before it starts, and must be on exactly
-   its two networks. A caller cannot set proxy variables (`Spec.Validate` reserves them).
+   its two networks, which the 500 ms loop re-reads (a third network attached to a running proxy
+   kills the job). `Session.Apply` carries what `Open` built the proxy from (image, entrypoint,
+   command line) in the `Spec`, and the audit requires the running proxy to carry exactly those.
+   **Namespace sharing is a blind spot of every list above:** a container started with
+   `--network container:<proxy or job>` joins that container's network stack without being
+   attached to any network, so `network inspect` and `ps --filter network=` never show it.
+   (`docker ps --format {{.Networks}}` prints nothing for it, which is how the audit finds it.)
+   Each pass therefore inspects the network mode of every container that shows no network or
+   carries a `bladerunner.*` label, and refuses the job if one shares the proxy's or the job's
+   stack (named by id, id prefix or name), or if a Blade Runner container joins any other
+   container's stack. A caller cannot set proxy variables (`Spec.Validate` reserves them).
 5. **Lifecycle** (`egress.Manager` / `Session`): `Open` builds the network and proxy and waits
    until the proxy answers (on failure it removes only what that call created, by Docker id:
    a name collision with another live session fails without touching it); `Apply` fills in the `isolation.Spec`; `Close` removes both
-   (idempotent); `Sweep` removes what a crash left behind; `Decisions` reads back what the proxy
-   allowed and refused.
+   (idempotent; the proxy is stopped with a grace period first so it can write what it still holds);
+   `Sweep` removes what a crash left behind **for this manager's `Owner` only** (a label on every
+   proxy and network; two supervisors on one daemon must set different owners, and the default
+   owner is shared by every manager that sets none), carries on past a failure and reports all
+   of them; `Decisions` asks the proxy to flush and reads back what it allowed and refused.
+   A failed `Open` also reclaims what a create call made without ever reporting an id (context
+   cancelled, CLI killed after the daemon had done the work): every object carries a label
+   unique to that `Open` call, and the failure path removes what carries it and the session
+   id, so a live session with the same id is never matched.
 
 ## Alternatives, with trade-offs
 
@@ -146,11 +176,25 @@ because they depend on the code at that moment.
   `publicsuffix.go` that is **not exhaustive** (the Public Suffix List has thousands of entries):
   the operator remains responsible for every wildcard they write. Names that read as numeric
   IPv4 forms (`1.2.3`, `010.1`, `0x7f.1`) are refused as hostnames.
-- **The decision log is bounded, not unlimited.** Refused requests are itemised up to a cap
-  (default 1000) and then counted in a periodic summary line, so a flood of refusals cannot push
-  the allowed records out of Docker's 1 MiB x 2 log; logged host and port text is clipped to 64
-  and 8 bytes. Allowed decisions are always written (each is a real tunnel, bounded by the
-  connection cap).
+- **The decision log is bounded, not unlimited, and kept current.**
+  - *Refusals* are itemised up to a budget **per reason** (default 100 each), then counted in a
+    summary line per reason. `forbidden-address` and `ip-literal` are **never** suppressed: they
+    are the attempts to reach inside, and an operator must be able to find every one. (They are
+    therefore the one unbounded stream; the connection cap and the header timeout bound their
+    rate, and the log can still rotate under a sustained flood of them.)
+  - *Allowed decisions* are aggregated per `host:port` per 10 s window: the first is written
+    at once, and the rest of the window becomes one line with a `count` and the **last**
+    decision's time and client. At most 200 distinct pairs get a first line per window (a
+    wildcard entry lets a job invent names); the rest are counted under one line. A burst of
+    short allowed CONNECTs therefore cannot rotate Docker's 1 MiB x 2 log and evict refusals.
+  - *Staleness.* A timer writes pending summaries and aggregates; SIGTERM flushes on the way out
+    (`Close` stops the proxy before removing it); `Session.Decisions` sends SIGUSR1 and waits
+    for the proxy's acknowledgement line (`flushed`, hidden from the result) before reading.
+    A proxy that is already gone is read as it is.
+  - *Line size.* Logged host, port and detail are clipped (64, 8, 200 bytes) and `resolved` to
+    8 addresses and 256 bytes with a `+N more` marker. `Decisions` reads with no fixed line
+    limit that could stop it: an over-long or broken line (log rotation can cut one) is skipped
+    and the lines after it are still read.
 - **An allowed name is trusted with whatever the job sends it.** The allowlist limits where a job
   can talk, not what it says: a job holding a token could still use `github.com` to send it
   somewhere (a gist, a push to another repository). A wildcard such as
@@ -174,13 +218,20 @@ because they depend on the code at that moment.
   Dockerfile is shipped.
 - **Not connected to anything.** Nothing starts jobs yet; `egress.Manager` and
   `isolation.Docker` are the pieces the supervisor will call.
-- **Proxy logs** record host, port, client address and the decision for each request, kept by
-  Docker's `local` log driver (1 MiB, 2 files) until `Close` removes the container.
+- **Proxy logs** record host, port, client address and the decision for each request (repeated
+  allowed ones aggregated, see above), kept by Docker's `local` log driver (1 MiB, 2 files)
+  until `Close` removes the container. Nothing persists them past that: a caller that wants the
+  record must call `Decisions` first.
+- **An idle tunnel** is one with no traffic in **either** direction for `IdleTimeout`: a long
+  download to a silent client, or an upload with nothing coming back, stays open.
 - **Concurrent runs share names.** `RemoveStale` acts on every container with the job label, so two
   test or runner processes on one daemon can remove each other's jobs. The repo's Docker tests take
-  a file lock (`internal/dockerlock`, in a per-user private directory) to avoid that between
+  a file lock (`internal/dockerlock`, in a per-user private directory whose owner and mode are
+  checked, for the cache directory as well as the temp fallback) to avoid that between
   `internal/isolation` and `internal/egress`; processes of another user, and other test
-  packages that do not call it, are not covered.
+  packages that do not call it, are not covered. The lock is re-entrant for a test and its
+  subtests (it used to deadlock against itself), and on Windows, which has no `flock`, a test
+  that asks for it is skipped.
 - **Error codes.** The codes asked for were BR-E080 to BR-E089, but BR-E080 was already the state
   file code, so this uses BR-E081 (invalid allowlist), BR-E082 (egress network could not be built
   or failed its audit) and BR-E083 (the proxy refused a request).
