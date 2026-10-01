@@ -11,12 +11,15 @@
 // Limits, stated plainly: a container shares its host's kernel, so a kernel flaw could let code
 // out; a virtual machine is a stronger boundary (on macOS Docker already runs inside one). The
 // "bridge" network mode reaches whatever the host network reaches: host services and the LAN are
-// only blocked by firewall rules this package does not install (see docs/decisions/0006).
+// only blocked by firewall rules this package does not install (see docs/decisions/0006). The
+// "allowlist" mode closes that gap for jobs that need the network (docs/decisions/0008).
 package isolation
 
 import (
 	"fmt"
+	"net/netip"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/modullar/blade-runner/internal/diag"
@@ -26,6 +29,10 @@ import (
 const (
 	NetworkNone   = "none"   // no network at all
 	NetworkBridge = "bridge" // an isolated bridge with outbound access
+	// NetworkAllowlist puts the job on a Docker network with no route out and no address for the
+	// host on it, whose only neighbour is an allowlisting proxy (internal/egress). The job can
+	// reach the hostnames the proxy allows, through the proxy, and nothing else.
+	NetworkAllowlist = "allowlist"
 )
 
 // Spec describes one job's container.
@@ -40,7 +47,13 @@ type Spec struct {
 	Env    map[string]string
 	Labels map[string]string
 
-	Network      string
+	Network string
+	// The three fields below are set for NetworkAllowlist (by egress.Session.Apply) and must be
+	// empty otherwise.
+	EgressNetwork        string // the internal Docker network the job joins
+	EgressProxy          string // the proxy's address on that network, "ip:port"
+	EgressProxyContainer string // the proxy's container name, the only neighbour allowed
+
 	CPUs         float64       // e.g. 2
 	MemoryMiB    int           // a hard cap; the job is killed above it
 	PidsLimit    int           // a cap on processes, so a fork bomb stops
@@ -67,6 +80,41 @@ func invalid(what string) error {
 		"the job description is unsafe or incomplete", "fix the caller: this is a bug in Blade Runner, not something to override")
 }
 
+// proxyEnvNames are the variables a client uses to find a proxy. In allowlist mode they belong
+// to Blade Runner: a caller must not be able to point the job at another proxy, or exempt a host
+// from this one with NO_PROXY.
+var proxyEnvNames = []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
+
+func isProxyEnv(k string) bool {
+	for _, n := range proxyEnvNames {
+		if strings.EqualFold(k, n) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s Spec) validateEgress() error {
+	if !nameRe.MatchString(s.EgressNetwork) {
+		return invalid(fmt.Sprintf("allowlist mode needs a valid egress network name, got %q", s.EgressNetwork))
+	}
+	if !nameRe.MatchString(s.EgressProxyContainer) {
+		return invalid(fmt.Sprintf("allowlist mode needs the proxy's container name, got %q", s.EgressProxyContainer))
+	}
+	ap, err := netip.ParseAddrPort(s.EgressProxy)
+	if err != nil || !ap.Addr().Is4() || ap.Addr().IsLoopback() || ap.Addr().IsUnspecified() || ap.Port() == 0 {
+		// An IP literal, so the job needs no DNS to find the proxy. IPv6 is not used: the egress
+		// network is IPv4-only and the audit requires that.
+		return invalid(fmt.Sprintf("allowlist mode needs the proxy as an IPv4 ip:port on the egress network, got %q", s.EgressProxy))
+	}
+	for k := range s.Env {
+		if isProxyEnv(k) {
+			return invalid(fmt.Sprintf("environment variable %s is reserved in allowlist mode: the proxy settings are not the caller's to change", k))
+		}
+	}
+	return nil
+}
+
 // Validate refuses a Spec that could not be made safe, and fills defaults into a copy.
 func (s Spec) Validate() (Spec, error) {
 	if !nameRe.MatchString(s.Name) {
@@ -77,10 +125,17 @@ func (s Spec) Validate() (Spec, error) {
 	}
 	switch s.Network {
 	case NetworkNone, NetworkBridge:
+	case NetworkAllowlist:
+		if err := s.validateEgress(); err != nil {
+			return s, err
+		}
 	case "":
 		s.Network = NetworkNone // the safe default
 	default:
-		return s, invalid(fmt.Sprintf("network mode %q is not allowed (only %q and %q)", s.Network, NetworkNone, NetworkBridge))
+		return s, invalid(fmt.Sprintf("network mode %q is not allowed (only %q, %q and %q)", s.Network, NetworkNone, NetworkBridge, NetworkAllowlist))
+	}
+	if s.Network != NetworkAllowlist && (s.EgressNetwork != "" || s.EgressProxy != "" || s.EgressProxyContainer != "") {
+		return s, invalid("egress settings are only meaningful with network mode " + NetworkAllowlist)
 	}
 	for k := range s.Env {
 		if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(k) {

@@ -97,7 +97,7 @@ func createArgs(s Spec) []string {
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges",
 		"--user", "65534:65534",
-		"--network", s.Network,
+		"--network", networkFlag(s),
 		"--pids-limit", strconv.Itoa(s.PidsLimit),
 		"--memory", fmt.Sprintf("%dm", s.MemoryMiB),
 		"--memory-swap", fmt.Sprintf("%dm", s.MemoryMiB), // no swap: the memory cap is real
@@ -117,8 +117,28 @@ func createArgs(s Spec) []string {
 	for _, k := range sortedKeys(s.Env) {
 		args = append(args, "--env", k+"="+s.Env[k])
 	}
+	if s.Network == NetworkAllowlist {
+		for _, k := range ProxyEnv(s) {
+			args = append(args, "--env", k)
+		}
+	}
 	args = append(args, s.Image)
 	return append(args, s.Args...)
+}
+
+// networkFlag is the value of --network: the mode, or for allowlist the internal network itself.
+func networkFlag(s Spec) string {
+	if s.Network == NetworkAllowlist {
+		return s.EgressNetwork
+	}
+	return s.Network
+}
+
+// ProxyEnv is the proxy configuration an allowlist job gets, as KEY=VALUE lines, in both
+// spellings clients use. NO_PROXY is set empty so no host is exempted from the proxy.
+func ProxyEnv(s Spec) []string {
+	u := "http://" + s.EgressProxy
+	return []string{"HTTP_PROXY=" + u, "HTTPS_PROXY=" + u, "http_proxy=" + u, "https_proxy=" + u, "NO_PROXY=", "no_proxy="}
 }
 
 func sortedKeys(m map[string]string) []string {
@@ -181,6 +201,20 @@ func (d *Docker) Run(ctx context.Context, spec Spec) (Result, error) {
 	violations, err := Audit([]byte(ins.Stdout), s)
 	if err != nil {
 		return Result{}, diag.Wrap(err, diag.CodeIsolation, "cannot audit the container", "an unexpected Docker version", "update Docker")
+	}
+	if s.Network == NetworkAllowlist {
+		// The container's own record says which network it joined; the network's record says
+		// whether that network is what the design needs. Both must hold.
+		nw, err := d.docker(ctx, "", "network", "inspect", s.EgressNetwork)
+		if err != nil {
+			return Result{}, diag.Wrap(err, diag.CodeIsolation, "cannot read back the egress network's configuration",
+				"the network is gone or Docker stopped answering", "check `docker network ls`")
+		}
+		nv, err := AuditNetwork([]byte(nw.Stdout), s)
+		if err != nil {
+			return Result{}, diag.Wrap(err, diag.CodeIsolation, "cannot audit the egress network", "an unexpected Docker version", "update Docker")
+		}
+		violations = append(violations, nv...)
 	}
 	if err := AuditError(s.Name, violations); err != nil {
 		return Result{}, err // never started

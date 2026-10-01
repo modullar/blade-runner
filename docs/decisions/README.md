@@ -25,6 +25,8 @@ fake can only confirm the code agrees with itself.
 
 | C1 to C3 | GitHub exposes a commit's signed bytes, supports one-job just-in-time runners, and names the commit a job would run | **Open**; see [0006](0006-signed-admission-and-isolation.md) | `provider/github`, future supervisor |
 
+Egress (a job that needs the network reaches only allowlisted hostnames, not the host, LAN, metadata or other containers) is [0008](0008-egress.md): built and tested on Linux with real Docker, **not verified on macOS**; it lives in `internal/egress` and the `allowlist` mode of `internal/isolation`.
+
 The current direction, cryptographic admission plus isolated runners, is
 [0006](0006-signed-admission-and-isolation.md); it supersedes the login-based hook of 0005 once built.
 
