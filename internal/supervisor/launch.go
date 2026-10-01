@@ -40,6 +40,12 @@ type watchState struct {
 func (s *Supervisor) launch(ctx context.Context, cand judgement, a assessment) (launchResult, error) {
 	run, job := cand.Obs.Run, cand.Obs.Job
 	name := s.runnerPrefix() + s.cfg.NewID()
+	if !s.ownRunner(name) {
+		// Reconcile only removes names of exactly this shape, so a runner named otherwise could
+		// never be cleaned up after a crash.
+		return launchResult{}, diag.New(diag.CodeConfigInvalid, "the generated runner name "+name+" is not of the form br-jit-<runner>-<12 hex digits>",
+			"a bug in the caller's NewID", "nothing was started")
+	}
 	s.attempts[job.ID]++
 	base := Entry{
 		RunID: run.ID, JobID: job.ID, Repository: cand.Subject.Repository, SHA: cand.Subject.SHA, Event: run.Event, Actor: run.Actor,

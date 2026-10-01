@@ -50,6 +50,8 @@ const (
 	// stops a runner that has not been given a job yet: it can no longer tell what it is exposed to.
 	watchErrorLimit = 3
 	runnerPrefix    = "br-jit-"
+	// runnerIDLen is the length of the random hex id that ends a runner name.
+	runnerIDLen = 12
 )
 
 // Config is everything the supervisor needs. Collaborators are injected so each is testable with
@@ -163,6 +165,22 @@ func (s *Supervisor) logf(format string, args ...any) {
 // runnerPrefix is the prefix of every runner (and container) name this supervisor creates.
 func (s *Supervisor) runnerPrefix() string { return runnerPrefix + s.cfg.RunnerName + "-" }
 
+// ownRunner reports whether name is exactly a runner this supervisor generates:
+// br-jit-<runner name>-<12 lower-case hex digits>. A prefix test is not enough: the supervisor
+// "mini-2" names its runners br-jit-mini-2-..., which start with the prefix of "mini".
+func (s *Supervisor) ownRunner(name string) bool {
+	rest, ok := strings.CutPrefix(name, s.runnerPrefix())
+	if !ok || len(rest) != runnerIDLen {
+		return false
+	}
+	for _, c := range rest {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // Reconcile brings the world back to a clean state at start-up, from what the provider and the
 // container runtime say, never from a file: it removes leftover runner containers and any
 // just-in-time runner registration this supervisor created and did not remove (a crash between
@@ -178,7 +196,7 @@ func (s *Supervisor) Reconcile(ctx context.Context) error {
 	}
 	removedRunners := 0
 	for _, r := range runners {
-		if !strings.HasPrefix(r.Name, s.runnerPrefix()) {
+		if !s.ownRunner(r.Name) {
 			continue
 		}
 		if err := s.cfg.Provider.RemoveRunner(ctx, s.cfg.Scope, r.ID); err != nil {
