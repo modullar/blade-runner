@@ -55,6 +55,13 @@ type Server struct {
 	// cancellation that is slow or never takes effect would look. CancelUnsupported answers 404.
 	CancelIgnored     bool
 	CancelUnsupported bool
+	// ResultCap makes the run and job listings return only the first ResultCap results however
+	// many pages are asked for, while total_count still reports the full count: GitHub's list
+	// endpoints stop at 1000 results. 0 means no cap.
+	ResultCap int
+	// MaxPerPage makes a listing page hold at most this many items even when per_page asks for
+	// more (a short page that is not the last one). 0 means no limit.
+	MaxPerPage int
 	// JobRunIDOffset is added to the run_id the jobs endpoint reports, as inconsistent data would.
 	JobRunIDOffset int64
 	// FailPathContains makes every request whose path contains it answer 500.
@@ -137,7 +144,18 @@ func (s *Server) AddJob(repo string, j provider.Job) {
 }
 
 // page returns the slice of n items that the request's page/per_page select (default: all).
-func page(r *http.Request, n int) (lo, hi int) {
+func (s *Server) page(r *http.Request, n int) (lo, hi int) {
+	if s.ResultCap > 0 && n > s.ResultCap {
+		n = s.ResultCap
+	}
+	lo, hi = pageOf(r, n)
+	if s.MaxPerPage > 0 && hi-lo > s.MaxPerPage {
+		hi = lo + s.MaxPerPage
+	}
+	return lo, hi
+}
+
+func pageOf(r *http.Request, n int) (lo, hi int) {
 	perPage, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
 	pg, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if perPage < 1 {
@@ -195,7 +213,7 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request, repo string,
 				matching = append(matching, all[i])
 			}
 		}
-		lo, hi := page(r, len(matching))
+		lo, hi := s.page(r, len(matching))
 		out := []map[string]any{}
 		for _, run := range matching[lo:hi] {
 			prs := []map[string]any{}
@@ -223,7 +241,7 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request, repo string,
 				mine = append(mine, j)
 			}
 		}
-		lo, hi := page(r, len(mine))
+		lo, hi := s.page(r, len(mine))
 		out := []map[string]any{}
 		for _, j := range mine[lo:hi] {
 			var runner any

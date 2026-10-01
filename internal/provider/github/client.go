@@ -301,6 +301,7 @@ var repoURLRe = regexp.MustCompile(`/repos/([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9.
 // assumptions to confirm in BR-0 (C3). A listing longer than listMaxPages pages is an error.
 func (c *Client) ListRuns(ctx context.Context, repository, status string) ([]provider.Run, error) {
 	var runs []provider.Run
+	total := 0
 	for page := 1; page <= listMaxPages; page++ {
 		q := url.Values{"per_page": {strconv.Itoa(listPerPage)}, "page": {strconv.Itoa(page)}}
 		if status != "" {
@@ -355,17 +356,28 @@ func (c *Client) ListRuns(ctx context.Context, repository, status string) ([]pro
 			}
 			runs = append(runs, run)
 		}
-		if len(out.Runs) < listPerPage || len(runs) >= out.Total {
-			return runs, nil
+		total = out.Total
+		if len(runs) >= total {
+			break
 		}
 	}
-	return nil, diag.New(diag.CodeGitHubUnavailable, fmt.Sprintf("more than %d workflow runs match; the list cannot be read completely", listPerPage*listMaxPages),
-		"a very long queue, or a runaway workflow", "clear the queue (cancel old runs), then re-run")
+	if len(runs) != total {
+		return nil, incompleteList("workflow runs", len(runs), total, "a very long queue (GitHub lists at most 1000 results), or a runaway workflow", "clear the queue (cancel old runs), then re-run")
+	}
+	return runs, nil
+}
+
+// incompleteList is the error for a listing whose results do not add up to its total_count.
+// The supervisor decides whether it is safe to start a runner from these lists, so a short or
+// capped list is never returned as if it were the whole.
+func incompleteList(what string, got, total int, cause, fix string) error {
+	return diag.New(diag.CodeGitHubUnavailable, fmt.Sprintf("read %d of %d %s: the list cannot be read completely", got, total, what), cause, fix)
 }
 
 // ListJobs returns every job of a run, following pagination.
 func (c *Client) ListJobs(ctx context.Context, repository string, runID int64) ([]provider.Job, error) {
 	var jobs []provider.Job
+	total := 0
 	for page := 1; page <= listMaxPages; page++ {
 		q := url.Values{"per_page": {strconv.Itoa(listPerPage)}, "page": {strconv.Itoa(page)}}
 		var out struct {
@@ -389,12 +401,15 @@ func (c *Client) ListJobs(ctx context.Context, repository string, runID int64) (
 			}
 			jobs = append(jobs, job)
 		}
-		if len(out.Jobs) < listPerPage || len(jobs) >= out.Total {
-			return jobs, nil
+		total = out.Total
+		if len(jobs) >= total {
+			break
 		}
 	}
-	return nil, diag.New(diag.CodeGitHubUnavailable, fmt.Sprintf("run %d has more than %d jobs; they cannot be read completely", runID, listPerPage*listMaxPages),
-		"an unusually large matrix", "cancel the run")
+	if len(jobs) != total {
+		return nil, incompleteList(fmt.Sprintf("jobs of run %d", runID), len(jobs), total, "an unusually large matrix, or GitHub cutting the list short", "cancel the run")
+	}
+	return jobs, nil
 }
 
 // CancelRun asks GitHub to cancel a run. The endpoint (POST .../actions/runs/{id}/cancel,
@@ -464,6 +479,7 @@ func (c *Client) ListRunners(ctx context.Context, s provider.Scope) ([]provider.
 	}
 	const perPage, maxPages = 100, 50
 	var all []provider.Runner
+	total := 0
 	for page := 1; page <= maxPages; page++ {
 		var out struct {
 			TotalCount int          `json:"total_count"`
@@ -480,9 +496,13 @@ func (c *Client) ListRunners(ctx context.Context, s provider.Scope) ([]provider.
 			}
 			all = append(all, pr)
 		}
-		if len(out.Runners) < perPage || len(all) >= out.TotalCount {
-			return all, nil
+		total = out.TotalCount
+		if len(all) >= total {
+			break
 		}
+	}
+	if len(all) != total {
+		return nil, incompleteList("runners", len(all), total, "more runners than the page limit allows, or GitHub cutting the list short", "remove runners you no longer use")
 	}
 	return all, nil
 }
