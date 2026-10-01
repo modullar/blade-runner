@@ -51,8 +51,8 @@ func Dir() (string, error) {
 }
 
 var (
-	procMu     sync.Mutex    // guards holder
-	holder     string        // name of the test that holds the lock in this process
+	procMu     sync.Mutex // guards holder
+	holder     string     // name of the test that holds the lock in this process
 	procToken  = make(chan struct{}, 1)
 	errSkipped = "docker tests are serialised with flock, which this platform lacks"
 )
