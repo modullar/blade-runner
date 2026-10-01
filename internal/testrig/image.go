@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/modullar/blade-runner/internal/dockerlock"
 )
 
 var (
@@ -27,6 +29,7 @@ func FakeRunnerImage(t testing.TB) string {
 	if out, err := exec.Command("docker", "info", "--format", "{{.OSType}}").Output(); err != nil || strings.TrimSpace(string(out)) != "linux" {
 		t.Skipf("no usable Docker daemon with Linux containers: %v", err)
 	}
+	dockerlock.Lock(t) // real-Docker tests in other packages share one daemon
 	runnerImgOnce.Do(func() {
 		dir, err := os.MkdirTemp("", "fakerunner-img-")
 		if err != nil {
