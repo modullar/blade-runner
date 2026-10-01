@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/modullar/blade-runner/internal/diag"
+	"github.com/modullar/blade-runner/internal/dockerlock"
 	"github.com/modullar/blade-runner/internal/execx"
 	"github.com/modullar/blade-runner/internal/isolation"
 )
@@ -41,7 +42,7 @@ func needDocker(t *testing.T) string {
 	if _, err := jobs.Preflight(ctx); err != nil {
 		t.Skipf("no usable Docker daemon: %v", err)
 	}
-	lockDocker(t)
+	dockerlock.Lock(t)
 	imgOnce.Do(func() {
 		dir, err := os.MkdirTemp("", "egress-img-")
 		if err != nil {
