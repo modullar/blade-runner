@@ -3,6 +3,9 @@
 **Status:** built and tested against the in-process fake GitHub, real `git`/`ssh-keygen`
 commits and a **real Docker daemon**. **Not run against the real GitHub.** One hazard, the
 shared-queue race below, is **mitigated, not solved**, and BR-0 must verify what it leans on.
+Pull requests are admitted only when every commit that can reach the job is signed by a trusted
+key ("Pull requests: every commit verified" below); that design leans on GitHub behaviour (C10 to
+C12b) that is **assumed, not verified**.
 
 [0006](0006-signed-admission-and-isolation.md) defined the supervisor as the part that joins
 admission and isolation. This records how it was built (`internal/supervisor`,
@@ -27,17 +30,14 @@ poll ──▶ read the queue ──▶ for every waiting job this runner could 
   concurrency, so two admitted jobs never share a moment in which either runner could take the
   other's neighbour.
 - **What is verified.** For a push, schedule or manual run: the run's head commit, which must live
-  in this repository. For a pull request: the run's head commit **in the head repository** (the
-  fork), cross-checked against the pull request the provider links to the run; never the merge
-  commit, **which is what the job actually runs: see "Open: PRs run the merge commit" below, and
-  note that `pull_request` runs are refused unless `supervisor.allow_pull_request_merge: true`.**
-  Anything incomplete or contradictory (no head repository, a commit id that is not 40 hex
-  digits, a job whose commit differs from its run's, no labels, unknown status) is refused as
-  ambiguous (BR-E073), not guessed at.
-- **Events.** Only `push`, `workflow_dispatch` and `schedule`, plus `pull_request` when
-  `supervisor.allow_pull_request_merge` is true (default false). Others
-  (`pull_request_target`, `issue_comment`, `workflow_run`, ...) run code that is not the commit
-  that was verified, or at a time a stranger picks: refused (BR-E074).
+  in this repository. For a pull request: the base tip, **every commit of the pull request**, and
+  that the merge commit the job runs is made of exactly those (see "Pull requests: every commit
+  verified" below). Anything incomplete or contradictory (no head repository, a commit id that is
+  not 40 hex digits, a job whose commit differs from its run's, no labels, unknown status) is
+  refused as ambiguous (BR-E073), not guessed at.
+- **Events.** Only `push`, `workflow_dispatch`, `schedule` and `pull_request` (with the check
+  above). Others (`pull_request_target`, `issue_comment`, `workflow_run`, ...) run code that is
+  not the commit that was verified, or at a time a stranger picks: refused (BR-E074).
 - **Stateless by design.** The queue, the runners and the containers are read from the provider and
   Docker every time; the only memory is "what did I already write to the audit log" and "how often
   did this job fail to start", both in process. A restart `Reconcile`s: it removes every leftover
@@ -204,50 +204,148 @@ Specifically:
   label on the runner restricts nothing; restricting would need the job to *ask* for the label,
   and the job's workflow is attacker-controlled.
 
-## Open: PRs run the merge commit
+## Pull requests: every commit verified
 
-**Status: a known hole, not fixed. It needs a decision from the repository owner.**
+**Status: decided by the repository owner ("each contributor needs to be trusted and signed in"),
+built and tested against the fake GitHub, real git and a real Docker daemon. The GitHub behaviour
+it relies on (C10 to C12b below) is UNVERIFIED and needs BR-0.** This replaces the earlier
+refuse-by-default switch `supervisor.allow_pull_request_merge`, which is **removed** (a config that
+still sets it fails with an error that says so and why).
 
-For a `pull_request` run, GitHub's `head_sha` on the run is the **head of the pull request**, but
-the job executes `GITHUB_SHA`, which is the **synthetic merge commit** of that head into the base
-branch, and the workflow file is taken from that merge as well. The supervisor verifies only the
-head (the run's `head_sha` in the head repository, cross-checked against `pull_requests[]`). The
-merge commit is created by GitHub, signed by nobody this machine trusts, and is never fetched or
-verified, so anything the base branch holds that was never checked here (an unsigned commit on the
-base branch, a base that moved since the pull request was opened) runs inside the container next
-to a properly signed head. "The code that runs was signed by a key I trust" is therefore **false
-for pull requests**. (The isolation of 0006 still bounds what that code can do; admission is what
-does not hold.)
+### The problem it closes
 
-What is in the code now, and why:
+For a `pull_request` run, GitHub's `head_sha` on the run is the head of the pull request, but the
+job executes `GITHUB_SHA`, the **synthetic merge commit** of that head into the base branch, and
+the workflow file is taken from that merge too. The merge commit is created by GitHub and signed
+by nobody this machine trusts, so verifying only the head left base-branch content nobody checked
+here (an unsigned commit on the base branch, or a base that moved) running next to a signed head.
 
-- **Refuse by default.** `pull_request` runs are refused (BR-E074, event not allowed) unless the
-  config says `supervisor.allow_pull_request_merge: true`. There is no command-line flag: the
-  opt-in belongs in the file the owner reviews. I judged this safe to add on my own because it
-  only narrows what runs and fails closed; the opposite default would leave the hole open for
-  everyone who has not read this section. The cost is real: with the key off, every pull request
-  run is a refused job, and a refused job that this runner could take **blocks the runner** until
-  it is cancelled (`--cancel-unadmitted`) or finishes elsewhere, so an owner who uses pull
-  requests with this runner must either opt in knowingly or label those workflows so this runner
-  cannot take them. Opting in restores exactly the earlier behaviour (judge the head, in the head
-  repository).
-- **A known-limit test** documents the opted-in behaviour:
-  `TestKnownLimit_AnOptedInPullRequestVerifiesTheHeadAndNeverTheMergeCommit` asserts that the
-  only commit fetched and verified is the head.
+### The rule
 
-Options (none implemented; pick one, then replace this section with the outcome):
+A `pull_request` run is admitted only if **all** of these hold. Each failure is a refusal
+(BR-E072, with a detail naming the exact commit and why), except data that cannot be read or does
+not exist yet, which is a transient withhold (BR-E076, retried at the next poll, never recorded as
+a refusal and never grounds to cancel a run):
 
-| Option | What it closes | Trade-offs |
-|--------|----------------|------------|
-| **A. Verify the base tip too.** Admit a pull request run only if the head *and* the current tip of the base branch are signed by trusted keys. | Most of it: the merge is of two verified commits. | Needs the base branch and its tip from the run/PR (`pull_requests[].base`, not read today) and a fetch of the base commit. The merge is made later than the check, and the base can move between the check and the job, so a window remains (the base must be re-read at launch and while waiting, like the rest of the watch). A base branch with an unsigned commit on it blocks every pull request until a trusted key signs on top of it. |
-| **B. Admit a PR only if its head descends from a verified base tip.** Verify that the head contains (as an ancestor) a base tip that is itself signed, and that the base has not moved past it. | The merge adds nothing the head did not already contain, so the merge tree equals the head tree. | Needs ancestry queries (`compare` API), which the adapter does not have. Fails for any pull request opened before the base moved on, so contributors must rebase constantly. If the base moves after the check the merge differs again; the window is the same as in A. |
-| **C. Run the PR head instead of the merge.** Have the runner check out the head commit (set `GITHUB_SHA`/`ref` for the job to the verified head, or fetch and run it explicitly). | All of it: what runs is exactly what was verified. | GitHub decides what the runner executes: a just-in-time runner cannot be told to run a different commit, and the workflow file already comes from the merge. It needs support in the runner image's job hook or a different trigger (for example, only `push` to the contributor's branch, which gives up the pull request workflow). Not buildable in the supervisor alone. |
-| **D. Keep refusing** (the current default). | All of it, by not running pull requests. | PR checks need another runner (a hosted one, or a runner that runs only code already on a trusted branch), and refusal still blocks the queue unless cancelled. |
+```
+run ── names exactly one pull request ─────────────────────────────── else refuse
+  1. GET pulls/N        open · base repo is this one · head sha = the run's head sha ·
+                        head repository = the run's · mergeable true · merge_commit_sha present
+                        (mergeable null or the PR unreadable: withhold; false or closed: refuse)
+  2. GET commit M       the merge commit, from the BASE repository:
+                        exactly two parents · parents[0] = base.sha · parents[1] = head sha
+  3. admit base.sha     the base tip: signed by a trusted, unrevoked, unexpired key
+  4. GET pulls/N/commits  every commit of the pull request (>= 250 listed, or fewer listed than the
+                        pull request has: refuse as too many commits to verify) · the head is among
+                        them · each is fetched from the base repository, then the head repository
+                        if the base cannot serve it, and admitted; a commit neither can serve:
+                        withhold
+  5. any unsigned, RSA/ECDSA/GPG-signed, unknown-signer, revoked or expired signer on 3 or 4:
+     refuse the whole job, naming the commit (and the author as GitHub reports it)
+```
 
-My recommendation is D now, then C if the runner image's job hook can pin the commit (it is also
-what R5 above needs), and A only if pull request checks on this machine are a requirement, with
-the residual window stated. This needs the owner's call because every option changes who can get
-CI feedback on this machine.
+Step 2 is what binds "what will run" to "what is verified": the job's `GITHUB_SHA` is the merge
+commit, whose tree is the merge of two verified trees. Refusals outrank transients (a commit that
+failed is the answer whatever else could not be fetched). The commits of one pull request are
+verified by a bounded pool of 4 workers; after the first refusal the commits not yet started are
+skipped (so the detail names the first refusal found, not necessarily every bad commit). A pull
+request is read once per assessment however many jobs its run has.
+
+**Re-judged at every poll, and while a runner waits.** Nothing about a pull request is cached
+across polls except the fetch of commit objects (below). The judgement carries the merge commit
+it was made for, and a runner is only kept while that stays the same: the re-read after the
+runner is registered withholds the launch if the merge commit changed since the job was admitted
+(the base moved, or the head was pushed to), and the watcher stops a runner that has not yet been
+handed a job when a waiting pull request job's merge commit differs from the one it was admitted
+at, or when anything on the new one no longer passes. The next poll judges the new merge commit
+from scratch and runs it if it passes. A runner that already has its job is not killed
+(unchanged rule).
+
+**The audit record.** The `launching` entry of a pull request lists the merge commit (`merge_sha`)
+and every verified commit (`verified_commits`: role `base-tip` or `pr-commit`, the repository it
+was fetched from, sha, signer name and fingerprint), the first 50 and `verified_total` for the
+count.
+
+### What it costs, in API calls
+
+For one pull request with N commits (N <= 100) the first judgement makes **3 + P + N** requests:
+the pull request, the merge commit, the base tip, P pages of the commit list (P = 1 for up to 100
+commits, at most 3), and one fetch per commit; plus one repository read per commit GitHub
+answers 404 for. A commit never changes under its id, so the supervisor's admitter
+(`admit.CommitCache`, 4096 commits) remembers what it fetched, and **only the fetch**: the
+signature is checked against the trust store as it is now at every poll, so a revocation still
+takes effect at the next one. Every later poll (and every 15 s watcher poll while a runner waits)
+therefore costs **2 + P** requests (the pull request, the commit list pages, the merge commit
+which is read fresh) plus the commits it has not seen. Without that cache a 20-commit pull
+request would cost over 5000 requests an hour, GitHub's limit for a token, at the 15 s poll. Only
+bytes that really hash to the commit id are cached, and an unsigned commit is not (it is cheap to
+refuse again).
+
+### What this does NOT give you (read before relying on it)
+
+- **(a) Commits made by GitHub's web UI are signed by GitHub's key, not the owner's.** The merge,
+  squash and rebase buttons, edits made in the web editor, and "Update branch" all create commits
+  that GitHub signs with its own key. They are therefore **refused** unless GitHub's signing key
+  is added to the trust store, and doing that would trust **everything GitHub signs on anyone's
+  behalf**: every account with write access, or with a pull request GitHub merges for them, could
+  get code onto this machine through that one key. That is the trade-off, stated plainly; this
+  record does not name or ship GitHub's key, and it is the owner's decision whether to add it. The
+  practical consequence is that a pull request containing a web-UI commit does not run here, and
+  a base branch whose tip came from the squash button blocks every pull request until a trusted
+  key signs a commit on top of it.
+- **(b) Base history before the tip is not individually verified.** Only the tip of the base
+  branch is checked. It commits to its whole parent chain and tree by hash (SHA-1), which is the
+  git trust model: a signed tip vouches for what is under it, assuming the hash is not broken. An
+  unsigned commit deep in the base history does not stop a pull request.
+- **(c) The merge algorithm is run by GitHub and is not verified here.** The supervisor checks
+  that the merge commit has the right two parents, not that its tree is the correct merge of
+  them (that would need a local `git merge-tree`, which is not built). A GitHub that produced a
+  tree with content from neither parent would not be caught.
+- **(d) Cost:** each pull request costs about 3 + N API calls to admit, see above.
+- **(e) First-time contributors must be added with `bladerunner trust add` BEFORE their pull
+  request can run.** Until then it is refused (BR-E072, naming their key's fingerprint), and a
+  refused job that this runner could take blocks the runner (BR-E075) until it is cancelled
+  (`--cancel-unadmitted`) or finishes elsewhere. This is the owner's requirement, and it is also
+  what makes the supervisor unsuitable for a repository open to unknown contributors.
+- **(f) The run's own `GITHUB_SHA` is not visible to the supervisor.** What is verified is the
+  pull request's **current** merge commit. A run created before the base moved executes the
+  merge commit of its own time, which the API fields read here do not name. If GitHub keeps such
+  a run on its old merge commit, that merge was made against an older base tip that was never
+  verified here. The re-judge on every poll narrows this (a moved base withholds the runner and
+  the new merge is verified) but cannot close it. Whether a re-created merge is what a queued
+  run executes is part of what BR-0 must establish (see C10).
+- **(g) A run from a fork may name no pull request.** The run's `pull_requests[]` is empty for
+  runs from forks, as far as is recalled (C3, unverified). A run that names zero pull requests is
+  refused, because which pull request, and so which merge commit, it is for cannot be told. If
+  that is how GitHub behaves, **fork pull requests will all be refused until it is fixed**
+  (for example by looking the pull request up by head commit, which is not built). The probe
+  (C3, C10, C12b) reports this.
+- **(h) Exactly 250 commits is refused too.** GitHub lists at most 250 commits of a pull request,
+  so a list of 250 may have been cut; it is refused like a longer one.
+- The merge commit's parents are GitHub's word: that object is unsigned, so unlike the others they
+  are not covered by a signature.
+
+### Deviations from the brief the owner gave
+
+- `ListPullRequestCommits` returns the commit ids with GitHub's display author (unverified, for
+  messages only) rather than bare ids, and the pull request carries GitHub's own commit count
+  (`PullRequestInfo.Commits`), which is what makes a short list detectable.
+- Besides "at the cap", a list shorter than the pull request's own count is refused as too many
+  commits to verify.
+- The admitter did not cache before; `admit.CommitCache` is new (the per-assessment memory in the
+  judge was not enough for the cost above) and is wired in `bladerunner supervise` only.
+- A run naming zero pull requests is refused as BR-E072 (not BR-E073): it is a failure of the
+  rule above, not an inconsistency in the description.
+- A merge commit that changes is handled by withholding the launch or stopping the waiting runner
+  and judging again at the next poll, rather than by re-verifying inside the same call.
+- The base tip is `base.sha` of the pull request, not a fresh read of the branch: the merge was
+  computed against it, and step 2 checks that the merge commit says so.
+
+## Unresolved from the earlier version of this record
+
+A per-job "run the head instead of the merge" binding (the old option C) still needs the runner
+image's job hook and is the only layer that would prevent rather than narrow R1 and R5; it is
+not built.
 
 ## Assumptions about GitHub (UNVERIFIED; every one lives in `internal/provider/github`)
 
@@ -258,13 +356,17 @@ correction changes the adapter and, at most, the field comments in `provider.go`
 |---|------------|----------|
 | C1 | `GET /repos/{r}/git/commits/{sha}` returns the signed payload and signature (0006) | Admission cannot fetch commits: every job is refused/withheld (fails closed) |
 | C2 | `generate-jitconfig` makes a single-use runner | Needs another way to bind a runner to a job; the supervisor's launch step fails (BR-E078) |
-| C3 | A run's `head_sha` is the commit it was triggered for; for a pull request the PR **head**, not the merge commit (but see "Open: PRs run the merge commit": the job runs the merge commit); `head_repository.full_name` is where it lives; `pull_requests[]` (possibly empty for forks) agrees | If `head_sha` is the merge commit it is unsigned, so every PR job is refused (BR-E072); if it disagrees with `pull_requests[]` the job is refused as ambiguous (BR-E073). Nothing runs on a wrong guess |
+| C3 | A run's `head_sha` is the commit it was triggered for; for a pull request the PR **head**, not the merge commit (the job runs the merge commit: see "Pull requests: every commit verified"); `head_repository.full_name` is where it lives; `pull_requests[]` agrees, and names exactly one pull request | If `head_sha` is the merge commit it is unsigned, so every PR job is refused (BR-E072); if it disagrees with `pull_requests[]` the job is refused as ambiguous (BR-E073); if `pull_requests[]` is empty (as is recalled for forks) the run is refused (BR-E072). Nothing runs on a wrong guess |
 | C4 | `POST /repos/{r}/actions/runs/{id}/cancel` cancels a queued run (answers 202) | `--cancel-unadmitted` records a failed cancel (BR-E078) and the queue stays blocked: safe, not live |
 | C5 | A job lists `runner_name` once a runner has taken it, and `status` is one of `queued`, `in_progress`, `completed`, `waiting`, `pending`, `requested` | See R2; an unknown status is treated as "might still be taken" |
 | C6 | The run list can be filtered by `status` and both lists paginate with `per_page`/`page` and `total_count` | A list that ends short of `total_count` (GitHub stops these lists at 1000 results; a page can be short) is an error (BR-E076/E022), never a shorter answer |
 | C7 | The `labels` passed to generate-jitconfig are accepted as the runner's labels; GitHub's own implicit labels are added or not | See R4; the call fails (BR-E078) if refused |
 | C8 | A JIT runner exits after one job and removes its own registration | The supervisor lists runners and removes the registration if it is still there, so "already gone" is the normal case and not an error |
 | C9 | The runner image's entrypoint reads the JIT config from standard input and starts the runner (the real runner takes it as `--jitconfig` or an environment variable, so the image needs a small wrapper) | The image is not built here; the test image is a FROM-scratch fixture that only checks the config arrived on stdin |
+| C10 | **UNVERIFIED (needs BR-0).** `GET /repos/{r}/pulls/{n}` returns `state`, `base.{ref,sha,repo.full_name}`, `head.{sha,repo.full_name}` (null for a deleted fork), `commits`, `mergeable` (null until GitHub computes it) and `merge_commit_sha`; for an open, mergeable pull request `merge_commit_sha` is the commit a `pull_request` job runs (`GITHUB_SHA`) | A missing field refuses the job (BR-E072); null `mergeable` withholds it. If `merge_commit_sha` is NOT what the job runs, the admitted merge is not the executed one (see (f)) and this design does not hold |
+| C11 | **UNVERIFIED (needs BR-0).** `GET /repos/{r}/pulls/{n}/commits` lists every commit of the pull request, paginated at 100, up to a cap of 250 | A list that stops short of the pull request's own count, or reaches 250, is refused as too many commits |
+| C12 | **UNVERIFIED (needs BR-0).** The merge commit (`GET /repos/{r}/git/commits/{merge sha}`) lists exactly two `parents`, `parents[0]` the base tip (`base.sha`) and `parents[1]` the pull request head | Any other shape is refused; if GitHub orders them the other way every pull request is refused (fails closed) |
+| C12b | **UNVERIFIED (needs BR-0).** The commits of a pull request from a fork can be read with `GET /repos/{base}/git/commits/{sha}` | The supervisor then asks the fork's repository; a commit neither serves withholds the job |
 
 ## Diagnostic codes
 
@@ -282,14 +384,15 @@ behaviour); E076 to E079 are failures and exit 1.
 - **API cost.** Each cycle lists runs for five statuses twice (two passes) and the jobs of each
   run once (the second pass reads jobs only for runs it had not seen); the watcher does the same
   every 15 s while a runner waits, plus one commit fetch per distinct commit of a waiting job.
-  That is fine for a small queue and would need `?created` filtering or conditional requests for
-  a busy repository. Jobs of a run that was already read are not read again within one scan, so a
+  A pull request adds 3 + P + N requests the first time and 2 + P at every later poll (see "Pull
+  requests: every commit verified"). That is fine for a small queue and would need `?created`
+  filtering or conditional requests for a busy repository. Jobs of a run that was already read are not read again within one scan, so a
   job added to an already-read run between the two passes is only seen at the next scan.
 - **The post-run look at finished runs is bounded** to the newest 30, and costs one page of 30
   (`ListRecentRuns`), not every page; a job that completed and fell off that window before the
   check would be missed (the watcher normally sees it first).
-- **A refusal is judged again every poll** (revocation takes effect at once, nothing is cached
-  across polls); the audit log records it once per reason.
+- **A refusal is judged again every poll** (revocation takes effect at once; across polls only the
+  fetch of a commit object is remembered, never a verdict); the audit log records it once per reason.
 - **Fork pull requests awaiting approval** (`action_required`) have no jobs yet; they are judged
   when they become queued.
 - **Not done:** the legacy hook, workflow guard and `trusted_actors` are untouched (increment 4);
@@ -321,3 +424,57 @@ through a later record; it now fails only the refusal record), a mutant that did
 one equivalent mutant (the watcher stopping its poll after assignment is an optimisation; the
 stronger mutant that keeps killing an assigned runner is caught). After those fixes every mutant
 fails at least one test.
+
+### Pull requests: how they were tested, and the mutation check
+
+Every commit in these tests is real: `internal/testrig.GitWorld` makes them with the real `git
+commit -S` and `ssh-keygen`, one freshly generated ed25519 key per contributor, with the machine's
+git configuration switched off and `gpg.ssh.program=ssh-keygen` and an explicit private key on
+every signature (the sandbox's own key is never used), and makes GitHub's kind of unsigned merge
+commit with `git merge --no-ff`. The fake GitHub serves them with the pull request endpoint, the
+commit list (capped at 250 like GitHub's) and the parents of each commit.
+
+Tests (`internal/supervisor/pullrequest_test.go`, `internal/cli/supervise_e2e_test.go`, the probe,
+client, admit and config packages): the happy path (base tip + 3 commits by 3 contributors:
+admitted, launched, the audit lists every commit, signer and fingerprint, and the merge commit); a
+fork pull request that only the fork serves; an untrusted contributor on a fork pull request
+(refused, nothing registered or started); an unsigned commit in the middle; an unsigned base tip;
+a base tip by a stranger; revoked and expired signers (on a commit and on the base tip); a merge
+commit with swapped, wrong, one, three or no parents; `mergeable` null (withheld, then admitted
+once known), false, and a merge commit id missing; the merge commit, base tip, commit list or
+pull request unreadable (withheld, never refused); 300, exactly 250 and a cut-short list of
+commits (refused); a commit that cannot be fetched (withheld, also for a 404); a refusal that
+outranks an unfetched commit; a run whose head is not the pull request's; closed, foreign-base,
+foreign-head and head-less pull requests; zero or two pull requests on a run; a head not in the
+list; `pull_request_target` (still refused, no pull request calls); a matrix of jobs reading the
+pull request once; the API cost (5 commit fetches and 2 pull request calls for 3 commits); the
+50-commit bound on the audit record; the base moving between judgement and launch (nothing starts,
+the new merge commit is verified at the next poll), moving to an unsigned tip while a runner waits
+(stopped), moving to another signed merge commit while a runner waits (stopped), and moving after
+the runner has its job (not killed); revocation applying at once through the commit cache; and,
+through the real command line with a real Docker container, a pull request of three commits that
+runs and one with an untrusted contributor that is refused (and runs once they are trusted), plus
+the removed config key.
+
+Mutation check by hand, 45 mutants, each removed or inverted in turn, each killed by at least one
+test: exactly-one pull request
+(both directions); base repository; open state; run head versus pull request head; gone head
+repository; head repository mismatch; malformed base sha; mergeable null refused instead of
+withheld; mergeable false; missing merge commit id; unreadable merge commit refused instead of
+withheld; parent count; first parent is the base tip; second parent is the head; base tip never
+admitted; unreadable base tip, commit list and pull request each refused instead of withheld; the
+cap check and the count check of truncation, separately; an unusable commit id in the list; head
+among the listed commits; the fallback to the head repository; an unfetched commit refused
+instead of withheld; a refusal no longer outranking an unfetched commit; a definite not-found
+treated as a refusal; only the head commit verified; the launch re-read ignoring a moved merge
+commit; the watcher ignoring one; a pull request judged as a push; `pull_request_target`
+allowed; the audit bound; the merge commit missing from the launch record; the head's verdict;
+the cache keeping bytes that are not the commit; the removed config key accepted; the client
+reading null `mergeable` as false, reversing the parents, reading one page of commits, and losing
+the no-such-commit marker; the probe passing a skip, ignoring the parent order, the head
+membership and the fork readability. Three mutants did not compile at first (an unused import,
+a duplicate field) and were rewritten as valid ones; all then failed a test. Not mutated: the
+`Author` text, the order of the audit fields, and the log wording.
+
+Not verified by any test here: that GitHub behaves as C10 to C12b say, which is what the probe
+(C10, C11, C12, C12b) checks in BR-0 and SKIPs, never passes, when no pull request exists.

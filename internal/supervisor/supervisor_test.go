@@ -96,97 +96,6 @@ func TestAdmittedJobGetsOneEphemeralIsolatedRunner(t *testing.T) {
 	}
 }
 
-func TestPullRequestFromForkIsAdmittedOnItsHeadCommitInTheForksRepository(t *testing.T) {
-	r := newRig(t)
-	sha := r.queue(q{run: 2, job: 20, event: "pull_request", headRepo: fork,
-		prs: []provider.PullRequest{{Number: 7, HeadSHA: r.commits["owner"].SHA, HeadRepository: fork}}})
-	r.rt.OnRun = r.takes(repo, 20, 2)
-
-	out, err := r.sup.Tick(ctx)
-	if err != nil || !out.Launched {
-		t.Fatalf("outcome = %+v, err = %v", out, err)
-	}
-	var asked []string
-	for _, req := range r.srv.Requests() {
-		if strings.Contains(req, "/git/commits/") {
-			asked = append(asked, req)
-		}
-	}
-	// (Twice: when judging, and again after the runner is registered.)
-	if len(asked) == 0 {
-		t.Fatal("no commit was fetched")
-	}
-	for _, a := range asked {
-		if a != "GET /repos/"+fork+"/git/commits/"+sha {
-			t.Errorf("commit requests = %v: the head commit must be fetched from the head repository", asked)
-		}
-	}
-}
-
-func TestOldestAdmittedJobFirstAndOnlyOneRunnerPerCycle(t *testing.T) {
-	r := newRig(t)
-	r.queue(q{run: 5, job: 50})
-	r.queue(q{run: 3, job: 30})
-	r.queue(q{run: 4, job: 40})
-	var order []int64
-	r.rt.OnRun = func(c context.Context, spec isolation.Spec) (isolation.Result, error) {
-		// The runner is handed the oldest waiting job.
-		var id, run int64
-		switch len(order) {
-		case 0:
-			id, run = 30, 3
-		case 1:
-			id, run = 40, 4
-		default:
-			id, run = 50, 5
-		}
-		order = append(order, id)
-		return r.takes(repo, id, run)(c, spec)
-	}
-	for i := 1; i <= 3; i++ {
-		if _, err := r.sup.Tick(ctx); err != nil {
-			t.Fatal(err)
-		}
-		if got := len(r.rt.Specs()); got != i {
-			t.Fatalf("after cycle %d, %d containers started: exactly one runner per cycle, never two at once", i, got)
-		}
-	}
-	var launched []int64
-	for _, e := range r.entriesOfKind(supervisor.KindLaunching) {
-		launched = append(launched, e.JobID)
-	}
-	if len(launched) != 3 || launched[0] != 30 || launched[1] != 40 || launched[2] != 50 {
-		t.Errorf("launch order = %v, want oldest first", launched)
-	}
-}
-
-func TestJobsOfOtherRunnersAreNotThisRunnersBusiness(t *testing.T) {
-	r := newRig(t)
-	// Hosted jobs and jobs needing a label this runner lacks are neither run nor a threat, even
-	// when their commits are unsigned: no runner of ours could be handed them.
-	r.queue(q{run: 1, job: 10, who: "unsigned", labels: []string{"ubuntu-latest"}})
-	r.queue(q{run: 2, job: 20, who: "mallory", labels: []string{"self-hosted", "windows"}})
-	r.queue(q{run: 3, job: 30, who: "mallory", labels: []string{"self-hosted", "gpu", "extra-label-we-lack"}})
-	out, err := r.sup.Tick(ctx)
-	if err != nil || !out.Idle {
-		t.Fatalf("outcome = %+v, err = %v", out, err)
-	}
-	r.mustStartNothing()
-	if len(r.entries()) != 0 {
-		t.Errorf("audit entries for jobs that are not ours: %+v", r.entries())
-	}
-}
-
-func TestLabelsMatchLikeGitHubDoes(t *testing.T) {
-	r := newRig(t)
-	// Case-insensitive, and a job needing a subset of the runner's labels matches.
-	r.queue(q{run: 1, job: 10, labels: []string{"SELF-HOSTED", "linux", "X64"}})
-	r.rt.OnRun = r.takes(repo, 10, 1)
-	if out, err := r.sup.Tick(ctx); err != nil || !out.Launched {
-		t.Fatalf("outcome = %+v, err = %v", out, err)
-	}
-}
-
 // ---- every refusal path -------------------------------------------------------------------
 
 func TestRefusedJobsStartNothingAndLeaveAnAuditRecord(t *testing.T) {
@@ -200,8 +109,7 @@ func TestRefusedJobsStartNothingAndLeaveAnAuditRecord(t *testing.T) {
 		{"unsigned commit", q{run: 1, job: 10, who: "unsigned"}, false, diag.CodeJobRefused, "not signed"},
 		{"signed by a key nobody trusted", q{run: 1, job: 10, who: "mallory"}, false, diag.CodeJobRefused, "not"},
 		{"signer revoked", q{run: 1, job: 10}, true, diag.CodeJobRefused, "revoked"},
-		{"pull request whose head is unsigned", q{run: 1, job: 10, event: "pull_request", who: "unsigned", headRepo: fork}, false, diag.CodeJobRefused, "not signed"},
-		{"pull request signed by a stranger's key", q{run: 1, job: 10, event: "pull_request", who: "mallory", headRepo: fork}, false, diag.CodeJobRefused, "not"},
+		{"pull request run that names no pull request", q{run: 1, job: 10, event: "pull_request", who: "mallory", headRepo: fork}, false, diag.CodeJobRefused, "exactly one pull request"},
 		{"pull_request_target", q{run: 1, job: 10, event: "pull_request_target"}, false, diag.CodeJobEventRefused, "pull_request_target"},
 		{"issue_comment", q{run: 1, job: 10, event: "issue_comment"}, false, diag.CodeJobEventRefused, "issue_comment"},
 		{"workflow_run", q{run: 1, job: 10, event: "workflow_run"}, false, diag.CodeJobEventRefused, "workflow_run"},

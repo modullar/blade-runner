@@ -89,22 +89,23 @@ func cmdSupervise(ctx context.Context, args []string, d *Deps) error {
 
 	scfg := supervisor.Config{
 		Provider: env.Provider,
-		Admitter: &admit.Admitter{Provider: env.Provider, Verifier: &trust.Verifier{Store: env.Trust}},
+		// The cache keeps each commit fetched once across polls (a pull request judges many commits
+		// at every poll); the trust store is still consulted at every poll, so revocation is immediate.
+		Admitter: &admit.Admitter{Provider: env.Provider, Verifier: &trust.Verifier{Store: env.Trust}, Cache: admit.NewCommitCache(4096)},
 		Runtime:  &supervisor.DockerRuntime{Docker: dock, Owner: cfg.Runner.Name},
 		Audit:    audit,
 		Log:      d.Stdout,
 		Scope:    env.Scope(),
 		// The runner runs in a Linux container whatever the host is, so its labels are Linux and
 		// the container architecture, not the host's.
-		RunnerName:            cfg.Runner.Name,
-		Labels:                cfg.Runner.AllLabels("linux", goarch),
-		Image:                 img,
-		Network:               cfg.Supervisor.Network,
-		MemoryMiB:             cfg.Supervisor.MemoryMiB,
-		Timeout:               time.Duration(cfg.Supervisor.TimeoutMinutes) * time.Minute,
-		CancelUnadmitted:      cfg.Supervisor.CancelUnadmitted || *cancel,
-		AllowPullRequestMerge: cfg.Supervisor.AllowPullRequestMerge,
-		PollInterval:          time.Duration(cfg.Agent.PollIdleSeconds) * time.Second,
+		RunnerName:       cfg.Runner.Name,
+		Labels:           cfg.Runner.AllLabels("linux", goarch),
+		Image:            img,
+		Network:          cfg.Supervisor.Network,
+		MemoryMiB:        cfg.Supervisor.MemoryMiB,
+		Timeout:          time.Duration(cfg.Supervisor.TimeoutMinutes) * time.Minute,
+		CancelUnadmitted: cfg.Supervisor.CancelUnadmitted || *cancel,
+		PollInterval:     time.Duration(cfg.Agent.PollIdleSeconds) * time.Second,
 	}
 	if *poll > 0 {
 		scfg.PollInterval = *poll

@@ -52,10 +52,6 @@ type Supervisor struct {
 	// CancelUnadmitted lets the supervisor ask GitHub to cancel runs it refused, so a refused
 	// job cannot block the queue forever. Off by default: cancelling is visible to others.
 	CancelUnadmitted bool
-	// AllowPullRequestMerge lets the supervisor run pull_request workflow runs. Off by default:
-	// such a run executes GitHub's synthetic merge of the pull request head and the base branch,
-	// and only the head is verified (decision 0007, "Open: PRs run the merge commit").
-	AllowPullRequestMerge bool
 }
 
 // BladeRunner carries the tool's own pin.

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -250,7 +251,10 @@ func (c *Client) Commit(ctx context.Context, repository, sha string) (provider.C
 			"a commit must be named by its full 40-character id", "use the full SHA")
 	}
 	var out struct {
-		SHA          string `json:"sha"`
+		SHA     string `json:"sha"`
+		Parents []struct {
+			SHA string `json:"sha"`
+		} `json:"parents"`
 		Verification struct {
 			Signature *string `json:"signature"`
 			Payload   *string `json:"payload"`
@@ -282,6 +286,9 @@ func (c *Client) Commit(ctx context.Context, repository, sha string) (provider.C
 		return provider.Commit{}, err
 	}
 	cm := provider.Commit{SHA: out.SHA}
+	for _, p := range out.Parents {
+		cm.Parents = append(cm.Parents, p.SHA)
+	}
 	if out.Verification.Signature != nil {
 		cm.Signature = *out.Verification.Signature
 	}
@@ -295,9 +302,93 @@ func (c *Client) Commit(ctx context.Context, repository, sha string) (provider.C
 // see its repository: retrying will not change it, so a caller that treated it as transient would
 // wait on it for ever.
 func notFound(err error, sha, repository, how string) error {
-	return diag.Wrap(err, diag.CodeNotAdmitted, fmt.Sprintf("commit %s cannot be fetched from %s: %s", sha, repository, how),
+	return diag.Wrap(errors.Join(err, provider.ErrNoSuchCommit), diag.CodeNotAdmitted, fmt.Sprintf("commit %s cannot be fetched from %s: %s", sha, repository, how),
 		"the commit was deleted or force-pushed away, or its fork's branch was",
 		"nothing can run from a commit that does not exist; push the change again")
+}
+
+// PullRequest reads a pull request of the base repository. The fields (state, base.sha,
+// head.sha, merge_commit_sha, mergeable, commits) are assumption C10, to confirm in BR-0.
+// mergeable is null while GitHub computes it, and is kept as nil, never read as false.
+func (c *Client) PullRequest(ctx context.Context, repository string, number int) (provider.PullRequestInfo, error) {
+	var out struct {
+		Number         int     `json:"number"`
+		State          string  `json:"state"`
+		MergeCommitSHA *string `json:"merge_commit_sha"`
+		Mergeable      *bool   `json:"mergeable"`
+		Commits        int     `json:"commits"`
+		Base           struct {
+			Ref  string `json:"ref"`
+			SHA  string `json:"sha"`
+			Repo *struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
+		} `json:"base"`
+		Head struct {
+			SHA  string `json:"sha"`
+			Repo *struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
+		} `json:"head"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d", repository, number), true, &out); err != nil {
+		return provider.PullRequestInfo{}, err
+	}
+	info := provider.PullRequestInfo{
+		Number: out.Number, State: out.State, BaseRef: out.Base.Ref, BaseSHA: out.Base.SHA,
+		HeadSHA: out.Head.SHA, Mergeable: out.Mergeable, Commits: out.Commits,
+	}
+	if out.Base.Repo != nil {
+		info.BaseRepository = out.Base.Repo.FullName
+	}
+	if out.Head.Repo != nil {
+		info.HeadRepository = out.Head.Repo.FullName
+	}
+	if out.MergeCommitSHA != nil {
+		info.MergeCommitSHA = *out.MergeCommitSHA
+	}
+	return info, nil
+}
+
+// pullCommitPages is how many pages of ListPullRequestCommits are read: GitHub serves at most
+// provider.PullRequestCommitCap commits, which is three pages of 100, and one more page is read
+// so that a list that does not stop where the cap says is noticed.
+const pullCommitPages = 4
+
+// ListPullRequestCommits returns the commits of a pull request, oldest first, following
+// pagination until a short or empty page. Assumption C11, to confirm in BR-0: the endpoint is
+// GET /repos/{r}/pulls/{n}/commits and stops at provider.PullRequestCommitCap. Whether the list
+// is COMPLETE is for the caller to judge against PullRequestInfo.Commits and the cap.
+func (c *Client) ListPullRequestCommits(ctx context.Context, repository string, number int) ([]provider.PullRequestCommit, error) {
+	var all []provider.PullRequestCommit
+	for page := 1; page <= pullCommitPages; page++ {
+		q := url.Values{"per_page": {strconv.Itoa(listPerPage)}, "page": {strconv.Itoa(page)}}
+		var out []struct {
+			SHA    string `json:"sha"`
+			Author *struct {
+				Login string `json:"login"`
+			} `json:"author"`
+			Commit struct {
+				Author struct {
+					Name string `json:"name"`
+				} `json:"author"`
+			} `json:"commit"`
+		}
+		if _, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d/commits?%s", repository, number, q.Encode()), true, &out); err != nil {
+			return nil, err
+		}
+		for _, x := range out {
+			who := x.Commit.Author.Name
+			if x.Author != nil && x.Author.Login != "" {
+				who = x.Author.Login
+			}
+			all = append(all, provider.PullRequestCommit{SHA: x.SHA, Author: who})
+		}
+		if len(out) < listPerPage {
+			return all, nil
+		}
+	}
+	return all, nil // four full pages: more than the cap, which the caller will see and refuse
 }
 
 // ListCommits returns recent commit ids of the default branch.

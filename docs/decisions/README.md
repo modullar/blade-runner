@@ -27,6 +27,8 @@ fake can only confirm the code agrees with itself.
 
 | C4 to C9 | The supervisor's further assumptions: run cancellation, `runner_name` on jobs, job statuses, JIT labels, pagination, the runner image reading its config from stdin | **Open**; see [0007](0007-supervisor.md), which also states the shared-queue race it narrows but does not close | `provider/github`, `internal/supervisor` |
 
+| C10 to C12b | Pull requests are admitted only when the base tip and **every** commit of the pull request are signed by a trusted key and the merge commit has exactly those two parents: the pull request endpoint's `mergeable` and `merge_commit_sha`, the commit list (cap 250), the order of the merge commit's parents, and fork commits readable through the base repository | **Decided** by the owner, built and tested; GitHub's behaviour **UNVERIFIED (needs BR-0)**. Commits made by GitHub's web UI are signed by GitHub's key and are refused unless it is trusted: see [0007](0007-supervisor.md), "Pull requests: every commit verified" | `internal/supervisor/pullrequest.go`, `internal/probe/pullrequest.go` |
+
 Egress (a job that needs the network reaches only allowlisted hostnames, not the host, LAN, metadata or other containers) is [0008](0008-egress.md): built and tested on Linux with real Docker, **not verified on macOS**; it lives in `internal/egress` and the `allowlist` mode of `internal/isolation`.
 
 The current direction, cryptographic admission plus isolated runners, is

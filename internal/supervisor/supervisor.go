@@ -78,14 +78,9 @@ type Config struct {
 	MemoryMiB        int
 	Timeout          time.Duration
 	CancelUnadmitted bool
-	// AllowPullRequestMerge lets pull_request runs through. Off by default: a pull request run
-	// executes GitHub's synthetic merge of the PR head and the base branch (and the workflow file
-	// from that merge), but only the head is verified here. See decision 0007, "Open: PRs run the
-	// merge commit".
-	AllowPullRequestMerge bool
-	MaxAttempts           int
-	PollInterval          time.Duration
-	WatchInterval         time.Duration
+	MaxAttempts      int
+	PollInterval     time.Duration
+	WatchInterval    time.Duration
 
 	// Sleep waits d or until ctx ends; nil means a real timer. Now is the clock; nil means
 	// time.Now. NewID returns a random hex id for runner names; nil means crypto/rand.

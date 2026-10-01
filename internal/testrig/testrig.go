@@ -276,6 +276,7 @@ type RealCommit struct {
 	SHA       string
 	Payload   string
 	Signature string
+	Parents   []string // the parent ids, first parent first
 }
 
 // RealFixtures loads the real signed-commit fixtures: commits by "owner" and "mallory" (two

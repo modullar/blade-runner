@@ -10,6 +10,7 @@ import (
 	"github.com/modullar/blade-runner/internal/cli"
 	"github.com/modullar/blade-runner/internal/core"
 	"github.com/modullar/blade-runner/internal/provider"
+	"github.com/modullar/blade-runner/internal/provider/github/githubtest"
 	"github.com/modullar/blade-runner/internal/supervisor"
 	"github.com/modullar/blade-runner/internal/testrig"
 )
@@ -23,6 +24,9 @@ type superviseRig struct {
 	image   string
 	commits map[string]testrig.RealCommit
 	pub     map[string]string
+	// prMerge and prCommits are the merge commit and the commits of the pull request queuePR made.
+	prMerge   string
+	prCommits []testrig.RealCommit
 }
 
 func newSuperviseRig(t *testing.T) *superviseRig {
@@ -261,50 +265,132 @@ func TestSuperviseRejectsBadFlags(t *testing.T) {
 	}
 }
 
-// queuePR puts a queued pull_request run from a fork at the fake GitHub, its head commit signed by
-// who. A pull request run executes GitHub's merge commit, which nobody here verified.
-func (s *superviseRig) queuePR(run, job int64, who string) {
+// A pull_request run executes GitHub's merge commit: it is admitted only when the base tip and
+// EVERY commit of the pull request are signed by a trusted key, and the merge is of exactly those
+// two (decision 0007, "Pull requests: every commit verified"). The commits below are made by the
+// real git and ssh-keygen; the fake GitHub serves them and the pull request that joins them.
+
+// queuePR builds a pull request: a signed base tip by "maint" and one signed commit per author,
+// merged the way GitHub does. It queues the run and returns each contributor's public key line.
+func (s *superviseRig) queuePR(run, job int64, authors ...string) map[string]string {
 	s.t.Helper()
-	sha := s.commits[who].SHA
-	s.srv.AddRun("acme/widgets", provider.Run{ID: run, HeadSHA: sha, Event: "pull_request", Status: "queued", HeadRepository: "acme/widgets", Actor: who})
-	s.srv.AddJob("acme/widgets", provider.Job{ID: job, RunID: run, Status: "queued", Labels: []string{"self-hosted", "gpu"}, HeadSHA: sha})
+	w := testrig.NewGitWorld(s.t)
+	w.Commit("maint", "a.txt", "1", "init")
+	tip := w.Commit("maint", "a.txt", "2", "base tip")
+	w.Checkout("pr", true)
+	var commits []testrig.RealCommit
+	for i, who := range authors {
+		commits = append(commits, w.Commit(who, "f.txt", string(rune('a'+i)), "pr commit"))
+	}
+	w.Checkout("main", false)
+	head := commits[len(commits)-1]
+	merge := w.MergeCommit(head.SHA)
+
+	var list []provider.PullRequestCommit
+	for _, c := range append([]testrig.RealCommit{tip, merge}, commits...) {
+		s.srv.AddCommit("acme/widgets", c.SHA, c.Payload, c.Signature)
+	}
+	for i, c := range commits {
+		list = append(list, provider.PullRequestCommit{SHA: c.SHA, Author: authors[i]})
+	}
+	yes := true
+	s.srv.SetPullRequest("acme/widgets", githubtest.PullRequest{
+		Info: provider.PullRequestInfo{Number: 7, State: "open", BaseRepository: "acme/widgets", BaseRef: "main", BaseSHA: tip.SHA,
+			HeadRepository: "acme/widgets", HeadSHA: head.SHA, MergeCommitSHA: merge.SHA, Mergeable: &yes},
+		Commits: list,
+	})
+	s.srv.AddRun("acme/widgets", provider.Run{ID: run, HeadSHA: head.SHA, Event: "pull_request", Status: "queued", HeadRepository: "acme/widgets", Actor: authors[0],
+		PullRequests: []provider.PullRequest{{Number: 7, HeadSHA: head.SHA, HeadRepository: "acme/widgets"}}})
+	s.srv.AddJob("acme/widgets", provider.Job{ID: job, RunID: run, Status: "queued", Labels: []string{"self-hosted", "gpu"}, HeadSHA: head.SHA})
+	keys := map[string]string{}
+	for _, who := range append([]string{"maint"}, authors...) {
+		keys[who] = w.Key(who)
+	}
+	s.prMerge, s.prCommits = merge.SHA, commits
+	return keys
 }
 
-func TestSuperviseWithADefaultConfigRefusesAPullRequestRunSignedByTheOwner(t *testing.T) {
-	// No supervisor.allow_pull_request_merge in the config: the default must be "refuse", all the
-	// way from the config file through the command's wiring to the judgement, because a pull
-	// request run executes a merge commit that was never verified.
+func (s *superviseRig) trustAs(who, line string) {
+	s.t.Helper()
+	s.mustRun("", "trust", "add", "-c", s.cfgPath, "--name", who, "--key", s.writePub(who, line))
+}
+
+func TestSuperviseRunsAPullRequestWhoseEveryCommitIsTrustedInARealContainer(t *testing.T) {
 	s := newSuperviseRig(t)
-	s.trustOwner()
-	s.queuePR(1, 10, "owner")
+	keys := s.queuePR(1, 10, "alice", "bob", "alice")
+	for _, who := range []string{"maint", "alice", "bob"} {
+		s.trustAs(who, keys[who])
+	}
+
+	s.mustRun("", "supervise", "-c", s.cfgPath, "--once")
+	if out := s.out.String(); !strings.Contains(out, "ran run 1 job 10 in an isolated container") {
+		t.Fatalf("output:\n%s", out)
+	}
+	var launching *supervisor.Entry
+	for _, e := range s.audit() {
+		if e.Kind == supervisor.KindLaunching {
+			e := e
+			launching = &e
+		}
+	}
+	if launching == nil || launching.MergeSHA != s.prMerge || launching.VerifiedTotal != 4 || len(launching.Verified) != 4 {
+		t.Fatalf("launching entry = %+v: want the merge commit, the base tip and the 3 commits", launching)
+	}
+	if launching.Verified[0].Role != "base-tip" || launching.Verified[0].Signer != "maint" || launching.Verified[3].Signer != "alice" || launching.Verified[2].Signer != "bob" {
+		t.Errorf("verified = %+v", launching.Verified)
+	}
+	if n, err := supervisor.VerifyAuditLog(s.auditPath()); err != nil || n != 3 {
+		t.Errorf("audit chain: %d, %v", n, err)
+	}
+	s.noContainers("1")
+}
+
+func TestSuperviseRefusesAPullRequestWithACommitByAnUntrustedContributorAndStartsNothing(t *testing.T) {
+	s := newSuperviseRig(t)
+	keys := s.queuePR(1, 10, "alice", "mallory", "alice")
+	for _, who := range []string{"maint", "alice"} { // mallory is not trusted: "each contributor needs to be trusted"
+		s.trustAs(who, keys[who])
+	}
 
 	if code := s.run("", "supervise", "-c", s.cfgPath, "--once"); code != cli.ExitOK {
 		t.Fatalf("a refusal is correct behaviour: exit %d\n%s", code, s.err.String())
 	}
-	if s.requestedJIT() {
-		t.Error("a runner was registered for a pull_request run under the default configuration")
+	out := s.out.String()
+	for _, want := range []string{"refused: run 1 job 10", "BR-E072", s.prCommits[1].SHA, "does not trust", "2 of 3", "nothing started"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output is missing %q:\n%s", want, out)
+		}
 	}
-	var refused []supervisor.Entry
+	if s.requestedJIT() {
+		t.Error("a runner registration was requested for a pull request with an untrusted contributor")
+	}
 	for _, e := range s.audit() {
 		if e.Kind == supervisor.KindLaunching {
 			t.Errorf("launched: %+v", e)
 		}
-		if e.Kind == supervisor.KindRefused {
-			refused = append(refused, e)
-		}
-	}
-	if len(refused) != 1 || refused[0].Code != "BR-E074" || !strings.Contains(refused[0].Message, "merge") {
-		t.Errorf("refused entries = %+v, want one BR-E074 naming the merge commit", refused)
 	}
 	s.noContainers("1")
 
-	// Opting in is what lets it through.
+	// Once the owner trusts the contributor the same pull request runs.
+	s.trustAs("mallory", keys["mallory"])
+	s.mustRun("", "supervise", "-c", s.cfgPath, "--once")
+	if !strings.Contains(s.out.String(), "ran run 1 job 10") {
+		t.Errorf("after trusting the contributor:\n%s", s.out.String())
+	}
+}
+
+func TestSuperviseRejectsTheRemovedPullRequestSwitchWithAnExplanation(t *testing.T) {
+	s := newSuperviseRig(t)
 	cfg, _ := os.ReadFile(s.cfgPath)
 	if err := os.WriteFile(s.cfgPath, append(cfg, []byte("  allow_pull_request_merge: true\n")...), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s.mustRun("", "supervise", "-c", s.cfgPath, "--once")
-	if !strings.Contains(s.out.String(), "ran run 1 job 10") {
-		t.Errorf("after opting in:\n%s", s.out.String())
+	if code := s.run("", "supervise", "-c", s.cfgPath, "--once"); code != cli.ExitFailure {
+		t.Fatalf("exit %d", code)
+	}
+	for _, want := range []string{"BR-E001", "supervisor.allow_pull_request_merge", "was removed", "every commit", "bladerunner trust add"} {
+		if !strings.Contains(s.err.String(), want) {
+			t.Errorf("stderr is missing %q:\n%s", want, s.err.String())
+		}
 	}
 }

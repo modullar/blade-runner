@@ -172,3 +172,88 @@ func TestAnAdmissionFailureIsToldFromARefusalByItsCode(t *testing.T) {
 		t.Errorf("a coded refusal: %v, want BR-E067", err)
 	}
 }
+
+func commitRequests(r *testrig.Rig) int {
+	n := 0
+	for _, req := range r.Srv.Requests() {
+		if strings.Contains(req, "/git/commits/") {
+			n++
+		}
+	}
+	return n
+}
+
+func TestACacheSavesTheFetchButNeverTheTrustDecision(t *testing.T) {
+	r, a, commits, pub := rig(t)
+	trustKey(t, r, "owner", pub["owner"], time.Time{})
+	a.Cache = admit.NewCommitCache(10)
+	s := subject(commits["owner"])
+
+	for i := 0; i < 3; i++ {
+		if v, err := a.Admit(ctx, s); err != nil || v.Signer.Name != "owner" {
+			t.Fatalf("admit %d: %v %+v", i, err, v)
+		}
+	}
+	if n := commitRequests(r); n != 1 {
+		t.Errorf("commit requests = %d, want 1: the same commit is fetched once", n)
+	}
+	if _, err := r.Env.Trust.Revoke("owner"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Admit(ctx, s); err == nil || !strings.Contains(err.Error(), "revoked") {
+		t.Fatalf("a revocation must apply at once even for a cached commit: %v", err)
+	}
+	if n := commitRequests(r); n != 1 {
+		t.Errorf("the refusal after revocation cost %d requests", n)
+	}
+}
+
+func TestACacheNeverKeepsWhatItShouldNotTrust(t *testing.T) {
+	r, a, commits, pub := rig(t)
+	trustKey(t, r, "owner", pub["owner"], time.Time{})
+	a.Cache = admit.NewCommitCache(10)
+	o, m := commits["owner"], commits["mallory"]
+
+	// A server that answers the owner's id with mallory's bytes: refused, and not remembered, so
+	// the honest answer is accepted as soon as the server gives it.
+	r.Srv.AddCommit(testrig.Target, o.SHA, m.Payload, m.Signature)
+	if _, err := a.Admit(ctx, subject(o)); diag.CodeOf(err) != diag.CodeNotAdmitted {
+		t.Fatalf("dishonest answer: %v", err)
+	}
+	if a.Cache.Len() != 0 {
+		t.Error("bytes that are not the commit were cached")
+	}
+	r.Srv.AddCommit(testrig.Target, o.SHA, o.Payload, o.Signature)
+	if _, err := a.Admit(ctx, subject(o)); err != nil {
+		t.Fatalf("after the server corrected itself: %v", err)
+	}
+
+	// An unsigned commit is refused every time and not cached.
+	before := a.Cache.Len()
+	for i := 0; i < 2; i++ {
+		if _, err := a.Admit(ctx, subject(commits["unsigned"])); err == nil {
+			t.Fatal("unsigned commit admitted")
+		}
+	}
+	if a.Cache.Len() != before {
+		t.Error("an unsigned commit was cached")
+	}
+}
+
+func TestTheCacheIsBounded(t *testing.T) {
+	r, a, commits, pub := rig(t)
+	trustKey(t, r, "owner", pub["owner"], time.Time{})
+	trustKey(t, r, "mallory", pub["mallory"], time.Time{})
+	a.Cache = admit.NewCommitCache(1)
+	for _, who := range []string{"owner", "mallory", "owner"} {
+		if _, err := a.Admit(ctx, subject(commits[who])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if a.Cache.Len() != 1 {
+		t.Errorf("cache holds %d, want at most 1", a.Cache.Len())
+	}
+	if n := commitRequests(r); n != 3 {
+		t.Errorf("requests = %d: a size-1 cache evicts the older commit, so each of three alternating commits is fetched", n)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/modullar/blade-runner/internal/admit"
 	"github.com/modullar/blade-runner/internal/diag"
@@ -41,6 +42,10 @@ type judgement struct {
 	Reason  string
 	Subject admit.Subject
 	Verdict trust.Verdict // set when admitted
+	// Merge and Verified are set for an admitted pull request: the merge commit the job runs, and
+	// every commit that was verified for it. A runner is only kept while Merge stays the same.
+	Merge    string
+	Verified []VerifiedCommit
 }
 
 type admission struct {
@@ -51,7 +56,9 @@ type admission struct {
 // judger judges jobs within one assessment, fetching each commit at most once.
 type judger struct {
 	s     *Supervisor
+	mu    sync.Mutex // the commits of a pull request are verified concurrently
 	cache map[string]admission
+	prs   map[string]prVerdict
 }
 
 func what(err error) string {
@@ -101,27 +108,19 @@ func (j *judger) judge(ctx context.Context, o observed) judgement {
 	if !allowedEvents[run.Event] {
 		return refuse(o, diag.CodeJobEventRefused, fmt.Sprintf("the event %q is not one whose commit is the code that runs", run.Event))
 	}
-	if run.Event == "pull_request" && !j.s.cfg.AllowPullRequestMerge {
-		// What runs is GITHUB_SHA, GitHub's synthetic merge of the PR head and the base branch,
-		// with the workflow file taken from that merge. Only the head would be verified, so
-		// base-branch content nobody checked here would run. Refused until the owner opts in.
-		return refuse(o, diag.CodeJobEventRefused, "a pull_request run executes GitHub's merge of the pull request head and the base branch, not the head commit that is verified here; "+
-			"set supervisor.allow_pull_request_merge: true to accept that (decision 0007, \"Open: PRs run the merge commit\")")
+	if run.Event == "pull_request" {
+		// What runs is GitHub's merge of the head into the base: every commit that can reach the
+		// job is verified (pullrequest.go, decision 0007 "Pull requests: every commit verified").
+		return j.judgePullRequest(ctx, o)
 	}
-	// Outside a pull request the commit must live in this repository: a push-like run whose
-	// commit is somewhere else has no reason to exist and nothing vouches for it.
-	if run.Event != "pull_request" && !strings.EqualFold(run.HeadRepository, j.s.cfg.Scope.Repository) {
+	// The commit must live in this repository: a push-like run whose commit is somewhere else
+	// has no reason to exist and nothing vouches for it.
+	if !strings.EqualFold(run.HeadRepository, j.s.cfg.Scope.Repository) {
 		return refuse(o, diag.CodeJobAmbiguous, fmt.Sprintf("a %s run's commit lives in %s, not in %s", run.Event, run.HeadRepository, j.s.cfg.Scope.Repository))
 	}
 
 	subj := admit.Subject{Repository: run.HeadRepository, SHA: run.HeadSHA}
-	key := strings.ToLower(subj.Repository) + "@" + subj.SHA
-	a, ok := j.cache[key]
-	if !ok {
-		v, err := j.s.cfg.Admitter.Admit(ctx, subj)
-		a = admission{verdict: v, err: err}
-		j.cache[key] = a
-	}
+	a := j.admission(ctx, subj)
 	switch {
 	case a.err == nil:
 		return judgement{Obs: o, Kind: admitted, Subject: subj, Verdict: a.verdict}

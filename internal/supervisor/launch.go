@@ -60,7 +60,13 @@ func (s *Supervisor) launch(ctx context.Context, cand judgement, a assessment) (
 	intent := fmt.Sprintf("admitted: run %d job %d (%s, commit %s in %s) is signed by %s; starting runner %s",
 		run.ID, job.ID, run.Event, short(run.HeadSHA), run.HeadRepository, cand.Verdict.Signer.Name, name)
 	s.logf("%s", intent)
-	if err := s.cfg.Audit.Record(entry(KindLaunching, "", intent)); err != nil {
+	launching := entry(KindLaunching, "", intent)
+	if cand.Merge != "" {
+		launching.MergeSHA = cand.Merge
+		launching.Verified, launching.VerifiedTotal = auditedCommits(cand.Verified)
+		launching.Message += fmt.Sprintf("; pull request merge commit %s, %d commit(s) verified, each signed by a trusted key", cand.Merge, len(cand.Verified))
+	}
+	if err := s.cfg.Audit.Record(launching); err != nil {
 		return launchResult{}, err // nothing unrecorded is ever started
 	}
 
@@ -84,8 +90,8 @@ func (s *Supervisor) launch(ctx context.Context, cand judgement, a assessment) (
 		return launchResult{}, s.recordFailure(entry(KindWithheld, diag.CodeOf(err), "runner not started: "+what(err)), err)
 	}
 	still, ok := b.Admitted[job.ID]
-	if !b.clear() || !ok || still.Obs.Job.Status != statusQueued {
-		msg := fmt.Sprintf("runner %s not started: the queue changed while it was being registered (a waiting job is not admitted, or the job is no longer waiting)", name)
+	if !b.clear() || !ok || still.Obs.Job.Status != statusQueued || still.Merge != cand.Merge {
+		msg := fmt.Sprintf("runner %s not started: the queue changed while it was being registered (a waiting job is not admitted, the job is no longer waiting, or its pull request's merge commit moved from %q to %q and must be verified again)", name, cand.Merge, still.Merge)
 		s.logf("withheld [%s]: %s", diag.CodeLaunchWithheld, msg)
 		s.refundAttempt(job.ID) // called off before any container ran: not a failure of this job
 		if err := s.cfg.Audit.Record(entry(KindWithheld, diag.CodeLaunchWithheld, msg)); err != nil {
@@ -94,8 +100,10 @@ func (s *Supervisor) launch(ctx context.Context, cand judgement, a assessment) (
 		return launchResult{Withheld: true}, nil
 	}
 	known := map[int64]bool{}
-	for id := range b.Admitted {
+	merges := map[int64]string{} // the merge commit each admitted pull request job was verified at
+	for id, jd := range b.Admitted {
 		known[id] = true
+		merges[id] = jd.Merge
 	}
 
 	spec := isolation.Spec{
@@ -106,7 +114,7 @@ func (s *Supervisor) launch(ctx context.Context, cand judgement, a assessment) (
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	w := &watchState{done: make(chan struct{})}
-	go s.watch(runCtx, name, known, cancel, w)
+	go s.watch(runCtx, name, known, merges, cancel, w)
 	res, runErr := s.cfg.Runtime.Run(runCtx, spec)
 	cancel()
 	<-w.done
@@ -232,7 +240,7 @@ func (s *Supervisor) deregister(name string, id int64) string {
 // takes exactly one job, so the exposure ends once it has one; until then, a new job it could
 // take that was not admitted when the runner was started means the runner is stopped, because it
 // might be handed that one. A job handed to the runner that is not an admitted one is an alarm.
-func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]bool, stop context.CancelFunc, w *watchState) {
+func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]bool, merges map[int64]string, stop context.CancelFunc, w *watchState) {
 	defer close(w.done)
 	t := time.NewTicker(s.cfg.WatchInterval)
 	defer t.Stop()
@@ -290,6 +298,15 @@ func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]boo
 				return
 			}
 			switch jd := j.judge(ctx, o); jd.Kind {
+			case admitted:
+				if jd.Merge != merges[o.Job.ID] {
+					// The pull request was merged again (the base moved or the head was pushed to):
+					// the merge commit this runner was admitted for is not the one the job runs.
+					w.stopped, w.code = true, diag.CodeLaunchWithheld
+					w.reason = fmt.Sprintf("the merge commit of job %d of run %d moved from %q to %q since it was admitted: the new one must be verified before a runner may take it", o.Job.ID, o.Run.ID, merges[o.Job.ID], jd.Merge)
+					stop()
+					return
+				}
 			case refused:
 				w.stopped, w.code = true, diag.CodeLaunchWithheld
 				w.reason = fmt.Sprintf("job %d of run %d is no longer admitted: %s", o.Job.ID, o.Run.ID, jd.Reason)

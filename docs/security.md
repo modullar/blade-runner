@@ -8,6 +8,17 @@
 > not built. Until they land, the layers below are what is in force, and they rely on GitHub's
 > statement of who the actor is rather than on a signature.
 
+> **Pull requests under the supervisor.** `bladerunner supervise` runs a `pull_request` job only
+> when the tip of the base branch and **every commit of the pull request** are signed by a key in
+> your trust store, and the merge commit GitHub makes has exactly those two parents; each
+> contributor must be added with `bladerunner trust add` before their pull request can run. Any
+> unsigned or untrusted commit refuses the whole job. Commits made with GitHub's web buttons are
+> signed by GitHub's own key and are refused unless you trust that key, which would trust everything
+> GitHub signs for anyone. History under the signed base tip is covered only by the hash chain
+> (the git trust model), the merge algorithm is GitHub's and not re-run here, and the GitHub
+> behaviour this leans on is unverified (C10 to C12b). See
+> [decision 0007](decisions/0007-supervisor.md), "Pull requests: every commit verified".
+
 A self-hosted runner executes whatever job GitHub sends it, as you, on your machine. On a
 public repository anyone can open a pull request from a fork, and other collaborators can push
 branches. Blade Runner's rule is: **code from anyone but the people you name never runs on

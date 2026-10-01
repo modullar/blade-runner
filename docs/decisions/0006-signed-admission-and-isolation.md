@@ -45,9 +45,12 @@ GitHub ── queued job ──▶ SUPERVISOR (host) ──admit?──▶ trust
 
 ### Pull requests
 
-For a pull request the commit to verify is the pull request's **head** commit, never GitHub's
-synthetic merge commit (nobody signed that). A contributor from a fork is admitted exactly when
-they signed the head commit with a key the owner trusts; the fork itself confers nothing.
+For a pull request the job runs GitHub's synthetic merge commit, which nobody signed. The first
+cut verified only the pull request's head; that left the base branch's content unchecked, and
+[0007](0007-supervisor.md) ("Pull requests: every commit verified") replaces it: the base tip and
+**every** commit of the pull request must be signed by a key the owner trusts, and the merge
+commit must have exactly those two parents. A contributor from a fork is admitted exactly when
+all of their commits are signed with a key the owner trusts; the fork itself confers nothing.
 
 ## What a signature does and does not prove
 

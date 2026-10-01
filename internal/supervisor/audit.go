@@ -31,6 +31,15 @@ const (
 	KindRecovered = "recovered" // the log was reopened after a torn last line; see AuditLog
 )
 
+// VerifiedCommit is one commit that was admitted for a job, and who vouched for it.
+type VerifiedCommit struct {
+	Role        string `json:"role"`       // "base-tip" or "pr-commit"
+	Repository  string `json:"repository"` // where it was fetched from
+	SHA         string `json:"sha"`
+	Signer      string `json:"signer"`
+	Fingerprint string `json:"fingerprint"`
+}
+
 // Entry is one line of the audit log. It never holds a secret: in particular never the
 // just-in-time runner config, which starts a runner.
 type Entry struct {
@@ -50,6 +59,13 @@ type Entry struct {
 	Actor       string `json:"actor,omitempty"`
 	Signer      string `json:"signer,omitempty"` // who vouched, when admitted
 	Fingerprint string `json:"fingerprint,omitempty"`
+
+	// MergeSHA, Verified and VerifiedTotal are on a launch of a pull request: the merge commit the
+	// job runs, and the commits verified for it (the first maxAuditedCommits; VerifiedTotal says
+	// how many there were).
+	MergeSHA      string           `json:"merge_sha,omitempty"`
+	Verified      []VerifiedCommit `json:"verified_commits,omitempty"`
+	VerifiedTotal int              `json:"verified_total,omitempty"`
 
 	Runner    string  `json:"runner,omitempty"` // the just-in-time runner's name (also the container's)
 	ExitCode  *int    `json:"exit_code,omitempty"`

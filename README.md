@@ -19,7 +19,10 @@ is allowed to run code here when the owner adds their public key (`bladerunner t
 host then checks, itself, that a commit is signed by a trusted key, with no reliance on GitHub's
 word. Verification is built and tested (`bladerunner trust verify`); running jobs only when it
 passes, and running them in isolated containers, are not built yet. See
-[decision 0006](docs/decisions/0006-signed-admission-and-isolation.md).
+[decision 0006](docs/decisions/0006-signed-admission-and-isolation.md). For a pull request,
+`bladerunner supervise` requires **every** commit (and the base branch tip) to be signed by a
+trusted key, so each contributor must be trusted before their pull request can run
+([decision 0007](docs/decisions/0007-supervisor.md), "Pull requests: every commit verified").
 
 **Only your code runs on your machine (what is in force today).** `apply` installs a *job hook* that the runner runs
 before every job and that refuses anyone not in `runner.trusted_actors` (default: the

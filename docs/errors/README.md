@@ -235,13 +235,25 @@ audit log, `~/.bladerunner/audit/supervisor-<runner name>.jsonl`, and nothing wa
 ### BR-E072
 
 **A queued job was refused: its commit is not admitted.** The supervisor verified the job's head
-commit (for a pull request, the pull request's head commit and the repository it lives in, never
-GitHub's merge commit) against this machine's trust store and the commit failed (BR-E067 explains
-which check), or GitHub says the commit does not exist (HTTP 404/422: deleted, force-pushed away,
-or a deleted fork), which no retry will change. No runner and no container was started for it. To
-allow it, trust the signer
-(`bladerunner trust add`) or have them sign the commit; to get rid of a job nobody should run,
-cancel its run, or start the supervisor with `--cancel-unadmitted`.
+commit against this machine's trust store and the commit failed (BR-E067 explains which check), or
+GitHub says the commit does not exist (HTTP 404/422: deleted, force-pushed away, or a deleted
+fork), which no retry will change. No runner and no container was started for it. To allow it,
+trust the signer (`bladerunner trust add`) or have them sign the commit; to get rid of a job
+nobody should run, cancel its run, or start the supervisor with `--cancel-unadmitted`.
+
+**For a `pull_request` run the same code means that something in the pull request failed the
+rule "every commit verified"** ([decision 0007](../decisions/0007-supervisor.md), "Pull requests:
+every commit verified"). The message names the exact commit and why: a commit (or the tip of the
+base branch) that is unsigned, signed by a key this machine does not trust (the message gives its
+fingerprint), or by a revoked or expired one; a merge commit that does not have exactly the base
+tip and the head as its two parents; a pull request that is closed, cannot be merged, or whose
+head differs from the run's; a run that names no pull request or more than one; or **too many
+commits to verify** (GitHub lists at most 250 of them, and a shorter list is never verified as if
+it were whole). A new contributor must be added with `bladerunner trust add` before their pull
+request can run. Commits made with GitHub's web buttons are signed by GitHub's key and are
+refused unless the owner trusts that key (see the trade-off in the decision). Data that could not
+be read (GitHub unreachable, `mergeable` not computed yet, a commit neither repository serves) is
+not this code: the job is withheld (BR-E076) and tried again at the next poll.
 
 ### BR-E073
 
@@ -254,10 +266,10 @@ for every job, GitHub's data differs from what Blade Runner assumes (C3): see de
 ### BR-E074
 
 **A queued job was refused because of the event that caused it.** Only `push`,
-`workflow_dispatch` and `schedule` are accepted, plus `pull_request` when the config says
-`supervisor.allow_pull_request_merge: true` (default false: a pull request run executes GitHub's
-merge of the head and the base branch, and only the head is verified; see the "Open: PRs run the
-merge commit" section of [decision 0007](../decisions/0007-supervisor.md)). For the other events
+`workflow_dispatch`, `schedule` and `pull_request` are accepted (a `pull_request` run additionally
+has to pass the "every commit verified" rule: see BR-E072 and
+[decision 0007](../decisions/0007-supervisor.md)). The config key
+`supervisor.allow_pull_request_merge` no longer exists. For the other events
 (for example `pull_request_target`, `issue_comment`, `workflow_run`) the code that runs is not the
 commit that was verified, or a stranger chose the moment. Change the workflow's trigger.
 

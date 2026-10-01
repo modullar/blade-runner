@@ -44,10 +44,12 @@ type Server struct {
 	// ForkApproval is the policy served per repository (default: the strictest).
 	// ForkApprovalUnsupported makes the endpoint answer 404, as an API that lacks it would.
 	ForkApproval map[string]string
-	commits      map[string]commitData // "owner/repo@sha"
-	commitOrder  map[string][]string   // repo -> shas, oldest first
-	commitStatus map[string]int        // sha -> forced HTTP status
-	repoStatus   map[string]int        // repo -> forced HTTP status of GET /repos/{repo}
+	commits      map[string]commitData   // "owner/repo@sha"
+	commitOrder  map[string][]string     // repo -> shas, oldest first
+	commitStatus map[string]int          // sha -> forced HTTP status
+	repoStatus   map[string]int          // repo -> forced HTTP status of GET /repos/{repo}
+	parents      map[string][]string     // "owner/repo@sha" -> parents served for it (default: the "parent" lines of its payload)
+	pulls        map[string]*PullRequest // "owner/repo#number"
 	runs         map[string][]provider.Run
 	jobs         map[string][]provider.Job
 	// JITUnsupported makes generate-jitconfig answer 404, as an API without it would.
@@ -112,6 +114,117 @@ func New() *Server {
 }
 
 type commitData struct{ payload, signature string }
+
+// PullRequest is a pull request the fake serves at /repos/{repo}/pulls/{number}. Info.Commits is
+// ignored: the server reports len(Commits), as GitHub counts them, while the commits LIST stops at
+// provider.PullRequestCommitCap like GitHub's does.
+type PullRequest struct {
+	Info    provider.PullRequestInfo
+	Commits []provider.PullRequestCommit
+	// ListLimit makes the commits listing stop after this many commits (0: only GitHub's own cap
+	// of provider.PullRequestCommitCap), as a listing cut short for another reason would.
+	ListLimit int
+}
+
+// SetPullRequest serves (or replaces) a pull request of repo.
+func (s *Server) SetPullRequest(repo string, pr PullRequest) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pulls == nil {
+		s.pulls = map[string]*PullRequest{}
+	}
+	cp := pr
+	cp.Commits = append([]provider.PullRequestCommit(nil), pr.Commits...)
+	s.pulls[fmt.Sprintf("%s#%d", repo, pr.Info.Number)] = &cp
+}
+
+// UpdatePullRequest edits a served pull request in place, as GitHub does when the base branch
+// moves, a merge is recomputed or the pull request is pushed to.
+func (s *Server) UpdatePullRequest(repo string, number int, edit func(*PullRequest)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if pr := s.pulls[fmt.Sprintf("%s#%d", repo, number)]; pr != nil {
+		edit(pr)
+	}
+}
+
+// SetCommitParents overrides the parents the commit endpoint reports for sha in repo (by default
+// they are the "parent" lines of the served payload): a provider that disagrees with the commit.
+func (s *Server) SetCommitParents(repo, sha string, parents []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.parents == nil {
+		s.parents = map[string][]string{}
+	}
+	s.parents[repo+"@"+sha] = parents
+}
+
+// payloadParents reads the parent ids out of a commit object.
+func payloadParents(payload string) []string {
+	var out []string
+	for _, l := range strings.Split(payload, "\n") {
+		if l == "" {
+			break // the header ends at the first blank line
+		}
+		if p, ok := strings.CutPrefix(l, "parent "); ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (s *Server) handlePulls(w http.ResponseWriter, r *http.Request, repo string, rest []string) {
+	// rest is [number] or [number, "commits"].
+	n, err := strconv.Atoi(rest[0])
+	s.mu.Lock()
+	var pr PullRequest
+	have := false
+	if err == nil {
+		if p := s.pulls[fmt.Sprintf("%s#%d", repo, n)]; p != nil {
+			pr, have = *p, true
+			pr.Commits = append([]provider.PullRequestCommit(nil), p.Commits...)
+		}
+	}
+	s.mu.Unlock()
+	if !have {
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+		return
+	}
+	if len(rest) == 2 && rest[1] == "commits" {
+		all := pr.Commits
+		if len(all) > provider.PullRequestCommitCap {
+			all = all[:provider.PullRequestCommitCap] // GitHub's own cap on this listing
+		}
+		if pr.ListLimit > 0 && len(all) > pr.ListLimit {
+			all = all[:pr.ListLimit]
+		}
+		lo, hi := pageOf(r, len(all))
+		out := []map[string]any{}
+		for _, c := range all[lo:hi] {
+			out = append(out, map[string]any{"sha": c.SHA, "author": map[string]string{"login": c.Author}, "commit": map[string]any{"author": map[string]string{"name": c.Author}}})
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	if len(rest) != 1 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+		return
+	}
+	i := pr.Info
+	var merge any
+	if i.MergeCommitSHA != "" {
+		merge = i.MergeCommitSHA
+	}
+	var head any
+	if i.HeadRepository != "" {
+		head = map[string]string{"full_name": i.HeadRepository}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"number": i.Number, "state": i.State, "merge_commit_sha": merge, "mergeable": i.Mergeable, "commits": len(pr.Commits),
+		"base": map[string]any{"ref": i.BaseRef, "sha": i.BaseSHA, "repo": map[string]string{"full_name": i.BaseRepository}},
+		"head": map[string]any{"sha": i.HeadSHA, "repo": head},
+	})
+}
 
 // AddCommit serves a commit (its signed payload and signature) for repo at sha. Pass the
 // signature "" for an unsigned commit. The server returns whatever it is given: it does not
@@ -379,13 +492,23 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, repo, sha 
 		writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
 		return
 	}
+	s.mu.Lock()
+	parents, overridden := s.parents[repo+"@"+sha]
+	s.mu.Unlock()
+	if !overridden {
+		parents = payloadParents(cd.payload)
+	}
+	plist := []map[string]string{}
+	for _, p := range parents {
+		plist = append(plist, map[string]string{"sha": p})
+	}
 	v := map[string]any{"verified": false, "reason": "unknown_key", "signature": nil, "payload": nil}
 	if cd.signature != "" {
 		v["signature"], v["payload"] = cd.signature, cd.payload
 	} else {
 		v["reason"] = "unsigned"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"sha": sha, "verification": v})
+	writeJSON(w, http.StatusOK, map[string]any{"sha": sha, "parents": plist, "verification": v})
 }
 
 // Requests returns "METHOD /path" for every request so far.
@@ -483,6 +606,13 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if parts := strings.Split(strings.Trim(p, "/"), "/"); len(parts) == 6 && parts[0] == "repos" && parts[3] == "git" && parts[4] == "commits" && r.Method == http.MethodGet {
 		s.handleCommit(w, r, parts[1]+"/"+parts[2], parts[5])
+		return
+	}
+	if parts := strings.Split(strings.Trim(p, "/"), "/"); (len(parts) == 5 || len(parts) == 6) && parts[0] == "repos" && parts[3] == "pulls" && r.Method == http.MethodGet {
+		if !s.authorized(w, r) {
+			return
+		}
+		s.handlePulls(w, r, parts[1]+"/"+parts[2], parts[4:])
 		return
 	}
 	if parts := strings.Split(strings.Trim(p, "/"), "/"); len(parts) == 3 && parts[0] == "repos" && r.Method == http.MethodGet {
