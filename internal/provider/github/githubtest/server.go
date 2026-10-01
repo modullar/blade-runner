@@ -125,11 +125,15 @@ func (s *Server) AddCommit(repo, sha, payload, signature string) {
 	s.commitOrder[repo] = append(s.commitOrder[repo], sha)
 }
 
-// SetCommitStatus makes the commit endpoint answer with this HTTP status for sha, whatever else
+// SetCommitStatus (status 0 clears it) makes the commit endpoint answer with this HTTP status for sha, whatever else
 // it knows: 404 and 422 are what GitHub says for a commit that does not exist (a deleted fork).
 func (s *Server) SetCommitStatus(sha string, status int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if status == 0 {
+		delete(s.commitStatus, sha)
+		return
+	}
 	if s.commitStatus == nil {
 		s.commitStatus = map[string]int{}
 	}

@@ -254,7 +254,6 @@ func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]boo
 			}
 			continue
 		}
-		failures = 0
 		assigned := false
 		for _, o := range obs {
 			if o.Job.RunnerName != name {
@@ -271,13 +270,44 @@ func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]boo
 		if assigned {
 			return // single-use: it has its job, and it is an admitted one
 		}
+		// Admission is not a one-time fact: a key can be revoked, or a commit become unreadable,
+		// while the runner waits. So every waiting job it could take is judged again each poll
+		// (a commit is fetched once per poll however many jobs share it), not only the new ones.
+		j := &judger{s: s, cache: map[string]admission{}}
+		cannotJudge := ""
 		for _, o := range obs {
-			if stillWaiting(o.Job) && couldTake(s.labels, o.Job) && !known[o.Job.ID] {
+			if !stillWaiting(o.Job) || !couldTake(s.labels, o.Job) {
+				continue
+			}
+			if !known[o.Job.ID] {
 				w.stopped, w.code = true, diag.CodeLaunchWithheld
 				w.reason = fmt.Sprintf("job %d of run %d appeared that this runner could take and is not known to be admitted", o.Job.ID, o.Run.ID)
 				stop()
 				return
 			}
+			switch jd := j.judge(ctx, o); jd.Kind {
+			case refused:
+				w.stopped, w.code = true, diag.CodeLaunchWithheld
+				w.reason = fmt.Sprintf("job %d of run %d is no longer admitted: %s", o.Job.ID, o.Run.ID, jd.Reason)
+				stop()
+				return
+			case transient:
+				if ctx.Err() != nil {
+					return
+				}
+				cannotJudge = fmt.Sprintf("job %d of run %d could not be judged again: %s", o.Job.ID, o.Run.ID, jd.Reason)
+			}
 		}
+		if cannotJudge != "" {
+			failures++
+			if failures >= watchErrorLimit {
+				w.stopped, w.code = true, diag.CodeQueueUnreadable
+				w.reason = fmt.Sprintf("a waiting job could not be judged %d times in a row (%s), so whether the runner may take it is unknown", failures, cannotJudge)
+				stop()
+				return
+			}
+			continue
+		}
+		failures = 0
 	}
 }

@@ -295,6 +295,7 @@ func (s *Supervisor) Tick(ctx context.Context) (Outcome, error) {
 	if err != nil {
 		return Outcome{Withheld: true}, s.noteError(err)
 	}
+	s.prune(a)
 	if len(a.Waiting) == 0 {
 		return Outcome{Idle: true}, nil
 	}
@@ -410,6 +411,30 @@ func (s *Supervisor) noteError(err error) error {
 	return err
 }
 
+// maxNoted bounds each of the in-memory "already recorded" sets: a long-lived supervisor must not
+// grow without limit. When a set is full it is emptied, which can repeat a record once and can
+// never lose one.
+const maxNoted = 4096
+
+// prune forgets bookkeeping about jobs that are no longer waiting: a job that has left the queue
+// has no use for its remembered refusal or failed attempts (and an id that comes back is news).
+func (s *Supervisor) prune(a assessment) {
+	waiting := make(map[int64]bool, len(a.Waiting))
+	for _, jd := range a.Waiting {
+		waiting[jd.Obs.Job.ID] = true
+	}
+	for id := range s.noted {
+		if !waiting[id] {
+			delete(s.noted, id)
+		}
+	}
+	for id := range s.attempts {
+		if !waiting[id] {
+			delete(s.attempts, id)
+		}
+	}
+}
+
 // recordRefusal writes a refusal once per distinct reason (a job that stays queued is refused on
 // every poll, but the audit log is not told every fifteen seconds).
 func (s *Supervisor) recordRefusal(jd judgement) error {
@@ -426,6 +451,9 @@ func (s *Supervisor) recordRefusal(jd judgement) error {
 	}); err != nil {
 		return err
 	}
+	if len(s.noted) >= maxNoted {
+		s.noted = map[int64]string{}
+	}
 	s.noted[jd.Obs.Job.ID] = key
 	return nil
 }
@@ -437,6 +465,9 @@ func (s *Supervisor) recordOnce(key string, e Entry) error {
 	}
 	if err := s.cfg.Audit.Record(e); err != nil {
 		return err
+	}
+	if len(s.runNoted) >= maxNoted {
+		s.runNoted = map[string]bool{} // bounded: forgetting costs one repeated record, never a lost one
 	}
 	s.runNoted[key] = true
 	return nil
