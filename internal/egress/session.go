@@ -40,7 +40,7 @@ const (
 
 	// OutNetwork is the one shared, ordinary bridge network the proxies reach the outside
 	// through. Jobs are never attached to it.
-	OutNetwork = "br-egress-out"
+	OutNetwork = isolation.EgressOutNetwork
 
 	// ProxyPort is the port every proxy listens on, on its internal address only.
 	ProxyPort = 3128
@@ -112,6 +112,10 @@ type Session struct {
 	// collision with another session's proxy or network must never remove that session's.
 	netRef, proxyRef string
 	token            string // this Open call's labelOpen value
+
+	// What Open built the proxy from: the audit requires the running proxy to match exactly.
+	proxyImage                string
+	proxyEntrypoint, proxyCmd []string
 
 	claimed atomic.Bool // Apply has handed this session to a job
 }
@@ -189,20 +193,20 @@ func (m *Manager) Open(ctx context.Context, id string) (s *Session, err error) {
 		return s, err
 	}
 
-	args := []string{"create", "--name", s.ProxyContainer, "--network", s.Network,
+	cmd := []string{"-listen-cidr", subnet.String(), "-port", strconv.Itoa(ProxyPort), "-ports", strings.Join(portArgs, ",")}
+	for _, e := range m.Allow.Entries() {
+		cmd = append(cmd, "-allow", e)
+	}
+	cmd = append(cmd, m.ProxyExtraArgs...)
+	s.proxyImage, s.proxyEntrypoint, s.proxyCmd = m.ProxyImage, []string{m.entrypoint()}, cmd // what the audit holds the running proxy to
+	args := append([]string{"create", "--name", s.ProxyContainer, "--network", s.Network,
 		"--entrypoint", m.entrypoint(),
 		"--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "65534:65534",
 		"--pids-limit", "128", "--memory", "128m", "--memory-swap", "128m", "--cpus", "1",
 		"--restart", "no", "--log-driver", "local", "--log-opt", "max-size=1m", "--log-opt", "max-file=2",
 		"--label", LabelKey + "=" + labelSession, "--label", labelID + "=" + id,
 		"--label", LabelOwner + "=" + m.owner(), "--label", labelOpen + "=" + s.token,
-		m.ProxyImage,
-		"-listen-cidr", subnet.String(), "-port", strconv.Itoa(ProxyPort), "-ports", strings.Join(portArgs, ","),
-	}
-	for _, e := range m.Allow.Entries() {
-		args = append(args, "-allow", e)
-	}
-	args = append(args, m.ProxyExtraArgs...)
+		m.ProxyImage}, cmd...)
 	proxyRes, err := m.docker(ctx, args...)
 	if err != nil {
 		return s, setupErr(err, "cannot create the egress proxy container", "the proxy image is missing, the name is taken, or Docker refused", "check `docker images` and `docker ps -a`")
@@ -357,12 +361,16 @@ func (s *Session) Apply(spec *isolation.Spec) error {
 	if !s.claimed.CompareAndSwap(false, true) {
 		spec.Network = isolation.NetworkAllowlist
 		spec.EgressNetwork, spec.EgressProxy, spec.EgressProxyContainer = "", "", ""
+		spec.EgressProxyImage, spec.EgressProxyEntrypoint, spec.EgressProxyCmd = "", nil, nil
 		return ErrSessionInUse
 	}
 	spec.Network = isolation.NetworkAllowlist
 	spec.EgressNetwork = s.Network
 	spec.EgressProxy = s.ProxyAddr
 	spec.EgressProxyContainer = s.ProxyContainer
+	spec.EgressProxyImage = s.proxyImage
+	spec.EgressProxyEntrypoint = append([]string(nil), s.proxyEntrypoint...)
+	spec.EgressProxyCmd = append([]string(nil), s.proxyCmd...)
 	return nil
 }
 

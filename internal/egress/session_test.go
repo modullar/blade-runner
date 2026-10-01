@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/modullar/blade-runner/internal/execx"
+	"github.com/modullar/blade-runner/internal/isolation"
 )
 
 // ---- no daemon: what Close, Decisions and Sweep ask Docker to do -------------------------
@@ -164,9 +165,9 @@ func TestRealDocker_SweepRemovesOnlyItsOwnersSessions(t *testing.T) {
 	mine.Owner = "owner-a"
 	theirs, _ := fixtureManager(t, img, h, "allowed.test")
 	theirs.Owner = "owner-b"
-	cleanSlate(t)
-	_ = mustSweep(t, &Manager{Exec: execx.OS{}, Owner: "owner-a"})
+	_ = mustSweep(t, &Manager{Exec: execx.OS{}, Owner: "owner-a"}) // a crashed earlier run's
 	_ = mustSweep(t, &Manager{Exec: execx.OS{}, Owner: "owner-b"})
+	cleanSlate(t)
 
 	a, err := mine.Open(ctx, uniq("sa"))
 	if err != nil {
@@ -296,5 +297,21 @@ func TestRealDocker_ASigtermedProxyWritesItsPendingSummaryBeforeItExits(t *testi
 	}
 	if final != 5 {
 		t.Errorf("the last summary in the proxy's log counts %d refusals, want 5 (6 refused, 1 itemised):\n%s", final, logs)
+	}
+}
+
+func TestApplyCarriesWhatOpenBuiltTheProxyFromIntoTheSpec(t *testing.T) {
+	s := &Session{Network: "n", ProxyContainer: "p", ProxyAddr: "172.19.0.1:3128",
+		proxyImage: "sha256:" + strings.Repeat("a", 64), proxyEntrypoint: []string{"/egress-proxy"}, proxyCmd: []string{"-port", "3128"}}
+	var spec isolation.Spec
+	if err := s.Apply(&spec); err != nil {
+		t.Fatal(err)
+	}
+	if spec.EgressProxyImage != s.proxyImage || strings.Join(spec.EgressProxyEntrypoint, " ") != "/egress-proxy" || strings.Join(spec.EgressProxyCmd, " ") != "-port 3128" {
+		t.Errorf("spec = %+v", spec)
+	}
+	var again isolation.Spec
+	if err := s.Apply(&again); err == nil || again.EgressProxyImage != "" || len(again.EgressProxyCmd) != 0 {
+		t.Errorf("a second Apply must fail and leave no proxy identity behind: %v %+v", err, again)
 	}
 }
