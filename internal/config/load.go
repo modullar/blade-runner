@@ -223,6 +223,15 @@ func decode(root *yamlsubset.Node) (*Config, []Problem) {
 				"network":         func(n *yamlsubset.Node, p string) { c.Supervisor.Network = d.str(n, p) },
 				"memory_mib":      func(n *yamlsubset.Node, p string) { c.Supervisor.MemoryMiB = d.integer(n, p) },
 				"timeout_minutes": func(n *yamlsubset.Node, p string) { c.Supervisor.TimeoutMinutes = d.integer(n, p) },
+				"allow_pull_request_merge": func(n *yamlsubset.Node, p string) {
+					switch v := d.str(n, p); v {
+					case "", "false":
+					case "true":
+						c.Supervisor.AllowPullRequestMerge = true
+					default:
+						d.add(p, "must be true or false (got %q)", v)
+					}
+				},
 				"cancel_unadmitted": func(n *yamlsubset.Node, p string) {
 					switch v := d.str(n, p); v {
 					case "", "false":

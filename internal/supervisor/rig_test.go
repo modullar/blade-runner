@@ -144,6 +144,9 @@ func newRig(t *testing.T, opts ...option) *rig {
 		RunnerName: "mini",
 		Labels:     []string{"self-hosted", "Linux", "X64", "gpu"},
 		Image:      testImage,
+		// Most tests are about the shared-queue and fork rules, which need pull requests to be
+		// judged on their head; the default (refused) is tested in pullrequest_test.go.
+		AllowPullRequestMerge: true,
 		// Fast timings: the watcher polls often, and nothing really sleeps.
 		WatchInterval: 10 * time.Millisecond,
 		Sleep:         func(context.Context, time.Duration) {},

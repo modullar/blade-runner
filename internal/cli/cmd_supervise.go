@@ -96,14 +96,15 @@ func cmdSupervise(ctx context.Context, args []string, d *Deps) error {
 		Scope:    env.Scope(),
 		// The runner runs in a Linux container whatever the host is, so its labels are Linux and
 		// the container architecture, not the host's.
-		RunnerName:       cfg.Runner.Name,
-		Labels:           cfg.Runner.AllLabels("linux", goarch),
-		Image:            img,
-		Network:          cfg.Supervisor.Network,
-		MemoryMiB:        cfg.Supervisor.MemoryMiB,
-		Timeout:          time.Duration(cfg.Supervisor.TimeoutMinutes) * time.Minute,
-		CancelUnadmitted: cfg.Supervisor.CancelUnadmitted || *cancel,
-		PollInterval:     time.Duration(cfg.Agent.PollIdleSeconds) * time.Second,
+		RunnerName:            cfg.Runner.Name,
+		Labels:                cfg.Runner.AllLabels("linux", goarch),
+		Image:                 img,
+		Network:               cfg.Supervisor.Network,
+		MemoryMiB:             cfg.Supervisor.MemoryMiB,
+		Timeout:               time.Duration(cfg.Supervisor.TimeoutMinutes) * time.Minute,
+		CancelUnadmitted:      cfg.Supervisor.CancelUnadmitted || *cancel,
+		AllowPullRequestMerge: cfg.Supervisor.AllowPullRequestMerge,
+		PollInterval:          time.Duration(cfg.Agent.PollIdleSeconds) * time.Second,
 	}
 	if *poll > 0 {
 		scfg.PollInterval = *poll

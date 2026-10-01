@@ -101,6 +101,13 @@ func (j *judger) judge(ctx context.Context, o observed) judgement {
 	if !allowedEvents[run.Event] {
 		return refuse(o, diag.CodeJobEventRefused, fmt.Sprintf("the event %q is not one whose commit is the code that runs", run.Event))
 	}
+	if run.Event == "pull_request" && !j.s.cfg.AllowPullRequestMerge {
+		// What runs is GITHUB_SHA, GitHub's synthetic merge of the PR head and the base branch,
+		// with the workflow file taken from that merge. Only the head would be verified, so
+		// base-branch content nobody checked here would run. Refused until the owner opts in.
+		return refuse(o, diag.CodeJobEventRefused, "a pull_request run executes GitHub's merge of the pull request head and the base branch, not the head commit that is verified here; "+
+			"set supervisor.allow_pull_request_merge: true to accept that (decision 0007, \"Open: PRs run the merge commit\")")
+	}
 	// Outside a pull request the commit must live in this repository: a push-like run whose
 	// commit is somewhere else has no reason to exist and nothing vouches for it.
 	if run.Event != "pull_request" && !strings.EqualFold(run.HeadRepository, j.s.cfg.Scope.Repository) {

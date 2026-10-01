@@ -237,7 +237,9 @@ audit log, `~/.bladerunner/audit/supervisor-<runner name>.jsonl`, and nothing wa
 **A queued job was refused: its commit is not admitted.** The supervisor verified the job's head
 commit (for a pull request, the pull request's head commit and the repository it lives in, never
 GitHub's merge commit) against this machine's trust store and the commit failed (BR-E067 explains
-which check). No runner and no container was started for it. To allow it, trust the signer
+which check), or GitHub says the commit does not exist (HTTP 404/422: deleted, force-pushed away,
+or a deleted fork), which no retry will change. No runner and no container was started for it. To
+allow it, trust the signer
 (`bladerunner trust add`) or have them sign the commit; to get rid of a job nobody should run,
 cancel its run, or start the supervisor with `--cancel-unadmitted`.
 
@@ -252,9 +254,12 @@ for every job, GitHub's data differs from what Blade Runner assumes (C3): see de
 ### BR-E074
 
 **A queued job was refused because of the event that caused it.** Only `push`,
-`pull_request`, `workflow_dispatch` and `schedule` are accepted: for the others (for example
-`pull_request_target`, `issue_comment`, `workflow_run`) the code that runs is not the commit that
-was verified, or a stranger chose the moment. Change the workflow's trigger.
+`workflow_dispatch` and `schedule` are accepted, plus `pull_request` when the config says
+`supervisor.allow_pull_request_merge: true` (default false: a pull request run executes GitHub's
+merge of the head and the base branch, and only the head is verified; see the "Open: PRs run the
+merge commit" section of [decision 0007](../decisions/0007-supervisor.md)). For the other events
+(for example `pull_request_target`, `issue_comment`, `workflow_run`) the code that runs is not the
+commit that was verified, or a stranger chose the moment. Change the workflow's trigger.
 
 ### BR-E075
 
