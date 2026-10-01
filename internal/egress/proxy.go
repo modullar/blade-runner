@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -265,7 +266,8 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 	p.observe(d)
 
 	idle := dflt(p.IdleTimeout, 2*time.Minute)
-	c, u := &idleConn{Conn: client, idle: idle}, &idleConn{Conn: upstream, idle: idle}
+	clock := newActivity()
+	c, u := &idleConn{Conn: client, idle: idle, clock: clock}, &idleConn{Conn: upstream, idle: idle, clock: clock}
 	p.track(c, u)
 	defer p.untrack(c, u)
 	defer c.Close()
@@ -357,21 +359,52 @@ func (p *Proxy) untrack(cs ...net.Conn) {
 	p.mu.Unlock()
 }
 
-// idleConn closes a connection that has moved no data for idle: a stalled tunnel must not hold
-// a slot forever.
+// activity is a tunnel's shared last-activity time. Both of its connections report to it, so
+// traffic in EITHER direction keeps the tunnel alive: a long download to a silent client, or an
+// upload from a client that hears nothing back, is not idle.
+type activity struct{ last atomic.Int64 } // unix nanoseconds
+
+func newActivity() *activity {
+	a := &activity{}
+	a.touch()
+	return a
+}
+
+func (a *activity) touch()               { a.last.Store(time.Now().UnixNano()) }
+func (a *activity) at() time.Time        { return time.Unix(0, a.last.Load()) }
+func (a *activity) since() time.Duration { return time.Since(a.at()) }
+
+// idleConn closes a connection when the tunnel it belongs to has moved no data in EITHER
+// direction for idle: a stalled tunnel must not hold a slot forever, a busy one must not be cut.
 type idleConn struct {
 	net.Conn
-	idle time.Duration
+	idle  time.Duration
+	clock *activity
 }
 
 func (c *idleConn) Read(b []byte) (int, error) {
-	_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
-	return c.Conn.Read(b)
+	for {
+		_ = c.Conn.SetReadDeadline(c.clock.at().Add(c.idle))
+		n, err := c.Conn.Read(b)
+		if n > 0 {
+			c.clock.touch()
+			return n, err
+		}
+		var ne net.Error
+		if err != nil && errors.As(err, &ne) && ne.Timeout() && c.clock.since() < c.idle {
+			continue // this side was silent, but the other direction moved data meanwhile
+		}
+		return n, err
+	}
 }
 
 func (c *idleConn) Write(b []byte) (int, error) {
 	_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
-	return c.Conn.Write(b)
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.clock.touch()
+	}
+	return n, err
 }
 
 func (c *idleConn) CloseWrite() error {

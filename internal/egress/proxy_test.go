@@ -703,3 +703,82 @@ func TestDefaultsApplyWhenNothingIsConfigured(t *testing.T) {
 }
 
 func atoi(s string) int { n, _ := strconv.Atoi(s); return n }
+
+// ---- idle is per tunnel, not per direction ---------------------------------------------
+
+// A long download: the upstream trickles bytes for far longer than IdleTimeout while the client
+// says nothing. The client's silence must not half-close the tunnel under the download.
+func TestADownloadToASilentClientIsNotCutByIdleTimeout(t *testing.T) {
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer l.Close()
+	const chunks = 12
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		var clientGone atomic.Bool
+		go func() { // like most servers, give up on a client that has half-closed
+			io.Copy(io.Discard, c)
+			clientGone.Store(true)
+		}()
+		for i := 0; i < chunks && !clientGone.Load(); i++ {
+			time.Sleep(100 * time.Millisecond) // 1.2s in total, 4x the idle timeout
+			io.WriteString(c, "x")
+		}
+	}()
+	port := l.Addr().(*net.TCPAddr).Port
+	addr, _ := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{port}, IdleTimeout: 300 * time.Millisecond,
+		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}}), Policy: loopbackOK{},
+	})
+	status, c, r := connectVia(t, addr, "allowed.test:"+strconv.Itoa(port), "")
+	wantStatus(t, status, 200)
+	_ = c.SetReadDeadline(time.Now().Add(8 * time.Second))
+	got, err := io.ReadAll(r) // the client sends nothing at all
+	if err != nil || len(got) != chunks {
+		t.Fatalf("download delivered %d of %d bytes (err %v): the silent client's side idled out", len(got), chunks, err)
+	}
+}
+
+// A long upload: the client trickles bytes for longer than IdleTimeout while the upstream says
+// nothing until the client is done. The upstream's silence must not half-close the client's
+// read side, or the final reply (here "done") never reaches it.
+func TestAnUploadToASilentUpstreamIsNotCutByIdleTimeout(t *testing.T) {
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer l.Close()
+	received := make(chan int, 1)
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		n, _ := io.Copy(io.Discard, c) // silent until the client half-closes
+		received <- int(n)
+		io.WriteString(c, "done")
+	}()
+	port := l.Addr().(*net.TCPAddr).Port
+	addr, _ := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{port}, IdleTimeout: 300 * time.Millisecond,
+		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}}), Policy: loopbackOK{},
+	})
+	status, c, r := connectVia(t, addr, "allowed.test:"+strconv.Itoa(port), "")
+	wantStatus(t, status, 200)
+	for i := 0; i < 12; i++ {
+		time.Sleep(100 * time.Millisecond)
+		if _, err := io.WriteString(c, "y"); err != nil {
+			t.Fatalf("upload write %d: %v", i, err)
+		}
+	}
+	c.(*net.TCPConn).CloseWrite()
+	_ = c.SetReadDeadline(time.Now().Add(8 * time.Second))
+	got, err := io.ReadAll(r)
+	if string(got) != "done" || err != nil {
+		t.Fatalf("reply = %q (err %v), want \"done\": the upstream's silence idled the tunnel out", got, err)
+	}
+	if n := <-received; n != 12 {
+		t.Errorf("upstream received %d bytes, want 12", n)
+	}
+}
