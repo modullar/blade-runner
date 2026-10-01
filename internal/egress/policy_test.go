@@ -108,6 +108,13 @@ func TestPublicOnlyRefusesEveryInternalAddress(t *testing.T) {
 		"::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254", "::ffff:192.168.1.1", // IPv4-mapped forms
 		"64:ff9b::7f00:1", "64:ff9b::a00:1", "2002:7f00:1::1", "2002:a00:1::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2", // forms that wrap an IPv4 address
 		"2001:db8::1", "100::1", "::7f00:1",
+		"::ffff:0:7f00:1", "::ffff:0:a00:1", "::ffff:0:808:808", // SIIT (::ffff:0:0:0/96) wraps an IPv4 address, public ones included
+		"fec0::1", "feff::1", // deprecated site-local
+		"192.88.99.1", "192.88.99.255", // deprecated 6to4 relay anycast
+		"2001:2::1", "2001:2:0:ffff::1", // benchmarking
+		"2001:10::1", "2001:1f::1", // ORCHID
+		"3fff::1", "3fff:fff::1", // documentation
+		"5f00::1", "5f00:ffff::1", // SRv6 segment identifiers
 	}
 	for _, s := range refused {
 		if err := (PublicOnly{}).Check(netip.MustParseAddr(s)); err == nil {
@@ -120,7 +127,7 @@ func TestPublicOnlyRefusesEveryInternalAddress(t *testing.T) {
 	if err := (PublicOnly{}).Check(netip.MustParseAddr("fe80::1%eth0")); err == nil {
 		t.Error("a zoned address must be refused")
 	}
-	for _, s := range []string{"8.8.8.8", "1.1.1.1", "140.82.112.3", "93.184.216.34", "172.32.0.1", "172.15.255.255", "100.63.255.255", "100.128.0.1", "2606:4700:4700::1111", "2a00:1450:4001::1"} {
+	for _, s := range []string{"8.8.8.8", "1.1.1.1", "140.82.112.3", "93.184.216.34", "172.32.0.1", "172.15.255.255", "100.63.255.255", "100.128.0.1", "2606:4700:4700::1111", "2a00:1450:4001::1", "192.88.98.1", "192.88.100.1", "2001:3::1", "5e00::1", "5f01::1", "3ffe::1"} {
 		if err := (PublicOnly{}).Check(netip.MustParseAddr(s)); err != nil {
 			t.Errorf("%s is a public address and must be allowed: %v", s, err)
 		}
