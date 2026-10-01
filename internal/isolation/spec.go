@@ -94,9 +94,27 @@ func isProxyEnv(k string) bool {
 	return false
 }
 
+// reservedNetworks are names Docker gives meaning to. "bridge" is the default bridge (on which
+// every other container lives), "host" and "none" are modes, "container:<id>" joins another
+// container's stack, and the rest are Docker's built-ins. None of them can be the one network
+// an allowlist job lives on: it must be a network egress.Open made for this job.
+var reservedNetworks = []string{"bridge", "none", "host", "default", "ingress", "docker_gwbridge"}
+
+func reservedNetwork(name string) bool {
+	if strings.HasPrefix(strings.ToLower(name), "container:") {
+		return true
+	}
+	for _, r := range reservedNetworks {
+		if strings.EqualFold(name, r) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s Spec) validateEgress() error {
-	if !nameRe.MatchString(s.EgressNetwork) {
-		return invalid(fmt.Sprintf("allowlist mode needs a valid egress network name, got %q", s.EgressNetwork))
+	if !nameRe.MatchString(s.EgressNetwork) || reservedNetwork(s.EgressNetwork) {
+		return invalid(fmt.Sprintf("allowlist mode needs the name of the job's own egress network (not a built-in such as bridge, host or none), got %q", s.EgressNetwork))
 	}
 	if !nameRe.MatchString(s.EgressProxyContainer) {
 		return invalid(fmt.Sprintf("allowlist mode needs the proxy's container name, got %q", s.EgressProxyContainer))

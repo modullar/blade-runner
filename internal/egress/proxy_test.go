@@ -58,6 +58,7 @@ type fixedResolver struct {
 	mu      sync.Mutex
 	answers map[string][][]netip.Addr
 	calls   map[string]int
+	queried []string // the names exactly as the proxy asked for them
 }
 
 func newResolver(m map[string][]string) *fixedResolver {
@@ -79,6 +80,8 @@ func (r *fixedResolver) add(name string, ips ...string) {
 func (r *fixedResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.queried = append(r.queried, host)
+	host = strings.TrimSuffix(host, ".") // the absolute form names the same host
 	seq, ok := r.answers[host]
 	if !ok {
 		return nil, fmt.Errorf("no such host %q", host)
@@ -181,6 +184,25 @@ func connectVia(t *testing.T, proxy, authority string, pipelined string) (status
 		}
 	}
 	return status, c, r
+}
+
+// connectWithHost sends a CONNECT whose request target is authority but whose Host header is
+// hostHeader, and returns the status line. It lets a test send a header Go's server accepts, so
+// the request reaches the proxy's own checks instead of being rejected as malformed first.
+func connectWithHost(t *testing.T, proxy, authority, hostHeader string) string {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", proxy, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", authority, hostHeader)
+	line, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil {
+		t.Fatalf("CONNECT %s: %v", authority, err)
+	}
+	return strings.TrimSpace(line)
 }
 
 func wantStatus(t *testing.T, status string, code int) {
@@ -296,30 +318,99 @@ func TestAnIPLiteralIsNeverAccepted(t *testing.T) {
 	}
 }
 
-func TestMalformedTargetsAreRefused(t *testing.T) {
+func TestMalformedTargetsAreRefusedWithTheirOwnCodes(t *testing.T) {
 	tg := newTarget(t)
 	addr, rec := startProxy(t, &Proxy{
 		Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())},
 		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}}), Policy: loopbackOK{},
 	})
-	for name, authority := range map[string]string{
-		"userinfo trick":         "evil.com@allowed.test:" + tg.port(),
-		"allowed name as a user": "allowed.test@evil.com:" + tg.port(),
-		"a space":                "allowed .test:" + tg.port(),
-		"no port":                "allowed.test",
-		"a percent escape":       "allowed.test%2e:" + tg.port(),
-		"a path":                 "allowed.test/x:" + tg.port(),
+	good := "allowed.test:" + tg.port() // a valid Host header, so Go's server hands the request over
+	for name, tc := range map[string]struct {
+		authority string
+		status    int
+		reason    string // what the proxy records; "" when Go's server refused it before the handler
+	}{
+		"no port":          {"allowed.test", 400, ReasonBadHost},
+		"a path":           {"allowed.test/x:" + tg.port(), 400, ReasonBadHost},
+		"a percent escape": {"allowed.test%2e:" + tg.port(), 400, ""},
+		"an empty host":    {":" + tg.port(), 400, ReasonBadHost},
 	} {
-		status, _, _ := connectVia(t, addr, authority, "")
-		if !strings.HasPrefix(status, "HTTP/1.1 400") && !strings.HasPrefix(status, "HTTP/1.1 403") {
-			t.Errorf("%s: status = %q, want a refusal", name, status)
+		before := rec.count()
+		status := connectWithHost(t, addr, tc.authority, good)
+		wantStatus(t, status, tc.status)
+		if got := rec.count() - before; tc.reason != "" && (got != 1 || rec.last().Reason != tc.reason) {
+			t.Errorf("%s: recorded %d decisions, last %+v; want one with reason %q", name, got, rec.last(), tc.reason)
 		}
 	}
 	if tg.accepted.Load() != 0 {
 		t.Error("a malformed target reached the target")
 	}
-	if rec.count() == 0 {
-		t.Error("refusals must be recorded")
+}
+
+// Go's HTTP server strips userinfo from a CONNECT authority before the handler sees it, so
+// "evil.com@allowed.test" is the host allowed.test and "allowed.test@evil.com" is the host
+// evil.com. The proxy must act on that host and nothing else: the part before the "@" must
+// neither grant access (an allowed name used as a user) nor be dialled (a forbidden name used
+// as a user). Each request carries a VALID Host header, so the request reaches the proxy.
+func TestUserinfoInTheTargetIsIgnoredNotTrusted(t *testing.T) {
+	tg := newTarget(t)
+	addr, rec := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())},
+		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}, "evil.com": {"127.0.0.1"}}), Policy: loopbackOK{},
+	})
+	good := "allowed.test:" + tg.port()
+
+	t.Run("a forbidden name as the user does not matter: the host is the allowed one", func(t *testing.T) {
+		wantStatus(t, connectWithHost(t, addr, "evil.com@allowed.test:"+tg.port(), good), 200)
+		d := rec.last()
+		if !d.Allowed || d.Host != "allowed.test" || d.Reason != ReasonAllowed {
+			t.Errorf("decision = %+v, want allowed.test", d)
+		}
+	})
+	t.Run("an allowed name as the user grants nothing: the host is evil.com", func(t *testing.T) {
+		before := tg.accepted.Load()
+		wantStatus(t, connectWithHost(t, addr, "allowed.test@evil.com:"+tg.port(), good), 403)
+		d := rec.last()
+		if d.Allowed || d.Host != "evil.com" || d.Reason != ReasonNotAllowlist {
+			t.Errorf("decision = %+v, want a refusal of evil.com as not-allowlisted", d)
+		}
+		if tg.accepted.Load() != before {
+			t.Error("evil.com was connected to")
+		}
+	})
+}
+
+func TestTheNameIsResolvedAsAbsoluteSoNoSearchDomainApplies(t *testing.T) {
+	tg := newTarget(t)
+	res := newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}})
+	addr, _ := startProxy(t, &Proxy{Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())}, Resolver: res, Policy: loopbackOK{}})
+	for _, authority := range []string{"allowed.test:" + tg.port(), "ALLOWED.test.:" + tg.port()} {
+		status, c, _ := connectVia(t, addr, authority, "")
+		wantStatus(t, status, 200)
+		c.Close()
+	}
+	res.mu.Lock()
+	defer res.mu.Unlock()
+	if len(res.queried) != 2 || res.queried[0] != "allowed.test." || res.queried[1] != "allowed.test." {
+		t.Errorf("the resolver was asked for %q, want the absolute name \"allowed.test.\" both times", res.queried)
+	}
+}
+
+func TestLoggedHostTextIsCapped(t *testing.T) {
+	tg := newTarget(t)
+	addr, rec := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())},
+		Resolver: newResolver(nil), Policy: loopbackOK{},
+	})
+	long := strings.Repeat(strings.Repeat("a", 60)+".", 4) + "test" // 248 bytes, a valid name
+	wantStatus(t, connectWithHost(t, addr, long+":"+tg.port(), "allowed.test:1"), 403)
+	d := rec.last()
+	if d.Reason != ReasonNotAllowlist || len(d.Host) > maxLoggedHost || !strings.HasPrefix(long, strings.TrimSuffix(d.Host, "...")) {
+		t.Errorf("logged host = %q (%d bytes), want a prefix of the name, at most %d bytes", d.Host, len(d.Host), maxLoggedHost)
+	}
+	wantStatus(t, connectWithHost(t, addr, "allowed.test:"+strings.Repeat("9", 40), "allowed.test:1"), 403)
+	if d := rec.last(); len(d.Port) > maxLoggedPort {
+		t.Errorf("logged port = %q", d.Port)
 	}
 }
 
@@ -469,6 +560,85 @@ func TestTooManyTunnelsAreRefusedAndASlotFreesUp(t *testing.T) {
 			t.Fatalf("the slot never freed after the first tunnel closed: %s", status)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// keepAliveDenied opens a connection, makes one request the proxy refuses (a plain GET), reads
+// the answer and leaves the connection open: an idle, kept-alive client.
+func keepAliveDenied(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	fmt.Fprint(c, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	r := bufio.NewReader(c)
+	line, err := r.ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, "HTTP/1.1 405") {
+		t.Fatalf("a refused request: %q %v", line, err)
+	}
+	for { // the rest of the response: headers, then the short body
+		l, err := r.ReadString('\n')
+		if err != nil || strings.TrimSpace(l) == "" {
+			break
+		}
+	}
+	r.ReadString('\n') // the body line
+	return c, r
+}
+
+func TestEveryConnectionCountsAgainstTheCapNotOnlyTunnels(t *testing.T) {
+	addr, rec := startProxy(t, &Proxy{Allow: allow(t, "allowed.test"), MaxConns: 3, IdleTimeout: 400 * time.Millisecond})
+	for i := 0; i < 3; i++ { // three idle connections, none of them a tunnel
+		keepAliveDenied(t, addr)
+	}
+	// The fourth connection is over the cap: answered 503 and closed, whatever it asks for.
+	c, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	line, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil {
+		t.Fatalf("the over-cap connection got no answer: %v", err)
+	}
+	wantStatus(t, strings.TrimSpace(line), 503)
+	if d := rec.last(); d.Reason != ReasonTooMany {
+		t.Errorf("decision = %+v", d)
+	}
+	// The idle ones are closed by IdleTimeout, which frees their slots.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c2, err := net.DialTimeout("tcp", addr, time.Second)
+		if err == nil {
+			_ = c2.SetDeadline(time.Now().Add(2 * time.Second))
+			fmt.Fprint(c2, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+			l, _ := bufio.NewReader(c2).ReadString('\n')
+			c2.Close()
+			if strings.HasPrefix(l, "HTTP/1.1 405") {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("slots held by idle connections were never freed")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestAnIdleKeepAliveConnectionIsClosedByIdleTimeout(t *testing.T) {
+	addr, _ := startProxy(t, &Proxy{Allow: allow(t, "allowed.test"), IdleTimeout: 300 * time.Millisecond})
+	c, r := keepAliveDenied(t, addr)
+	start := time.Now()
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := r.ReadByte(); err != io.EOF {
+		t.Errorf("read = %v, want the proxy to close the idle connection (EOF)", err)
+	}
+	if time.Since(start) > 4*time.Second {
+		t.Errorf("the idle connection stayed open for %v", time.Since(start))
 	}
 }
 

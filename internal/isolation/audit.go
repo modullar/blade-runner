@@ -11,9 +11,14 @@ import (
 // inspected is the part of `docker inspect` the audit reads: the configuration Docker
 // actually applied, not the flags we asked for.
 type inspected struct {
+	ID    string `json:"Id"`
+	State struct {
+		Running bool `json:"Running"`
+	} `json:"State"`
 	Config struct {
-		User string   `json:"User"`
-		Env  []string `json:"Env"`
+		User   string            `json:"User"`
+		Env    []string          `json:"Env"`
+		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	HostConfig struct {
 		Privileged      bool              `json:"Privileged"`

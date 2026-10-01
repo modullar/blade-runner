@@ -37,30 +37,40 @@ func TestAllowlistMatching(t *testing.T) {
 
 func TestParseAllowlistRefusesWhatItCannotTrust(t *testing.T) {
 	for name, entries := range map[string][]string{
-		"empty":                 nil,
-		"empty entry":           {""},
-		"an IPv4 address":       {"1.2.3.4"},
-		"an IPv6 address":       {"::1"},
-		"loopback":              {"127.0.0.1"},
-		"a bare star":           {"*"},
-		"a star over a TLD":     {"*.com"},
-		"a star in the middle":  {"a.*.com"},
-		"a star without a dot":  {"*example.com"},
-		"a port":                {"github.com:443"},
-		"a URL":                 {"https://github.com"},
-		"a path":                {"github.com/x"},
-		"upper case":            {"GitHub.com"},
-		"non-ASCII":             {"gîthub.com"},
-		"an underscore":         {"a_b.example.com"},
-		"a leading hyphen":      {"-a.example.com"},
-		"an empty label":        {"a..example.com"},
-		"a trailing dot":        {"example.com."},
-		"a space":               {"a b.example.com"},
-		"all digits":            {"10.1.2"},
-		"over-long label":       {strings.Repeat("a", 64) + ".com"},
-		"one bad among good":    {"github.com", "http://x"},
-		"a wildcard wildcard":   {"*.*.example.com"},
-		"a leading dot wildcad": {".example.com"},
+		"empty":                   nil,
+		"empty entry":             {""},
+		"an IPv4 address":         {"1.2.3.4"},
+		"an IPv6 address":         {"::1"},
+		"loopback":                {"127.0.0.1"},
+		"a bare star":             {"*"},
+		"a star over a TLD":       {"*.com"},
+		"a star in the middle":    {"a.*.com"},
+		"a star without a dot":    {"*example.com"},
+		"a port":                  {"github.com:443"},
+		"a URL":                   {"https://github.com"},
+		"a path":                  {"github.com/x"},
+		"upper case":              {"GitHub.com"},
+		"non-ASCII":               {"gîthub.com"},
+		"an underscore":           {"a_b.example.com"},
+		"a leading hyphen":        {"-a.example.com"},
+		"an empty label":          {"a..example.com"},
+		"a trailing dot":          {"example.com."},
+		"a space":                 {"a b.example.com"},
+		"all digits":              {"10.1.2"},
+		"hex numeric form":        {"0x7f.1"},
+		"hex numeric form 2":      {"0x7f.0x0.0x0.0x1"},
+		"mixed numeric forms":     {"0x7f.0.0.01"},
+		"a wildcard of digits":    {"*.10.1.2"},
+		"a public suffix":         {"*.co.uk"},
+		"a public suffix 2":       {"*.com.au"},
+		"a multi-tenant suffix":   {"*.github.io"},
+		"a multi-tenant suffix 2": {"*.herokuapp.com"},
+		"a multi-tenant suffix 3": {"*.s3.amazonaws.com"},
+		"a multi-tenant suffix 4": {"*.githubusercontent.com"},
+		"over-long label":         {strings.Repeat("a", 64) + ".com"},
+		"one bad among good":      {"github.com", "http://x"},
+		"a wildcard wildcard":     {"*.*.example.com"},
+		"a leading dot wildcad":   {".example.com"},
 	} {
 		_, err := ParseAllowlist(entries)
 		if diag.CodeOf(err) != diag.CodeEgressPolicyInvalid {
@@ -69,6 +79,27 @@ func TestParseAllowlistRefusesWhatItCannotTrust(t *testing.T) {
 	}
 	if _, err := ParseAllowlist(DefaultAllowlist); err != nil {
 		t.Errorf("the default allowlist must itself be valid: %v", err)
+	}
+}
+
+func TestWildcardsOverAPublicSuffixAreRefusedButNamesBelowItAreNot(t *testing.T) {
+	for _, ok := range []string{"*.example.co.uk", "*.example.com.au", "*.me.github.io", "*.myapp.herokuapp.com", "*.actions.githubusercontent.com", "*.example.com"} {
+		if _, err := ParseAllowlist([]string{ok}); err != nil {
+			t.Errorf("%s names one registrant and must be accepted: %v", ok, err)
+		}
+	}
+	// An EXACT entry for a suffix is the operator naming one host, which is their call.
+	if _, err := ParseAllowlist([]string{"github.io"}); err != nil {
+		t.Errorf("an exact entry is not a wildcard: %v", err)
+	}
+}
+
+func TestAWildcardMatchesDeeperSubdomainsToo(t *testing.T) {
+	a := allow(t, "*.example.com")
+	for host, want := range map[string]bool{"a.example.com": true, "a.b.example.com": true, "a.b.c.example.com": true, "example.com": false} {
+		if got := a.Allowed(host); got != want {
+			t.Errorf("Allowed(%q) = %v, want %v", host, got, want)
+		}
 	}
 }
 
@@ -108,6 +139,13 @@ func TestPublicOnlyRefusesEveryInternalAddress(t *testing.T) {
 		"::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254", "::ffff:192.168.1.1", // IPv4-mapped forms
 		"64:ff9b::7f00:1", "64:ff9b::a00:1", "2002:7f00:1::1", "2002:a00:1::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2", // forms that wrap an IPv4 address
 		"2001:db8::1", "100::1", "::7f00:1",
+		"::ffff:0:7f00:1", "::ffff:0:a00:1", "::ffff:0:808:808", // SIIT (::ffff:0:0:0/96) wraps an IPv4 address, public ones included
+		"fec0::1", "feff::1", // deprecated site-local
+		"192.88.99.1", "192.88.99.255", // deprecated 6to4 relay anycast
+		"2001:2::1", "2001:2:0:ffff::1", // benchmarking
+		"2001:10::1", "2001:1f::1", // ORCHID
+		"3fff::1", "3fff:fff::1", // documentation
+		"5f00::1", "5f00:ffff::1", // SRv6 segment identifiers
 	}
 	for _, s := range refused {
 		if err := (PublicOnly{}).Check(netip.MustParseAddr(s)); err == nil {
@@ -120,7 +158,7 @@ func TestPublicOnlyRefusesEveryInternalAddress(t *testing.T) {
 	if err := (PublicOnly{}).Check(netip.MustParseAddr("fe80::1%eth0")); err == nil {
 		t.Error("a zoned address must be refused")
 	}
-	for _, s := range []string{"8.8.8.8", "1.1.1.1", "140.82.112.3", "93.184.216.34", "172.32.0.1", "172.15.255.255", "100.63.255.255", "100.128.0.1", "2606:4700:4700::1111", "2a00:1450:4001::1"} {
+	for _, s := range []string{"8.8.8.8", "1.1.1.1", "140.82.112.3", "93.184.216.34", "172.32.0.1", "172.15.255.255", "100.63.255.255", "100.128.0.1", "2606:4700:4700::1111", "2a00:1450:4001::1", "192.88.98.1", "192.88.100.1", "2001:3::1", "5e00::1", "5f01::1", "3ffe::1"} {
 		if err := (PublicOnly{}).Check(netip.MustParseAddr(s)); err != nil {
 			t.Errorf("%s is a public address and must be allowed: %v", s, err)
 		}

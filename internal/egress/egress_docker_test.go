@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/modullar/blade-runner/internal/diag"
+	"github.com/modullar/blade-runner/internal/dockerlock"
 	"github.com/modullar/blade-runner/internal/execx"
 	"github.com/modullar/blade-runner/internal/isolation"
 )
@@ -41,7 +42,7 @@ func needDocker(t *testing.T) string {
 	if _, err := jobs.Preflight(ctx); err != nil {
 		t.Skipf("no usable Docker daemon: %v", err)
 	}
-	lockDocker(t)
+	dockerlock.Lock(t)
 	imgOnce.Do(func() {
 		dir, err := os.MkdirTemp("", "egress-img-")
 		if err != nil {
@@ -177,7 +178,7 @@ func job(t *testing.T, img string, s *Session, args ...string) isolation.Result 
 
 func runJob(img string, s *Session, d *isolation.Docker, args ...string) (isolation.Result, error) {
 	spec := isolation.Spec{Name: uniq("br-egj-"), Image: img, Args: args, Timeout: 60 * time.Second, MemoryMiB: 128, PidsLimit: 64, WorkTmpfsMiB: 16}
-	s.Apply(&spec)
+	applyAgain(s, &spec)
 	return d.Run(ctx, spec)
 }
 
@@ -310,11 +311,17 @@ func TestRealDocker_AForbiddenHostnameIsRefusedAndRecorded(t *testing.T) {
 func TestRealDocker_TheProductionProxyRefusesAnAllowedNameThatResolvesInside(t *testing.T) {
 	img := needDocker(t)
 	h := newHostService(t)
-	// The PRODUCTION proxy, no fixture flags: "localhost" is on the allowlist, and it resolves
-	// (through the container's /etc/hosts, so no network is involved) to a loopback address.
-	m := &Manager{Exec: execx.OS{}, ProxyImage: img, Allow: allow(t, "localhost"), Ports: []int{h.port}}
+	m0 := &Manager{Exec: execx.OS{}}
+	outNetwork(t, m0)
+	// A real neighbour of the proxies on the outbound network, reachable by NAME through Docker's
+	// own DNS: an allowlisted name that resolves to a private address, as a hostile or careless
+	// DNS answer would. The PRODUCTION proxy (no fixture flags) must refuse it.
+	victim := uniq("br-egv-")
+	dockerCLI(t, "run", "-d", "--name", victim, "--network", OutNetwork, "--entrypoint", "/probe", img, "listen", "9000")
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", victim).Run() })
+	m := &Manager{Exec: execx.OS{}, ProxyImage: img, Allow: allow(t, victim), Ports: []int{9000}}
 	s := open(t, m)
-	res := job(t, img, s, "via-proxy", s.ProxyAddr, "localhost:"+strconv.Itoa(h.port))
+	res := job(t, img, s, "via-proxy", s.ProxyAddr, victim+":9000")
 	if !strings.HasPrefix(res.Stdout, "BLOCKED") || !strings.Contains(res.Stdout, " 403 ") {
 		t.Fatalf("through the production proxy: %q", res.Stdout)
 	}
@@ -324,12 +331,20 @@ func TestRealDocker_TheProductionProxyRefusesAnAllowedNameThatResolvesInside(t *
 	}
 	found := false
 	for _, d := range ds {
-		if d.Host == "localhost" && !d.Allowed && d.Reason == ReasonForbiddenAddr && len(d.Resolved) > 0 {
+		if d.Host == victim && !d.Allowed && d.Reason == ReasonForbiddenAddr && len(d.Resolved) > 0 {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("the proxy's record should show localhost refused as forbidden-address: %+v", ds)
+		t.Errorf("the proxy's record should show %s refused as forbidden-address: %+v", victim, ds)
+	}
+	// The name is asked for as an absolute name, so /etc/hosts does not apply: "localhost" is not
+	// resolved from the proxy container's hosts file (where it would be refused as loopback
+	// anyway) but asked of DNS, which has no such name. Either way nothing is reachable.
+	m1 := &Manager{Exec: execx.OS{}, ProxyImage: img, Allow: allow(t, "localhost"), Ports: []int{h.port}}
+	s1 := open(t, m1)
+	if res := job(t, img, s1, "via-proxy", s1.ProxyAddr, "localhost:"+strconv.Itoa(h.port)); !strings.HasPrefix(res.Stdout, "BLOCKED") {
+		t.Errorf("localhost through the production proxy: %q", res.Stdout)
 	}
 	// And that production proxy really is the production policy: asked for an allowlisted name
 	// that does not resolve at all, it fails closed.
@@ -545,7 +560,7 @@ func TestRealDocker_ARefusedJobNeverStartsAndLeavesNothingBehind(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.run.inner = execx.OS{}
 			spec := isolation.Spec{Name: uniq("br-egr-"), Image: img, Args: []string{"connect", out.Gateway + ":" + port}, Timeout: 30 * time.Second, MemoryMiB: 128, PidsLimit: 32}
-			s.Apply(&spec)
+			applyAgain(s, &spec)
 			before := h.accepted.Load()
 			res, err := (&isolation.Docker{Exec: tc.run}).Run(ctx, spec)
 			if diag.CodeOf(err) != diag.CodeEgressSetup || !strings.Contains(err.Error(), "NOT started") || !strings.Contains(err.Error(), tc.want) {
@@ -573,7 +588,7 @@ func TestRealDocker_TheNetworkAuditRefusesNetworksThatAreNotTheDesign(t *testing
 	try := func(t *testing.T, network string, wantInErr ...string) {
 		t.Helper()
 		spec := isolation.Spec{Name: uniq("br-egn-"), Image: img, Args: []string{"routes"}, Timeout: 30 * time.Second, MemoryMiB: 128, PidsLimit: 32}
-		s.Apply(&spec)
+		applyAgain(s, &spec)
 		spec.EgressNetwork = network
 		res, err := jobs.Run(ctx, spec)
 		if diag.CodeOf(err) != diag.CodeEgressSetup {
@@ -603,8 +618,16 @@ func TestRealDocker_TheNetworkAuditRefusesNetworksThatAreNotTheDesign(t *testing
 		t.Cleanup(func() { _ = exec.Command("docker", "network", "rm", name).Run() })
 		try(t, name, "not internal")
 	})
-	t.Run("the default bridge", func(t *testing.T) {
-		try(t, "bridge", "not internal")
+	t.Run("the default bridge cannot even be named as the egress network", func(t *testing.T) {
+		spec := isolation.Spec{Name: uniq("br-egn-"), Image: img, Args: []string{"routes"}, Timeout: 30 * time.Second, MemoryMiB: 128, PidsLimit: 32}
+		applyAgain(s, &spec)
+		spec.EgressNetwork = "bridge"
+		if _, err := jobs.Run(ctx, spec); diag.CodeOf(err) != diag.CodeIsolation {
+			t.Fatalf("err = %v, want a BR-E068 refusal before anything is created", err)
+		}
+		if containerExists(spec.Name) {
+			t.Error("a container was created")
+		}
 	})
 	t.Run("an intruder sharing the network", func(t *testing.T) {
 		name := uniq("br-egi-")
@@ -706,5 +729,252 @@ func TestRealDocker_OpenFailsCleanly(t *testing.T) {
 	}
 	if _, err := (&Manager{Exec: execx.OS{}, ProxyImage: img, Allow: allow(t, "github.com")}).Open(ctx, "Bad ID"); diag.CodeOf(err) != diag.CodeEgressSetup {
 		t.Errorf("bad id: %v", err)
+	}
+}
+
+// applyAgain hands the session to another job. Production never does that (Apply refuses a
+// second job); these tests probe ONE topology with many short jobs in sequence, and the Docker
+// side of the rule (a network with anything besides the proxy and that job is refused) is still
+// in force for each of them.
+func applyAgain(s *Session, spec *isolation.Spec) {
+	s.claimed.Store(false)
+	_ = s.Apply(spec)
+}
+
+// ---- collisions, one job per session, proxy identity ---------------------------------------
+
+func containerExists(name string) bool {
+	out, _ := exec.Command("docker", "ps", "-aq", "--filter", "name=^"+name+"$").Output()
+	return strings.TrimSpace(string(out)) != ""
+}
+
+func networkExists(name string) bool {
+	out, _ := exec.Command("docker", "network", "ls", "-q", "--filter", "name=^"+name+"$").Output()
+	return strings.TrimSpace(string(out)) != ""
+}
+
+func TestRealDocker_AFailedOpenOnANameCollisionLeavesTheLiveSessionAlone(t *testing.T) {
+	img := needDocker(t)
+	h := newHostService(t)
+	m, _ := fixtureManager(t, img, h, "allowed.test")
+	live := open(t, m)
+
+	if s, err := m.Open(ctx, live.ID); err == nil {
+		_ = s.Close(ctx)
+		t.Fatal("Open with an id that is already in use must fail")
+	} else if diag.CodeOf(err) != diag.CodeEgressSetup {
+		t.Errorf("err = %v, want BR-E082", err)
+	}
+
+	// The live session must be exactly as it was: proxy running, network there, and usable.
+	if got := dockerCLI(t, "inspect", "--format", "{{.State.Running}}", live.ProxyContainer); got != "true" {
+		t.Fatalf("the live session's proxy is running = %q after another Open failed on its name", got)
+	}
+	if !networkExists(live.Network) {
+		t.Fatal("the live session's network was removed by another Open's failure")
+	}
+	res := job(t, img, live, "via-proxy", live.ProxyAddr, "allowed.test:"+strconv.Itoa(h.port))
+	if !strings.HasPrefix(res.Stdout, "ALLOWED") {
+		t.Errorf("the live session no longer works: %q", res.Stdout)
+	}
+}
+
+func TestRealDocker_AFailedOpenRemovesOnlyWhatItCreated(t *testing.T) {
+	img := needDocker(t)
+	h := newHostService(t)
+	m, _ := fixtureManager(t, img, h, "allowed.test")
+
+	// A bystander already holds the proxy's name (nothing to do with egress). Open creates the
+	// network, fails at the proxy, and must remove its own network but not the bystander.
+	id := uniq("b")
+	bystander := "br-egress-" + id + "-proxy"
+	dockerCLI(t, "create", "--name", bystander, "--entrypoint", "/probe", img, "sleep")
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", bystander).Run() })
+
+	if s, err := m.Open(ctx, id); err == nil {
+		_ = s.Close(ctx)
+		t.Fatal("Open must fail when the proxy's name is taken")
+	}
+	if !containerExists(bystander) {
+		t.Error("Open's failure removed a container it did not create")
+	}
+	if networkExists("br-egress-" + id + "-net") {
+		t.Error("Open's failure left the network it created behind")
+	}
+}
+
+func TestSessionServesOneJobAndASecondApplyCannotProduceARunnableSpec(t *testing.T) {
+	s := &Session{ID: "x", Network: "br-egress-x-net", ProxyContainer: "br-egress-x-proxy", ProxyAddr: "172.19.0.1:3128"}
+	img := "sha256:" + strings.Repeat("a", 64)
+
+	first := isolation.Spec{Name: "job-1", Image: img}
+	if err := s.Apply(&first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Validate(); err != nil {
+		t.Fatalf("the first spec must be valid: %v", err)
+	}
+	if first.EgressNetwork != s.Network || first.EgressProxy != s.ProxyAddr || first.EgressProxyContainer != s.ProxyContainer {
+		t.Errorf("spec = %+v", first)
+	}
+
+	second := isolation.Spec{Name: "job-2", Image: img}
+	if err := s.Apply(&second); err != ErrSessionInUse {
+		t.Fatalf("err = %v, want ErrSessionInUse", err)
+	}
+	// A caller that ignores the error still cannot run the spec, nor fall back to another mode.
+	if _, err := second.Validate(); diag.CodeOf(err) != diag.CodeIsolation {
+		t.Errorf("the refused spec validated: %v", err)
+	}
+	if second.Network == isolation.NetworkBridge || second.EgressNetwork != "" {
+		t.Errorf("refused spec = %+v", second)
+	}
+}
+
+func TestRealDocker_AContainerCreatedButNotStartedOnTheNetworkRefusesTheJob(t *testing.T) {
+	img := needDocker(t)
+	h := newHostService(t)
+	m, _ := fixtureManager(t, img, h, "allowed.test")
+	s := open(t, m)
+
+	// `docker network inspect` does not list a container that has not started; the job's audit
+	// must still see it (a second job, or an intruder, waiting to be started).
+	stranger := uniq("br-egs-")
+	dockerCLI(t, "create", "--name", stranger, "--network", s.Network, "--entrypoint", "/probe", img, "sleep")
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", stranger).Run() })
+
+	res, err := runJob(img, s, jobs, "routes")
+	if diag.CodeOf(err) != diag.CodeEgressSetup || !strings.Contains(err.Error(), "container "+stranger+" is attached") {
+		t.Fatalf("err = %v, want a BR-E082 refusal naming the unstarted container %s", err, stranger)
+	}
+	if res.Stdout != "" {
+		t.Errorf("the job ran: %q", res.Stdout)
+	}
+}
+
+func TestRealDocker_AContainerThatJoinsTheNetworkWhileTheJobRunsStopsTheJob(t *testing.T) {
+	img := needDocker(t)
+	h := newHostService(t)
+	m, _ := fixtureManager(t, img, h, "allowed.test")
+	s := open(t, m)
+
+	d := &isolation.Docker{Exec: execx.OS{}, RecheckEvery: 100 * time.Millisecond}
+	spec := isolation.Spec{Name: uniq("br-egw-"), Image: img, Args: []string{"sleep"}, Timeout: 90 * time.Second, MemoryMiB: 128, PidsLimit: 64, WorkTmpfsMiB: 16}
+	applyAgain(s, &spec)
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", spec.Name).Run() }) // unblocks Run if the watch fails
+
+	type outcome struct {
+		res isolation.Result
+		err error
+	}
+	done := make(chan outcome, 1)
+	start := time.Now()
+	go func() {
+		res, err := d.Run(ctx, spec)
+		done <- outcome{res, err}
+	}()
+
+	// Wait until the job is really running, then create (not start) a container on its network.
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		out, _ := exec.Command("docker", "ps", "-q", "--filter", "name=^"+spec.Name+"$", "--filter", "status=running").Output()
+		if strings.TrimSpace(string(out)) != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the job never started")
+		}
+	}
+	stranger := uniq("br-egl-")
+	dockerCLI(t, "create", "--name", stranger, "--network", s.Network, "--entrypoint", "/probe", img, "sleep")
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", stranger).Run() })
+
+	select {
+	case o := <-done:
+		if diag.CodeOf(o.err) != diag.CodeEgressSetup || !strings.Contains(o.err.Error(), "container "+stranger+" is attached") {
+			t.Fatalf("err = %v, want a BR-E082 refusal naming %s", o.err, stranger)
+		}
+		if o.res.TimedOut {
+			t.Error("the job was stopped by its timeout, not by the audit")
+		}
+		if time.Since(start) > 60*time.Second {
+			t.Errorf("the job ran for %v before it was stopped", time.Since(start))
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the job kept running although an unexpected container joined its network")
+	}
+	if containerExists(spec.Name) {
+		t.Error("the stopped job's container was not removed")
+	}
+}
+
+func TestRealDocker_ANetworkNeighbourThatOnlyHasTheProxysNameAndAddressIsRefused(t *testing.T) {
+	img := needDocker(t)
+	// Everything a lookalike needs to pass the old audit: an internal network without a host
+	// address, the egress manager's labels on the network, and a container with the proxy's
+	// name at the address the job is told. What it lacks is being the proxy egress.Open built.
+	hardened := []string{"--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "65534:65534", "--pids-limit", "64", "--memory", "64m", "--cpus", "1"}
+	type variant struct {
+		name  string
+		flags []string
+		want  string
+	}
+	for _, v := range []variant{
+		{"hardened but without the egress labels", hardened, "lacks the bladerunner.egress label"},
+		{"labelled but not hardened", []string{"--label", "bladerunner.egress=session", "--label", "bladerunner.egress.id=lookalike"}, "is not hardened"},
+	} {
+		t.Run(v.name, func(t *testing.T) {
+			net1, proxy := uniq("br-egf-net"), uniq("br-egf-proxy")
+			dockerCLI(t, "network", "create", "--internal", "--opt", isolation.OptInhibitIPv4+"=true",
+				"--label", "bladerunner.egress=session", "--label", "bladerunner.egress.id=lookalike", net1)
+			t.Cleanup(func() { _ = exec.Command("docker", "network", "rm", net1).Run() })
+			args := append([]string{"run", "-d", "--name", proxy, "--network", net1, "--entrypoint", "/probe"}, v.flags...)
+			dockerCLI(t, append(args, img, "sleep")...)
+			t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", proxy).Run() })
+			ip := dockerCLI(t, "inspect", "--format", "{{(index .NetworkSettings.Networks \""+net1+"\").IPAddress}}", proxy)
+
+			spec := isolation.Spec{Name: uniq("br-egj-"), Image: img, Args: []string{"routes"}, Timeout: 30 * time.Second, MemoryMiB: 128, PidsLimit: 32,
+				Network: isolation.NetworkAllowlist, EgressNetwork: net1, EgressProxy: ip + ":3128", EgressProxyContainer: proxy}
+			res, err := jobs.Run(ctx, spec)
+			if diag.CodeOf(err) != diag.CodeEgressSetup || !strings.Contains(err.Error(), v.want) {
+				t.Fatalf("err = %v, want a BR-E082 refusal mentioning %q", err, v.want)
+			}
+			if res.Stdout != "" {
+				t.Errorf("the job ran next to a container that is not the proxy: %q", res.Stdout)
+			}
+		})
+	}
+}
+
+func TestRealDocker_ADenialFloodIsCountedNotItemisedAndTheAllowedRecordSurvives(t *testing.T) {
+	img := needDocker(t)
+	h := newHostService(t)
+	m, _ := fixtureManager(t, img, h, "allowed.test")
+	m.ProxyExtraArgs = append(m.ProxyExtraArgs, "-max-logged-denials", "3")
+	s := open(t, m)
+	port := strconv.Itoa(h.port)
+
+	if res := job(t, img, s, "via-proxy", s.ProxyAddr, "allowed.test:"+port); !strings.HasPrefix(res.Stdout, "ALLOWED") {
+		t.Fatalf("the allowed request: %q", res.Stdout)
+	}
+	for i := 0; i < 8; i++ {
+		job(t, img, s, "via-proxy", s.ProxyAddr, fmt.Sprintf("flood%d.test:%s", i, port))
+	}
+	ds, err := s.Decisions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var allowed, itemised, summaries int
+	for _, d := range ds {
+		switch {
+		case d.Allowed && d.Host == "allowed.test":
+			allowed++
+		case d.Reason == ReasonSuppressed:
+			summaries++
+		case !d.Allowed:
+			itemised++
+		}
+	}
+	if allowed != 1 || itemised != 3 || summaries == 0 {
+		t.Errorf("allowed=%d itemised denials=%d summaries=%d, want 1, 3 (the cap) and at least one summary: %+v", allowed, itemised, summaries, ds)
 	}
 }

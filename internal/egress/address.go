@@ -13,8 +13,11 @@ type AddressPolicy interface {
 	Check(addr netip.Addr) error
 }
 
-// PublicOnly is the policy production uses: only globally routable unicast addresses. It
-// refuses loopback, private (RFC 1918 and IPv6 unique-local), link-local (which holds the cloud
+// PublicOnly is the policy production uses: global unicast addresses outside a list of ranges it
+// knows are not the public internet. The list (forbiddenPrefixes, plus Go's own loopback,
+// private, link-local and multicast classes) follows the IANA special-purpose registries as of
+// this writing; it is NOT a proof that every address it allows is globally routable, and a range
+// IANA assigns later is allowed until it is added here. It refuses loopback, private (RFC 1918 and IPv6 unique-local), link-local (which holds the cloud
 // metadata address 169.254.169.254), carrier-grade NAT, multicast, unspecified, documentation,
 // benchmarking, reserved, and IPv6 forms that can wrap an IPv4 address (IPv4-mapped, NAT64,
 // 6to4, Teredo). It has no configuration on purpose: an allowed name must never be a way to the
@@ -38,6 +41,13 @@ var forbiddenPrefixes = mustPrefixes(
 	"2001:db8::/32",   // documentation
 	"2002::/16",       // 6to4: embeds an IPv4 address
 	"::ffff:0:0/96",   // IPv4-mapped (a mapped address is unmapped first; one left is odd)
+	"::ffff:0:0:0/96", // SIIT (RFC 2765): IPv4-translated, wraps an IPv4 address Check cannot unmap
+	"fec0::/10",       // deprecated site-local
+	"192.88.99.0/24",  // deprecated 6to4 relay anycast
+	"2001:2::/48",     // benchmarking
+	"2001:10::/28",    // ORCHID (deprecated)
+	"3fff::/20",       // documentation (RFC 9637)
+	"5f00::/16",       // SRv6 segment identifiers
 )
 
 func mustPrefixes(ss ...string) []netip.Prefix {

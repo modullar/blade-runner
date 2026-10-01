@@ -3,7 +3,6 @@ package egress
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,7 +13,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -46,8 +44,9 @@ func RunProxy(args []string, stdout, stderr io.Writer, extend func(fs *flag.Flag
 	cidr := fs.String("listen-cidr", "", "listen only on this machine's address inside this CIDR (the job network)")
 	port := fs.Int("port", ProxyPort, "port to listen on")
 	ports := fs.String("ports", "443", "comma-separated ports a CONNECT may target")
+	maxDenied := fs.Int("max-logged-denials", DefaultMaxLoggedDenials, "refused requests to itemise in the decision log; later ones are counted in a summary line")
 	var allow listFlag
-	fs.Var(&allow, "allow", "an allowed hostname or *.domain wildcard (repeatable)")
+	fs.Var(&allow, "allow", "an allowed hostname or *.domain wildcard, which matches every depth below domain (repeatable)")
 	var adjust func(*Proxy)
 	if extend != nil {
 		adjust = extend(fs)
@@ -79,13 +78,10 @@ func RunProxy(args []string, stdout, stderr io.Writer, extend func(fs *flag.Flag
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	var mu sync.Mutex
-	enc := json.NewEncoder(stdout)
-	p := &Proxy{Allow: list, Ports: pp, Observe: func(d Decision) {
-		mu.Lock()
-		defer mu.Unlock()
-		_ = enc.Encode(d)
-	}}
+	dlog := NewDecisionLog(stdout)
+	dlog.MaxDenied = *maxDenied
+	defer dlog.Flush()
+	p := &Proxy{Allow: list, Ports: pp, Observe: dlog.Record}
 	if adjust != nil {
 		adjust(p)
 	}

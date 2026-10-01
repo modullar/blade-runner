@@ -28,7 +28,7 @@ func (m *multi) Set(s string) error { *m = append(*m, s); return nil }
 type table map[string][]netip.Addr
 
 func (t table) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
-	if a, ok := t[host]; ok {
+	if a, ok := t[strings.TrimSuffix(host, ".")]; ok { // the proxy asks for absolute names
 		return a, nil
 	}
 	return nil, fmt.Errorf("no such host %s", host)

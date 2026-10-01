@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -32,7 +33,24 @@ const (
 	ReasonForbiddenAddr = "forbidden-address"
 	ReasonConnectFailed = "connect-failed"
 	ReasonTooMany       = "too-many-connections"
+	// ReasonSuppressed marks a summary line from DecisionLog: denials past its itemising cap.
+	ReasonSuppressed = "denials-not-itemised"
 )
+
+// Limits on the text a Decision may carry, so what a client sends cannot make log lines large.
+const (
+	maxLoggedHost   = 64
+	maxLoggedPort   = 8
+	maxLoggedDetail = 200
+)
+
+// clip shortens s to at most n bytes, marking the cut, and keeps it valid UTF-8.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return strings.ToValidUTF8(s[:n-3], "") + "..."
+}
 
 // Decision is the proxy's record of one request. It holds only what a CONNECT carries (a host
 // and a port) and what the proxy did about it: never a payload, never a credential.
@@ -62,16 +80,15 @@ type Proxy struct {
 	Policy   AddressPolicy  // default PublicOnly{}
 	Observe  func(Decision) // called once per request; may be nil
 
-	MaxConns          int           // simultaneous tunnels; default 256
+	MaxConns          int           // simultaneous client connections, tunnelled or not; default 256
 	ResolveTimeout    time.Duration // default 5s
 	DialTimeout       time.Duration // default 10s per address
-	IdleTimeout       time.Duration // a tunnel with no traffic this long is closed; default 2m
+	IdleTimeout       time.Duration // a tunnel, or a kept-alive connection, with no traffic this long is closed; default 2m
 	ReadHeaderTimeout time.Duration // default 10s
 
 	mu     sync.Mutex
 	srv    *http.Server
 	tunnel map[net.Conn]struct{}
-	slots  chan struct{}
 }
 
 func (p *Proxy) ports() []int {
@@ -109,15 +126,18 @@ func (p *Proxy) Serve(l net.Listener) error {
 	if n <= 0 {
 		n = 256
 	}
-	p.slots = make(chan struct{}, n)
 	p.tunnel = map[net.Conn]struct{}{}
 	p.srv = &http.Server{
 		Handler:           http.HandlerFunc(p.handle),
 		ReadHeaderTimeout: dflt(p.ReadHeaderTimeout, 10*time.Second),
+		IdleTimeout:       dflt(p.IdleTimeout, 2*time.Minute), // a kept-alive connection must not hold a slot forever
 		MaxHeaderBytes:    8 << 10,
 	}
 	srv := p.srv
 	p.mu.Unlock()
+	// Every connection counts against the cap from the moment it is accepted, not only those that
+	// become tunnels: a flood of connections that never finish a request is bounded the same way.
+	l = &limitListener{Listener: l, slots: make(chan struct{}, n), refuse: p.refuse}
 	if err := srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -145,6 +165,7 @@ func (p *Proxy) Close() error {
 
 func (p *Proxy) observe(d Decision) {
 	d.Time = time.Now().UTC()
+	d.Host, d.Port, d.Detail = clip(d.Host, maxLoggedHost), clip(d.Port, maxLoggedPort), clip(d.Detail, maxLoggedDetail)
 	if p.Observe != nil {
 		p.Observe(d)
 	}
@@ -198,17 +219,11 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	select {
-	case p.slots <- struct{}{}:
-		defer func() { <-p.slots }()
-	default:
-		d.Reason = ReasonTooMany
-		p.deny(w, d, http.StatusServiceUnavailable)
-		return
-	}
-
 	rctx, cancel := context.WithTimeout(r.Context(), dflt(p.ResolveTimeout, 5*time.Second))
-	addrs, err := p.resolver().LookupNetIP(rctx, "ip", host)
+	// The trailing dot makes the name absolute. Without it the system resolver applies the
+	// resolv.conf search list, so an allowlisted "github.com" could be answered as
+	// "github.com.<search domain>", a name nobody put on the list.
+	addrs, err := p.resolver().LookupNetIP(rctx, "ip", host+".")
 	cancel()
 	if err != nil || len(addrs) == 0 {
 		d.Reason, d.Detail = ReasonUnresolvable, "the name did not resolve"
@@ -277,6 +292,16 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 	go pipe(c, u)
 	<-done
 	<-done
+}
+
+// refuse answers a connection over the cap and closes it. It never blocks the accept loop: the
+// reply is a few bytes into a fresh socket, with a short deadline.
+func (p *Proxy) refuse(c net.Conn) {
+	p.observe(Decision{Client: c.RemoteAddr().String(), Reason: ReasonTooMany, Detail: "the connection cap was reached"})
+	_ = c.SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
+	body := "BR-E083 egress denied: " + ReasonTooMany + "\n"
+	fmt.Fprintf(c, "HTTP/1.1 503 Service Unavailable\r\nX-Egress-Denied: %s\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", ReasonTooMany, len(body), body)
+	_ = c.Close()
 }
 
 func (p *Proxy) portAllowed(port string) bool {
@@ -350,6 +375,49 @@ func (c *idleConn) Write(b []byte) (int, error) {
 }
 
 func (c *idleConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+// limitListener counts every accepted connection against a cap and hands the ones over it to
+// refuse. A slot is released when the connection is closed, which for a tunnel is when the
+// tunnel ends (the HTTP server hands the hijacked connection back unchanged).
+type limitListener struct {
+	net.Listener
+	slots  chan struct{}
+	refuse func(net.Conn)
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case l.slots <- struct{}{}:
+			return &slotConn{Conn: c, release: func() { <-l.slots }}, nil
+		default:
+			l.refuse(c)
+		}
+	}
+}
+
+type slotConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *slotConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
+func (c *slotConn) CloseWrite() error {
 	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
 	}
