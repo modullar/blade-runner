@@ -15,10 +15,14 @@ type inspected struct {
 	State struct {
 		Running bool `json:"Running"`
 	} `json:"State"`
+	Name   string `json:"Name"`
 	Config struct {
-		User   string            `json:"User"`
-		Env    []string          `json:"Env"`
-		Labels map[string]string `json:"Labels"`
+		User       string            `json:"User"`
+		Env        []string          `json:"Env"`
+		Labels     map[string]string `json:"Labels"`
+		Image      string            `json:"Image"`
+		Entrypoint strList           `json:"Entrypoint"`
+		Cmd        strList           `json:"Cmd"`
 	} `json:"Config"`
 	HostConfig struct {
 		Privileged      bool              `json:"Privileged"`
@@ -53,6 +57,32 @@ type inspected struct {
 		Source      string `json:"Source"`
 		Destination string `json:"Destination"`
 	} `json:"Mounts"`
+}
+
+// strList is a JSON array of strings that Docker may also print as one string or null.
+type strList []string
+
+func (l *strList) UnmarshalJSON(b []byte) error {
+	var one string
+	if err := json.Unmarshal(b, &one); err == nil {
+		*l = strList{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(b, &many); err != nil {
+		return err
+	}
+	*l = many
+	return nil
+}
+
+// InspectedID is the container id in `docker inspect` output for one container.
+func InspectedID(inspectJSON []byte) string {
+	var list []inspected
+	if json.Unmarshal(inspectJSON, &list) != nil || len(list) != 1 {
+		return ""
+	}
+	return list[0].ID
 }
 
 // Audit reads `docker inspect` output for ONE container and returns every way it is less
@@ -158,4 +188,24 @@ func AuditError(name string, violations []string) error {
 		fmt.Sprintf("container %s was NOT started: it is not confined as required", name),
 		"Docker applied a different configuration than was asked for:\n    - "+strings.Join(violations, "\n    - "),
 		"update Docker, or report this: Blade Runner will not run a job that is less confined than specified")
+}
+
+// RanAuditError is the refusal for a job that DID run: the audit that repeats while it runs (or
+// once more when it ends) found the network no longer the design. Its result is not to be
+// trusted, and it must not be reported as a job that never started.
+func RanAuditError(name string, violations []string) error {
+	if len(violations) == 0 {
+		return nil
+	}
+	code := diag.CodeIsolation
+	for _, x := range violations {
+		if strings.HasPrefix(x, egressPrefix) {
+			code = diag.CodeEgressSetup
+			break
+		}
+	}
+	return diag.New(code,
+		fmt.Sprintf("container %s RAN, but its network was not as required while it ran: its result is not to be trusted", name),
+		"the egress topology was checked again while the job ran and when it ended:\n    - "+strings.Join(violations, "\n    - "),
+		"discard the result and run the job again; if this repeats, something else on this machine is changing Docker's networks, or report it")
 }

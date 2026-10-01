@@ -3,6 +3,8 @@ package egress
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,9 +27,20 @@ const (
 	labelOut     = "out"
 	labelID      = isolation.LabelEgressID
 
+	// LabelOwner records which Manager owner started a session; Sweep removes only its own.
+	LabelOwner = "bladerunner.egress.owner"
+	// labelOpen is unique per Open call. It is how a failed Open finds what ITS create calls
+	// made even when the CLI never reported an id (cancelled, killed), without being able to
+	// match another session that merely has the same session id.
+	labelOpen = "bladerunner.egress.open"
+
+	// DefaultOwner is the owner of a Manager that sets none. Two supervisors that share one
+	// Docker daemon must each set their own, or one's Sweep removes the other's live sessions.
+	DefaultOwner = "default"
+
 	// OutNetwork is the one shared, ordinary bridge network the proxies reach the outside
 	// through. Jobs are never attached to it.
-	OutNetwork = "br-egress-out"
+	OutNetwork = isolation.EgressOutNetwork
 
 	// ProxyPort is the port every proxy listens on, on its internal address only.
 	ProxyPort = 3128
@@ -55,6 +68,35 @@ type Manager struct {
 
 	// StartTimeout bounds how long Open waits for the proxy to accept connections; default 20s.
 	StartTimeout time.Duration
+
+	// Owner names whoever runs this Manager (the supervisor's runner name, say). Sessions carry
+	// it as a label and Sweep removes only sessions with the same value, so one supervisor's
+	// start-up sweep cannot tear down another's live sessions on a shared daemon. Default
+	// DefaultOwner.
+	Owner string
+
+	// ProxyStopGrace is how long Close lets the proxy run after SIGTERM, so it can write its
+	// pending log lines, before the container is removed. Default 5s.
+	ProxyStopGrace time.Duration
+}
+
+func (m *Manager) owner() string {
+	if m.Owner == "" {
+		return DefaultOwner
+	}
+	return m.Owner
+}
+
+func (m *Manager) stopGrace() time.Duration {
+	if m.ProxyStopGrace <= 0 {
+		return 5 * time.Second
+	}
+	return m.ProxyStopGrace
+}
+
+// ownerFilter selects the sessions of this Manager's owner.
+func (m *Manager) ownerFilter() []string {
+	return []string{"--filter", "label=" + LabelKey + "=" + labelSession, "--filter", "label=" + LabelOwner + "=" + m.owner()}
 }
 
 // Session is one job's egress topology: its internal network and its proxy.
@@ -69,6 +111,11 @@ type Session struct {
 	// What THIS Open call created, by Docker's id. A failed Open removes only these: a name
 	// collision with another session's proxy or network must never remove that session's.
 	netRef, proxyRef string
+	token            string // this Open call's labelOpen value
+
+	// What Open built the proxy from: the audit requires the running proxy to match exactly.
+	proxyImage                string
+	proxyEntrypoint, proxyCmd []string
 
 	claimed atomic.Bool // Apply has handed this session to a job
 }
@@ -114,12 +161,17 @@ func (m *Manager) Open(ctx context.Context, id string) (s *Session, err error) {
 		return nil, setupErr(err, "the egress proxy image is not usable", "it must be pinned by content (name@sha256:... or sha256:...)", "build the proxy image and pass its digest")
 	}
 
-	s = &Session{ID: id, Network: "br-egress-" + id + "-net", ProxyContainer: "br-egress-" + id + "-proxy", m: m}
+	var tok [8]byte
+	if _, rerr := rand.Read(tok[:]); rerr != nil {
+		return nil, setupErr(rerr, "cannot make a session token", "the system's random source failed", "report this")
+	}
+	s = &Session{ID: id, Network: "br-egress-" + id + "-net", ProxyContainer: "br-egress-" + id + "-proxy", m: m, token: hex.EncodeToString(tok[:])}
 	defer func() {
 		if err != nil {
 			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			_ = s.Close(cctx) // removes only what the refs below record
+			_ = s.Close(cctx)   // removes what the refs below record
+			_ = s.reclaim(cctx) // and what a create call made without ever reporting an id
 			s = nil
 		}
 	}()
@@ -131,7 +183,7 @@ func (m *Manager) Open(ctx context.Context, id string) (s *Session, err error) {
 	// plain --internal lacks: there the host's bridge address stays reachable from the job.
 	netRes, err := m.docker(ctx, "network", "create", "--internal", "--driver", "bridge",
 		"--opt", isolation.OptInhibitIPv4+"=true",
-		"--label", LabelKey+"="+labelSession, "--label", labelID+"="+id, s.Network)
+		"--label", LabelKey+"="+labelSession, "--label", labelID+"="+id, "--label", LabelOwner+"="+m.owner(), "--label", labelOpen+"="+s.token, s.Network)
 	if err != nil {
 		return s, setupErr(err, "cannot create the job's internal network", "Docker refused (is the id already in use, or are Docker's address pools exhausted?)", "check `docker network ls`; a crash can leave networks behind, the next start removes them")
 	}
@@ -141,19 +193,20 @@ func (m *Manager) Open(ctx context.Context, id string) (s *Session, err error) {
 		return s, err
 	}
 
-	args := []string{"create", "--name", s.ProxyContainer, "--network", s.Network,
+	cmd := []string{"-listen-cidr", subnet.String(), "-port", strconv.Itoa(ProxyPort), "-ports", strings.Join(portArgs, ",")}
+	for _, e := range m.Allow.Entries() {
+		cmd = append(cmd, "-allow", e)
+	}
+	cmd = append(cmd, m.ProxyExtraArgs...)
+	s.proxyImage, s.proxyEntrypoint, s.proxyCmd = m.ProxyImage, []string{m.entrypoint()}, cmd // what the audit holds the running proxy to
+	args := append([]string{"create", "--name", s.ProxyContainer, "--network", s.Network,
 		"--entrypoint", m.entrypoint(),
 		"--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "65534:65534",
 		"--pids-limit", "128", "--memory", "128m", "--memory-swap", "128m", "--cpus", "1",
 		"--restart", "no", "--log-driver", "local", "--log-opt", "max-size=1m", "--log-opt", "max-file=2",
 		"--label", LabelKey + "=" + labelSession, "--label", labelID + "=" + id,
-		m.ProxyImage,
-		"-listen-cidr", subnet.String(), "-port", strconv.Itoa(ProxyPort), "-ports", strings.Join(portArgs, ","),
-	}
-	for _, e := range m.Allow.Entries() {
-		args = append(args, "-allow", e)
-	}
-	args = append(args, m.ProxyExtraArgs...)
+		"--label", LabelOwner + "=" + m.owner(), "--label", labelOpen + "=" + s.token,
+		m.ProxyImage}, cmd...)
 	proxyRes, err := m.docker(ctx, args...)
 	if err != nil {
 		return s, setupErr(err, "cannot create the egress proxy container", "the proxy image is missing, the name is taken, or Docker refused", "check `docker images` and `docker ps -a`")
@@ -308,40 +361,123 @@ func (s *Session) Apply(spec *isolation.Spec) error {
 	if !s.claimed.CompareAndSwap(false, true) {
 		spec.Network = isolation.NetworkAllowlist
 		spec.EgressNetwork, spec.EgressProxy, spec.EgressProxyContainer = "", "", ""
+		spec.EgressProxyImage, spec.EgressProxyEntrypoint, spec.EgressProxyCmd = "", nil, nil
 		return ErrSessionInUse
 	}
 	spec.Network = isolation.NetworkAllowlist
 	spec.EgressNetwork = s.Network
 	spec.EgressProxy = s.ProxyAddr
 	spec.EgressProxyContainer = s.ProxyContainer
+	spec.EgressProxyImage = s.proxyImage
+	spec.EgressProxyEntrypoint = append([]string(nil), s.proxyEntrypoint...)
+	spec.EgressProxyCmd = append([]string(nil), s.proxyCmd...)
 	return nil
 }
 
 // Decisions reads back what the proxy decided, oldest first. It is the record of what a job
 // asked for and what it was refused.
+//
+// The proxy batches some of what it writes (summaries of refusals, aggregates of repeated
+// allowed tunnels), so before reading it is asked to flush (SIGUSR1) and the read waits for the
+// proxy's acknowledgement marker. A proxy that is already gone is simply read as it is.
 func (s *Session) Decisions(ctx context.Context) ([]Decision, error) {
 	res, err := s.m.docker(ctx, "logs", s.ProxyContainer)
 	if err != nil {
 		return nil, setupErr(err, "cannot read the proxy's log", "the proxy is gone", "the session was closed")
 	}
-	var out []Decision
-	sc := bufio.NewScanner(strings.NewReader(res.Stdout + res.Stderr))
-	sc.Buffer(make([]byte, 64<<10), 1<<20)
-	for sc.Scan() {
-		var d Decision
-		if json.Unmarshal(sc.Bytes(), &d) == nil && d.Reason != "" {
+	all := parseDecisionLines(res.Stdout + res.Stderr)
+	seen := flushMarker(all)
+	if _, err := s.m.docker(ctx, "kill", "--signal", "USR1", s.ProxyContainer); err == nil {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if r, err := s.m.docker(ctx, "logs", s.ProxyContainer); err == nil {
+				all = parseDecisionLines(r.Stdout + r.Stderr)
+				if flushMarker(all) > seen {
+					break
+				}
+			}
+			select {
+			case <-ctx.Done():
+				deadline = time.Time{}
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}
+	out := all[:0:0]
+	for _, d := range all {
+		if d.Reason != ReasonFlushed {
 			out = append(out, d)
 		}
 	}
-	return out, sc.Err()
+	return out, nil
+}
+
+// flushMarker is the highest flush count the log acknowledges.
+func flushMarker(ds []Decision) int {
+	n := 0
+	for _, d := range ds {
+		if d.Reason == ReasonFlushed && d.Count > n {
+			n = d.Count
+		}
+	}
+	return n
+}
+
+// maxDecisionLine is the longest log line Decisions parses. The proxy clips what it writes, so
+// a longer line is not one of its records (or is a record cut by log rotation): it is skipped.
+const maxDecisionLine = 64 << 10
+
+// parseDecisionLines reads the proxy's log text. A line that is too long, not JSON, or not a
+// decision is skipped; it never stops the lines after it from being read.
+func parseDecisionLines(text string) []Decision {
+	var out []Decision
+	r := bufio.NewReaderSize(strings.NewReader(text), 4<<10)
+	for {
+		line, err := readLine(r, maxDecisionLine)
+		if len(line) > 0 {
+			var d Decision
+			if json.Unmarshal(line, &d) == nil && d.Reason != "" {
+				out = append(out, d)
+			}
+		}
+		if err != nil {
+			return out
+		}
+	}
+}
+
+// readLine returns the next line without its newline, or nil for a line longer than max (which
+// it consumes to the newline so the next call starts on the following line).
+func readLine(r *bufio.Reader, max int) ([]byte, error) {
+	var buf []byte
+	tooLong := false
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if !tooLong {
+			buf = append(buf, chunk...)
+			if len(buf) > max {
+				buf, tooLong = nil, true
+			}
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if tooLong {
+			return nil, err
+		}
+		return []byte(strings.TrimRight(string(buf), "\r\n")), err
+	}
 }
 
 // Close removes the proxy and the network this session created. It is idempotent and tolerates a
 // half-built session: what Open never created (a name that was already taken, a step it did not
-// reach) is left alone.
+// reach) is left alone. The proxy is stopped first, with a grace period, so that it writes the
+// log lines it still holds before the container (and its log) is removed.
 func (s *Session) Close(ctx context.Context) error {
 	var firstErr error
 	if s.proxyRef != "" {
+		grace := s.m.stopGrace()
+		_, _ = s.m.docker(ctx, "stop", "--time", strconv.Itoa(int((grace+time.Second-1)/time.Second)), s.proxyRef) // best effort: rm -f below is the guarantee
 		if _, err := s.m.docker(ctx, "rm", "-f", "-v", s.proxyRef); err != nil && !notFound(err) {
 			firstErr = err
 		}
@@ -357,36 +493,73 @@ func (s *Session) Close(ctx context.Context) error {
 	return nil
 }
 
+// reclaim removes what this Open call's create commands made but never reported an id for (the
+// context was cancelled, or the CLI was killed, after the daemon had done the work). They are
+// found by this call's own token label together with the session label and id, so another
+// session, even one with the same id, is never matched.
+func (s *Session) reclaim(ctx context.Context) error {
+	var errs []error
+	sel := []string{"--filter", "label=" + LabelKey + "=" + labelSession, "--filter", "label=" + labelID + "=" + s.ID, "--filter", "label=" + labelOpen + "=" + s.token}
+	if cs, err := s.m.docker(ctx, append([]string{"ps", "-aq"}, sel...)...); err != nil {
+		errs = append(errs, err)
+	} else {
+		for _, id := range strings.Fields(cs.Stdout) {
+			if _, err := s.m.docker(ctx, "rm", "-f", "-v", id); err != nil && !notFound(err) {
+				errs = append(errs, err)
+			}
+		}
+	}
+	if ns, err := s.m.docker(ctx, append([]string{"network", "ls", "-q"}, sel...)...); err != nil {
+		errs = append(errs, err)
+	} else {
+		for _, id := range strings.Fields(ns.Stdout) {
+			if _, err := s.m.docker(ctx, "network", "rm", id); err != nil && !notFound(err) {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func notFound(err error) bool {
 	m := strings.ToLower(err.Error())
 	return strings.Contains(m, "no such") || strings.Contains(m, "not found")
 }
 
-// Sweep removes every proxy and network a crashed run left behind. The shared outbound network
-// stays: it is cheap, and another job may be using it.
+// Sweep removes every proxy and network this Manager's owner left behind (a crash's leftovers),
+// and returns how many it removed. Sessions of another owner are not touched, so a supervisor's
+// start-up sweep cannot remove a neighbour's live sessions. It carries on past a failure and
+// reports every one, joined: a proxy that will not go must not keep the others in place. The
+// shared outbound network stays: it is cheap, and another job may be using it.
 func (m *Manager) Sweep(ctx context.Context) (int, error) {
-	filter := "label=" + LabelKey + "=" + labelSession
 	n := 0
-	cs, err := m.docker(ctx, "ps", "-aq", "--filter", filter)
+	var errs []error
+	cs, err := m.docker(ctx, append([]string{"ps", "-aq"}, m.ownerFilter()...)...)
 	if err != nil {
-		return 0, setupErr(err, "cannot list stale egress proxies", "Docker is not answering", "check Docker")
-	}
-	if ids := strings.Fields(cs.Stdout); len(ids) > 0 {
-		if _, err := m.docker(ctx, append([]string{"rm", "-f", "-v"}, ids...)...); err != nil {
-			return 0, setupErr(err, "cannot remove stale egress proxies", "Docker refused", "run `docker rm -f` on them by hand")
-		} else {
-			n += len(ids)
+		errs = append(errs, fmt.Errorf("cannot list stale egress proxies: %w", err))
+	} else {
+		for _, id := range strings.Fields(cs.Stdout) {
+			if _, err := m.docker(ctx, "rm", "-f", "-v", id); err != nil && !notFound(err) {
+				errs = append(errs, fmt.Errorf("cannot remove stale egress proxy %s: %w", id, err))
+			} else {
+				n++
+			}
 		}
 	}
-	ns, err := m.docker(ctx, "network", "ls", "-q", "--filter", filter)
+	ns, err := m.docker(ctx, append([]string{"network", "ls", "-q"}, m.ownerFilter()...)...)
 	if err != nil {
-		return 0, setupErr(err, "cannot list stale egress networks", "Docker is not answering", "check Docker")
-	}
-	for _, id := range strings.Fields(ns.Stdout) {
-		if _, err := m.docker(ctx, "network", "rm", id); err != nil {
-			return n, setupErr(err, "cannot remove a stale egress network", "a container is still attached", "run `docker network rm "+id+"` after removing it")
+		errs = append(errs, fmt.Errorf("cannot list stale egress networks: %w", err))
+	} else {
+		for _, id := range strings.Fields(ns.Stdout) {
+			if _, err := m.docker(ctx, "network", "rm", id); err != nil && !notFound(err) {
+				errs = append(errs, fmt.Errorf("cannot remove stale egress network %s: %w", id, err))
+			} else {
+				n++
+			}
 		}
-		n++
+	}
+	if len(errs) > 0 {
+		return n, setupErr(errors.Join(errs...), "cannot remove every stale egress object", "Docker is not answering, refused, or something is still attached", "run `docker rm -f` and `docker network rm` on what is listed above")
 	}
 	return n, nil
 }

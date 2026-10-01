@@ -963,18 +963,112 @@ func TestRealDocker_ADenialFloodIsCountedNotItemisedAndTheAllowedRecordSurvives(
 	if err != nil {
 		t.Fatal(err)
 	}
-	var allowed, itemised, summaries int
+	var allowed, itemised, lastSummary int
 	for _, d := range ds {
 		switch {
 		case d.Allowed && d.Host == "allowed.test":
 			allowed++
 		case d.Reason == ReasonSuppressed:
-			summaries++
-		case !d.Allowed:
+			lastSummary = d.Count
+		case d.Reason == ReasonNotAllowlist:
 			itemised++
 		}
 	}
-	if allowed != 1 || itemised != 3 || summaries == 0 {
-		t.Errorf("allowed=%d itemised denials=%d summaries=%d, want 1, 3 (the cap) and at least one summary: %+v", allowed, itemised, summaries, ds)
+	// The budget is per reason (the readiness probe's own "method" refusal does not use it up),
+	// and Decisions asked the proxy to flush first: the newest summary carries the FINAL count,
+	// not the count at the moment the first summary was written.
+	if allowed != 1 || itemised != 3 || lastSummary != 5 {
+		t.Errorf("allowed=%d itemised not-allowlisted=%d final summary count=%d, want 1, 3 (the budget) and 5 (8 refused - 3 itemised): %+v", allowed, itemised, lastSummary, ds)
+	}
+}
+
+// ---- the namespace blind spot ----------------------------------------------------------------
+
+func TestRealDocker_AContainerSharingTheProxysNetworkStackRefusesTheJob(t *testing.T) {
+	img := needDocker(t)
+	h := newHostService(t)
+	m, _ := fixtureManager(t, img, h, "allowed.test")
+	s := open(t, m)
+
+	// Created, not started, and attached to no network of its own: `docker network inspect` and
+	// `docker ps --filter network=` show nothing, yet once started it sits inside the proxy's
+	// network namespace, on both the job's side and the outbound side.
+	sneaky := uniq("br-ens-")
+	dockerCLI(t, "create", "--name", sneaky, "--network", "container:"+s.ProxyContainer, "--entrypoint", "/probe", img, "sleep")
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", sneaky).Run() })
+	if out := dockerCLI(t, "ps", "-a", "--filter", "network="+s.Network, "--format", "{{.Names}}"); strings.Contains(out, sneaky) {
+		t.Skip("this Docker lists container-mode containers by network; the blind spot is not present to test")
+	}
+
+	res, err := runJob(img, s, jobs, "routes")
+	if diag.CodeOf(err) != diag.CodeEgressSetup || !strings.Contains(err.Error(), sneaky+" shares the network stack of the proxy") {
+		t.Fatalf("err = %v, want a BR-E082 refusal naming %s", err, sneaky)
+	}
+	if res.Stdout != "" {
+		t.Errorf("the job ran: %q", res.Stdout)
+	}
+}
+
+// watchedRun starts a sleeping job with a fast re-audit and waits until it is running. The
+// returned channel yields Run's outcome.
+func watchedRun(t *testing.T, img string, s *Session) (spec isolation.Spec, done chan error) {
+	t.Helper()
+	d := &isolation.Docker{Exec: execx.OS{}, RecheckEvery: 100 * time.Millisecond}
+	spec = isolation.Spec{Name: uniq("br-egw-"), Image: img, Args: []string{"sleep"}, Timeout: 90 * time.Second, MemoryMiB: 128, PidsLimit: 64, WorkTmpfsMiB: 16}
+	applyAgain(s, &spec)
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", spec.Name).Run() }) // unblocks Run if the watch fails
+	done = make(chan error, 1)
+	go func() { _, err := d.Run(ctx, spec); done <- err }()
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		out, _ := exec.Command("docker", "ps", "-q", "--filter", "name=^"+spec.Name+"$", "--filter", "status=running").Output()
+		if strings.TrimSpace(string(out)) != "" {
+			return spec, done
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the job never started")
+		}
+	}
+}
+
+func TestRealDocker_AContainerThatJoinsTheJobsStackWhileItRunsStopsTheJob(t *testing.T) {
+	img := needDocker(t)
+	h := newHostService(t)
+	m, _ := fixtureManager(t, img, h, "allowed.test")
+	s := open(t, m)
+	spec, done := watchedRun(t, img, s)
+
+	sneaky := uniq("br-enj-")
+	dockerCLI(t, "create", "--name", sneaky, "--network", "container:"+spec.Name, "--entrypoint", "/probe", img, "sleep")
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", sneaky).Run() })
+
+	select {
+	case err := <-done:
+		if diag.CodeOf(err) != diag.CodeEgressSetup || !strings.Contains(err.Error(), sneaky+" shares the network stack of the job") || strings.Contains(err.Error(), "NOT started") {
+			t.Fatalf("err = %v, want a BR-E082 refusal (the job RAN) naming %s", err, sneaky)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the job kept running although a container joined its network namespace")
+	}
+}
+
+func TestRealDocker_AThirdNetworkOnTheProxyWhileTheJobRunsStopsTheJob(t *testing.T) {
+	img := needDocker(t)
+	h := newHostService(t)
+	m, _ := fixtureManager(t, img, h, "allowed.test")
+	s := open(t, m)
+	_, done := watchedRun(t, img, s)
+
+	extra := uniq("br-ex3-")
+	dockerCLI(t, "network", "create", extra)
+	t.Cleanup(func() { _ = exec.Command("docker", "network", "rm", extra).Run() })
+	dockerCLI(t, "network", "connect", extra, s.ProxyContainer)
+
+	select {
+	case err := <-done:
+		if diag.CodeOf(err) != diag.CodeEgressSetup || !strings.Contains(err.Error(), "not exactly") {
+			t.Fatalf("err = %v, want a BR-E082 refusal about the proxy's networks", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the job kept running although the proxy gained a third network")
 	}
 }

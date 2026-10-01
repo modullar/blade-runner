@@ -80,13 +80,31 @@ func RunProxy(args []string, stdout, stderr io.Writer, extend func(fs *flag.Flag
 	}
 	dlog := NewDecisionLog(stdout)
 	dlog.MaxDenied = *maxDenied
-	defer dlog.Flush()
+	defer dlog.Flush() // SIGTERM ends Serve, and the return path writes what is pending
 	p := &Proxy{Allow: list, Ports: pp, Observe: dlog.Record}
 	if adjust != nil {
 		adjust(p)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
+	go dlog.Run(ctx) // a quiet proxy's log must not stay stale: summaries and aggregates are timed
+	if sigs := flushSignals(); len(sigs) > 0 {
+		// A flush request (docker kill -s USR1): write everything pending, then say so, so the
+		// reader can tell when the log is current.
+		fc := make(chan os.Signal, 1)
+		signal.Notify(fc, sigs...)
+		defer signal.Stop(fc)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-fc:
+					dlog.Ack()
+				}
+			}
+		}()
+	}
 	go func() { <-ctx.Done(); _ = p.Close() }()
 	fmt.Fprintf(stderr, "egress-proxy listening on %s\n", l.Addr())
 	if err := p.Serve(l); err != nil {

@@ -20,6 +20,10 @@ const (
 	EgressRoleSession = "session" // the value of LabelEgress on a session's proxy and network
 )
 
+// EgressOutNetwork is the shared bridge the proxies reach the outside through (egress.OutNetwork).
+// A proxy is attached to exactly this and its session's internal network.
+const EgressOutNetwork = "br-egress-out"
+
 // OptInhibitIPv4 is the bridge option that gives the host no address on the network. Without it
 // an internal network still lets its containers reach the host through the bridge's own address
 // (observed on Docker 29.3.1, see docs/decisions/0008-egress.md).
@@ -240,5 +244,110 @@ func AuditProxy(proxyInspect, networkInspect []byte, want Spec) ([]string, error
 	for _, x := range hv {
 		add("is not hardened: %s", x)
 	}
+	// Exactly the session's network and the outbound one. A third network is a second way for
+	// the proxy to reach somewhere, and is re-read on every pass while the job runs.
+	got := make([]string, 0, len(p.NetworkSettings.Networks))
+	for name := range p.NetworkSettings.Networks {
+		got = append(got, name)
+	}
+	sort.Strings(got)
+	if _, ok := p.NetworkSettings.Networks[want.EgressNetwork]; !ok || len(got) != 2 || !contains(got, EgressOutNetwork) {
+		add("is attached to networks %v, not exactly %s and %s", got, want.EgressNetwork, EgressOutNetwork)
+	}
+	if want.EgressProxyImage != "" && p.Config.Image != want.EgressProxyImage {
+		add("runs image %q, not the %q the egress manager built it from", p.Config.Image, want.EgressProxyImage)
+	}
+	if want.EgressProxyImage != "" && !equalStrings(p.Config.Entrypoint, want.EgressProxyEntrypoint) {
+		add("has entrypoint %q, not %q", []string(p.Config.Entrypoint), want.EgressProxyEntrypoint)
+	}
+	if want.EgressProxyImage != "" && !equalStrings(p.Config.Cmd, want.EgressProxyCmd) {
+		add("has command %q, not %q", []string(p.Config.Cmd), want.EgressProxyCmd)
+	}
 	return v, nil
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// NamespaceFormat is the `docker inspect --format` that prints a container as the namespace audit
+// reads it: id, name, network mode and labels, separated by "|".
+const NamespaceFormat = `{{.Id}}|{{.Name}}|{{.HostConfig.NetworkMode}}|{{json .Config.Labels}}`
+
+// PSNamespaceFormat is the `docker ps -a --no-trunc --format` the candidates are picked from.
+const PSNamespaceFormat = `{{.ID}}|{{.Names}}|{{.Networks}}|{{.Labels}}`
+
+// NamespaceCandidates picks, from `docker ps -a --no-trunc --format PSNamespaceFormat` output,
+// the ids whose network mode must be read: containers that show no network at all (what ps
+// prints for one that shares another's stack, which is why network inspect and
+// `ps --filter network=` cannot see it) and those carrying a Blade Runner label.
+func NamespaceCandidates(psOut string) []string {
+	var ids []string
+	for _, line := range strings.Split(psOut, "\n") {
+		f := strings.SplitN(strings.TrimSpace(line), "|", 4)
+		if len(f) < 4 || f[0] == "" {
+			continue
+		}
+		if f[2] == "" || strings.Contains(f[3], "bladerunner.") {
+			ids = append(ids, f[0])
+		}
+	}
+	return ids
+}
+
+// AuditNamespaceSharing reads the network mode of the containers NamespaceCandidates chose
+// (`docker inspect --format NamespaceFormat`, one line each) and reports every one that shares
+// the proxy's or the job's network namespace (`--network container:<proxy or job>`): such a
+// container sits on the job's internal network, or on the proxy's outbound side, without being
+// listed as attached to any network. A Blade Runner container that joins ANY other container's
+// stack is reported too. The job and the proxy themselves are not judged here.
+func AuditNamespaceSharing(inspectOut string, want Spec, jobID, proxyID string) []string {
+	var v []string
+	for _, line := range strings.Split(inspectOut, "\n") {
+		f := strings.SplitN(strings.TrimSpace(line), "|", 4)
+		if len(f) < 3 || f[0] == "" {
+			continue
+		}
+		id, name, mode := f[0], strings.TrimPrefix(f[1], "/"), f[2]
+		if name == want.Name || name == want.EgressProxyContainer || (jobID != "" && id == jobID) || (proxyID != "" && id == proxyID) {
+			continue
+		}
+		labelled := len(f) == 4 && strings.Contains(f[3], "bladerunner.")
+		ref, shares := strings.CutPrefix(mode, "container:")
+		if !shares {
+			continue
+		}
+		target := ""
+		switch {
+		case refersTo(ref, want.Name, jobID):
+			target = "the job " + want.Name
+		case refersTo(ref, want.EgressProxyContainer, proxyID):
+			target = "the proxy " + want.EgressProxyContainer
+		}
+		switch {
+		case target != "":
+			v = append(v, egressPrefix+fmt.Sprintf("container %s shares the network stack of %s (network mode %q): it is invisible to the network's member list but is on the job's side of the proxy", name, target, mode))
+		case labelled:
+			v = append(v, egressPrefix+fmt.Sprintf("Blade Runner container %s joins another container's network stack (network mode %q)", name, mode))
+		}
+	}
+	return v
+}
+
+// refersTo reports whether a container:<ref> reference names the container with this name and id
+// (by name, by full id, or by a unique-looking id prefix).
+func refersTo(ref, name, id string) bool {
+	ref = strings.TrimPrefix(ref, "/")
+	if ref == "" {
+		return false
+	}
+	return ref == name || (id != "" && (ref == id || (len(ref) >= 4 && strings.HasPrefix(id, ref))))
 }

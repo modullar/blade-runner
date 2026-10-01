@@ -42,6 +42,10 @@ type Docker struct {
 	// 500ms). A container created on the network after the pre-start audit is caught by the
 	// next check, and the job is killed.
 	RecheckEvery time.Duration
+
+	// KillRetryEvery is the first pause between attempts to kill a job container that is still
+	// running (doubling, capped at 2s; at most 10 attempts). Default 100ms.
+	KillRetryEvery time.Duration
 }
 
 func (d *Docker) bin() string {
@@ -208,11 +212,13 @@ func (d *Docker) Run(ctx context.Context, spec Spec) (Result, error) {
 	if err != nil {
 		return Result{}, diag.Wrap(err, diag.CodeIsolation, "cannot audit the container", "an unexpected Docker version", "update Docker")
 	}
+	jobID := ""
 	if s.Network == NetworkAllowlist {
 		// The container's own record says which network it joined; the network's record says
 		// whether that network is what the design needs; the proxy's record says whether the
 		// neighbour is the proxy; the container list says who else is attached. All must hold.
-		nv, err := d.auditEgress(ctx, s)
+		jobID = InspectedID([]byte(ins.Stdout))
+		nv, err := d.auditEgress(ctx, s, jobID)
 		if err != nil {
 			return Result{}, err
 		}
@@ -227,7 +233,7 @@ func (d *Docker) Run(ctx context.Context, spec Spec) (Result, error) {
 	var out, errOut cappedBuffer
 	var watch *egressWatch
 	if s.Network == NetworkAllowlist {
-		watch = d.watchEgress(s)
+		watch = d.watchEgress(s, jobID)
 	}
 	_, runErr := d.Exec.Run(runCtx, execx.Cmd{Name: d.bin(), Args: []string{"start", "-a", "-i", s.Name}, Stdin: s.Stdin, Stdout: &out, Stderr: &errOut})
 
@@ -238,9 +244,7 @@ func (d *Docker) Run(ctx context.Context, spec Spec) (Result, error) {
 	res := Result{Stdout: out.String(), Stderr: errOut.String()}
 	if runCtx.Err() != nil { // the timeout (or the caller) cut the job off: stop the container itself
 		res.TimedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
-		kctx, kcancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer kcancel()
-		_, _ = d.docker(kctx, "", "kill", s.Name)
+		d.killUntilGone(s.Name)
 	}
 	var ee *execx.ExitError
 	switch {
@@ -263,16 +267,17 @@ func (d *Docker) Run(ctx context.Context, spec Spec) (Result, error) {
 		}
 	}
 	if len(watchViolations) > 0 { // the job ran on a network that stopped being the design's: its result is not to be trusted
-		return res, AuditError(s.Name, watchViolations)
+		return res, RanAuditError(s.Name, watchViolations)
 	}
 	return res, nil
 }
 
 // auditEgress reads the egress network, its attached containers (including ones that are only
 // created) and the proxy back from Docker and returns every way they are not the design.
-func (d *Docker) auditEgress(ctx context.Context, s Spec) ([]string, error) {
+func (d *Docker) auditEgress(ctx context.Context, s Spec, jobID string) ([]string, error) {
+	// A failure to READ the topology is an egress failure (BR-E082), not a hardening one.
 	fail := func(err error, what, cause, fix string) ([]string, error) {
-		return nil, diag.Wrap(err, diag.CodeIsolation, what, cause, fix)
+		return nil, diag.Wrap(err, diag.CodeEgressSetup, what, cause, fix)
 	}
 	nw, err := d.docker(ctx, "", "network", "inspect", s.EgressNetwork)
 	if err != nil {
@@ -295,7 +300,63 @@ func (d *Docker) auditEgress(ctx context.Context, s Spec) ([]string, error) {
 	if err != nil {
 		return fail(err, "cannot audit the egress proxy", "an unexpected Docker version", "update Docker")
 	}
-	return append(v, pv...), nil
+	v = append(v, pv...)
+	// A container that joined the proxy's or the job's network stack (--network container:...)
+	// is attached to no network of its own, so none of the lists above can see it.
+	nsv, err := d.auditNamespaces(ctx, s, jobID, InspectedID([]byte(px.Stdout)))
+	if err != nil {
+		return fail(err, "cannot check which containers share the job's or the proxy's network stack", "Docker stopped answering", "check Docker")
+	}
+	return append(v, nsv...), nil
+}
+
+// auditNamespaces finds containers that share the proxy's or job's network namespace.
+func (d *Docker) auditNamespaces(ctx context.Context, s Spec, jobID, proxyID string) ([]string, error) {
+	ps, err := d.docker(ctx, "", "ps", "-a", "--no-trunc", "--format", PSNamespaceFormat)
+	if err != nil {
+		return nil, err
+	}
+	ids := NamespaceCandidates(ps.Stdout)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	in, err := d.docker(ctx, "", append([]string{"inspect", "--format", NamespaceFormat}, ids...)...)
+	if err != nil && !inspectGone(err) { // a container removed between the two commands is no finding
+		return nil, err
+	}
+	return AuditNamespaceSharing(in.Stdout, s, jobID, proxyID), nil
+}
+
+func inspectGone(err error) bool {
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "no such") || strings.Contains(m, "not found")
+}
+
+// killUntilGone kills the container and checks that it is really not running, and tries again
+// (with a growing pause, at most 10 times) until it is: a single `docker kill` that fails
+// because the daemon was busy must not leave a job running on a network that stopped being the
+// design. It does not depend on any caller's context.
+func (d *Docker) killUntilGone(name string) {
+	pause := d.KillRetryEvery
+	if pause <= 0 {
+		pause = 100 * time.Millisecond
+	}
+	for attempt := 0; attempt < 10; attempt++ {
+		kctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		_, _ = d.docker(kctx, "", "kill", name)
+		st, err := d.docker(kctx, "", "inspect", "--format", "{{.State.Running}}", name)
+		cancel()
+		if err != nil && inspectGone(err) {
+			return
+		}
+		if err == nil && strings.TrimSpace(st.Stdout) == "false" {
+			return
+		}
+		time.Sleep(pause)
+		if pause *= 2; pause > 2*time.Second {
+			pause = 2 * time.Second
+		}
+	}
 }
 
 // egressWatch re-audits the egress topology while a job runs, and kills the job the moment it
@@ -305,14 +366,22 @@ type egressWatch struct {
 	done   chan struct{}
 	d      *Docker
 	s      Spec
+	jobID  string
+
+	readFails int // consecutive audits that could not be READ; touched by one goroutine at a time
 
 	mu         sync.Mutex
 	violations []string
 }
 
-func (d *Docker) watchEgress(s Spec) *egressWatch {
+// readFailuresTolerated is how many audits in a row may fail to READ the topology (a docker
+// command erred) before that counts as a violation. One is a hiccup; two in a row is not
+// knowing, and not knowing is not a pass. A violation that was actually READ is never tolerated.
+const readFailuresTolerated = 1
+
+func (d *Docker) watchEgress(s Spec, jobID string) *egressWatch {
 	ctx, cancel := context.WithCancel(context.Background())
-	w := &egressWatch{cancel: cancel, done: make(chan struct{}), d: d, s: s}
+	w := &egressWatch{cancel: cancel, done: make(chan struct{}), d: d, s: s, jobID: jobID}
 	every := d.RecheckEvery
 	if every <= 0 {
 		every = 500 * time.Millisecond
@@ -327,9 +396,7 @@ func (d *Docker) watchEgress(s Spec) *egressWatch {
 				return
 			case <-t.C:
 				if w.check(ctx) {
-					kctx, kcancel := context.WithTimeout(context.Background(), 30*time.Second)
-					_, _ = d.docker(kctx, "", "kill", s.Name)
-					kcancel()
+					d.killUntilGone(s.Name)
 					return
 				}
 			}
@@ -339,16 +406,22 @@ func (d *Docker) watchEgress(s Spec) *egressWatch {
 }
 
 // check audits once and records what it found; it reports whether the job must be stopped. A
-// topology that cannot be read is treated as a violation: not knowing is not a pass.
+// violation that was read stops the job at once. A topology that could not be read stops it only
+// when that happens twice in a row.
 func (w *egressWatch) check(ctx context.Context) bool {
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	v, err := w.d.auditEgress(cctx, w.s)
+	v, err := w.d.auditEgress(cctx, w.s, w.jobID)
 	if err != nil {
 		if ctx.Err() != nil {
 			return false // we were told to stop: that is not a finding
 		}
-		v = []string{egressPrefix + "cannot re-audit the egress network while the job runs: " + err.Error()}
+		if w.readFails++; w.readFails <= readFailuresTolerated {
+			return false
+		}
+		v = []string{egressPrefix + "cannot re-audit the egress network while the job runs (" + fmt.Sprint(w.readFails) + " reads in a row failed): " + err.Error()}
+	} else {
+		w.readFails = 0
 	}
 	if len(v) == 0 {
 		return false
@@ -359,7 +432,9 @@ func (w *egressWatch) check(ctx context.Context) bool {
 	return true
 }
 
-// stop ends the watch, audits one last time, and returns every violation seen during the run.
+// stop ends the watch, audits one last time, and returns every violation seen during the run. The
+// last audit runs after the job has exited, so a failure to read it is retried once before it is
+// reported; the report says the job RAN (see RanAuditError).
 func (w *egressWatch) stop() []string {
 	w.cancel()
 	<-w.done
@@ -367,7 +442,11 @@ func (w *egressWatch) stop() []string {
 	found := len(w.violations) > 0
 	w.mu.Unlock()
 	if !found {
-		w.check(context.Background())
+		w.readFails = 0
+		if !w.check(context.Background()) && w.readFails > 0 {
+			time.Sleep(200 * time.Millisecond)
+			w.check(context.Background())
+		}
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()

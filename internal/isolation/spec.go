@@ -53,6 +53,12 @@ type Spec struct {
 	EgressNetwork        string // the internal Docker network the job joins
 	EgressProxy          string // the proxy's address on that network, "ip:port"
 	EgressProxyContainer string // the proxy's container name, the only neighbour allowed
+	// What egress.Open built the proxy from. When set, the audit requires the running container
+	// to carry exactly this image, entrypoint and command (egress.Session.Apply fills them in).
+	// Left empty (a hand-built Spec) the proxy's identity is checked by labels and network only.
+	EgressProxyImage      string
+	EgressProxyEntrypoint []string
+	EgressProxyCmd        []string
 
 	CPUs         float64       // e.g. 2
 	MemoryMiB    int           // a hard cap; the job is killed above it
@@ -152,7 +158,8 @@ func (s Spec) Validate() (Spec, error) {
 	default:
 		return s, invalid(fmt.Sprintf("network mode %q is not allowed (only %q, %q and %q)", s.Network, NetworkNone, NetworkBridge, NetworkAllowlist))
 	}
-	if s.Network != NetworkAllowlist && (s.EgressNetwork != "" || s.EgressProxy != "" || s.EgressProxyContainer != "") {
+	if s.Network != NetworkAllowlist && (s.EgressNetwork != "" || s.EgressProxy != "" || s.EgressProxyContainer != "" ||
+		s.EgressProxyImage != "" || len(s.EgressProxyEntrypoint) > 0 || len(s.EgressProxyCmd) > 0) {
 		return s, invalid("egress settings are only meaningful with network mode " + NetworkAllowlist)
 	}
 	for k := range s.Env {

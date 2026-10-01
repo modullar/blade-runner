@@ -341,7 +341,11 @@ back what Docker applied and refuses to start the job unless every property hold
 names the step or the violation: for example Docker is not answering, the proxy image is
 missing or not pinned by content, the network is not internal, the host still has an address
 on it (an old Docker that ignores `com.docker.network.bridge.inhibit_ipv4`), the container is
-attached to another network, or the proxy is not running. Update Docker, or report it.
+attached to another network, the proxy is not running or is not the one Blade Runner built, or a
+container shares the proxy's or the job's network stack (`--network container:...`). When the
+message says the job **RAN**, the audit that repeats while the job runs (or once more when it
+ends) found the topology changed: the job was stopped if it was still running, and its result is
+not to be trusted. Update Docker, or report it.
 `docker network ls --filter label=bladerunner.egress` shows leftovers from a crash; the next
 start removes them.
 
