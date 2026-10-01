@@ -230,7 +230,7 @@ failure; jobs fail confusingly when the work directory fills up. Free space.
 The codes BR-E072 to BR-E079 belong to the supervisor (`bladerunner supervise`, see
 [decision 0007](../decisions/0007-supervisor.md)). BR-E070 and BR-E071 above were already taken
 by the doctor, so the supervisor's range starts at 072. Every refusal below is also written to the
-audit log, `~/.bladerunner/audit/supervisor.jsonl`, and nothing was started for the job.
+audit log, `~/.bladerunner/audit/supervisor-<runner name>.jsonl`, and nothing was started for the job.
 
 ### BR-E072
 
@@ -290,8 +290,15 @@ until the supervisor is restarted.
 ### BR-E079
 
 **The audit log cannot be written.** Every decision (refusal, launch, outcome) is appended to
-`~/.bladerunner/audit/supervisor.jsonl` before it takes effect, and the supervisor refuses to
+`~/.bladerunner/audit/supervisor-<runner name>.jsonl` before it takes effect, and the supervisor refuses to
 start a job it cannot record. Fix the directory's permissions or free disk space.
+
+It is also raised when the log is not safe to continue: a write or flush failed earlier (the
+supervisor stops rather than guess what is on disk; restart it, and a torn last line is accounted
+for by a `recovered` entry), another supervisor has the same log open (each runner name has its
+own file, and the file is locked), or the log is damaged or shorter than its head anchor
+(`<log>.head`: the number and hash of the newest entry), in which case move both files aside to
+start a new log.
 
 ### BR-E080
 

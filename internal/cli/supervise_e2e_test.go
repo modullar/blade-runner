@@ -55,7 +55,8 @@ func (s *superviseRig) queue(run, job int64, who string) {
 }
 
 func (s *superviseRig) auditPath() string {
-	return filepath.Join(s.home(), "audit", "supervisor.jsonl")
+	// One log per runner name: two supervisors must never share (and fork) one chain.
+	return filepath.Join(s.home(), "audit", "supervisor-e2e-runner.jsonl")
 }
 
 func (s *superviseRig) audit() []supervisor.Entry {

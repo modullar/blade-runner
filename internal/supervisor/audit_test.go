@@ -106,20 +106,22 @@ func TestAuditLogContinuesAcrossReopenAndSurvivesAHalfWrittenLine(t *testing.T) 
 	}
 	raw, _ := os.ReadFile(path)
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(lines) != 3 {
+	// one, the torn fragment (kept as evidence), the recovery record, the new entry.
+	if len(lines) != 4 {
 		t.Fatalf("lines = %q", lines)
 	}
 	var last supervisor.Entry
-	if err := json.Unmarshal([]byte(lines[2]), &last); err != nil || last.Message != "after the crash" || last.Seq != 3 {
-		t.Errorf("the entry after the crash is not on its own line: %q (%v)", lines[2], err)
+	if err := json.Unmarshal([]byte(lines[3]), &last); err != nil || last.Message != "after the crash" || last.Seq != 3 {
+		t.Errorf("the entry after the crash is not on its own line: %q (%v)", lines[3], err)
 	}
 	var first supervisor.Entry
 	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil || first.Message != "one" {
 		t.Errorf("earlier entries were damaged: %q", lines[0])
 	}
-	// The damage is visible, not hidden.
-	if _, err := supervisor.VerifyAuditLog(path); err == nil {
-		t.Error("a half-written line must make verification fail loudly")
+	// The damage stays on record (the fragment and the recovery entry naming it), and the chain
+	// verifies again: see TestAHalfWrittenLastLineIsReportedAndRecoveryIsExplicit.
+	if n, err := supervisor.VerifyAuditLog(path); err != nil || n != 3 {
+		t.Errorf("verify after recovery: %d, %v", n, err)
 	}
 }
 

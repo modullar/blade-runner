@@ -19,7 +19,7 @@ const superviseUsage = `usage: bladerunner supervise [-c FILE] [--once] [--image
 Watch the repository's queue. For each waiting job whose labels match this runner, verify that
 its head commit is signed by a key in the trust store; only then start ONE ephemeral, isolated
 runner container for it, and always remove the container and the runner registration afterwards.
-A job that is not admitted starts nothing and is recorded in ~/.bladerunner/audit/supervisor.jsonl.
+A job that is not admitted starts nothing and is recorded in ~/.bladerunner/audit/supervisor-<runner name>.jsonl.
 
   --once               do one cycle and exit (for testing, or to run from cron)
   --image REF          the runner image, pinned by content (name@sha256:...); default supervisor.image
@@ -79,7 +79,9 @@ func cmdSupervise(ctx context.Context, args []string, d *Deps) error {
 	}
 	defer unlock()
 
-	audit, err := supervisor.OpenAuditLog(filepath.Join(d.bladeHome(), "audit", "supervisor.jsonl"), nil)
+	// One log per runner name (the name is validated to file-name-safe characters): the log is
+	// also flocked, so a second supervisor on the same name is refused rather than forking it.
+	audit, err := supervisor.OpenAuditLog(filepath.Join(d.bladeHome(), "audit", "supervisor-"+cfg.Runner.Name+".jsonl"), nil)
 	if err != nil {
 		return err
 	}
