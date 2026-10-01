@@ -1,6 +1,8 @@
 package testrig
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,9 +16,10 @@ import (
 )
 
 var (
-	runnerImgOnce sync.Once
-	runnerImgID   string
-	runnerImgErr  error
+	runnerImgMu  sync.Mutex
+	runnerImgTag string // set once the image has been built by this process
+	runnerImgBin string // the built fakerunner, kept so a vanished image can be rebuilt
+	runnerImgErr error
 )
 
 // FakeRunnerImage builds, once per test process, a FROM scratch image holding the fakerunner
@@ -30,28 +33,69 @@ func FakeRunnerImage(t testing.TB) string {
 		t.Skipf("no usable Docker daemon with Linux containers: %v", err)
 	}
 	dockerlock.Lock(t) // real-Docker tests in other packages share one daemon
-	runnerImgOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "fakerunner-img-")
-		if err != nil {
-			runnerImgErr = err
-			return
+	runnerImgMu.Lock()
+	defer runnerImgMu.Unlock()
+	// Other test processes share the daemon and it may garbage-collect images between tests, so
+	// the image is checked on every call (under the lock) and rebuilt when it has gone.
+	if runnerImgTag != "" {
+		if out, err := exec.Command("docker", "image", "inspect", "--format", "{{.Id}}", runnerImgTag).Output(); err == nil {
+			return strings.TrimSpace(string(out))
 		}
-		build := exec.Command("go", "build", "-o", filepath.Join(dir, "fakerunner"), "github.com/modullar/blade-runner/internal/supervisor/testdata/fakerunner")
-		build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
-		if out, err := build.CombinedOutput(); err != nil {
-			runnerImgErr = fmt.Errorf("build fakerunner: %v\n%s", err, out)
-			return
-		}
-		_ = os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\nCOPY fakerunner /fakerunner\nENTRYPOINT [\"/fakerunner\"]\n"), 0o644)
-		if out, err := exec.Command("docker", "build", "-q", "-t", "br-supervisor-fakerunner", dir).CombinedOutput(); err != nil {
-			runnerImgErr = fmt.Errorf("docker build: %v\n%s", err, out)
-			return
-		}
-		out, err := exec.Command("docker", "image", "inspect", "--format", "{{.Id}}", "br-supervisor-fakerunner").Output()
-		runnerImgID, runnerImgErr = strings.TrimSpace(string(out)), err
-	})
+	}
+	if runnerImgErr == nil && runnerImgBin == "" {
+		runnerImgErr = buildFakeRunnerBinary()
+	}
+	if runnerImgErr == nil {
+		runnerImgErr = buildFakeRunnerImage()
+	}
 	if runnerImgErr != nil {
 		t.Fatalf("cannot prepare the runner image: %v", runnerImgErr)
 	}
-	return runnerImgID
+	out, err := exec.Command("docker", "image", "inspect", "--format", "{{.Id}}", runnerImgTag).Output()
+	if err != nil {
+		t.Fatalf("cannot inspect the runner image: %v", err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func buildFakeRunnerBinary() error {
+	dir, err := os.MkdirTemp("", "fakerunner-bin-")
+	if err != nil {
+		return err
+	}
+	bin := filepath.Join(dir, "fakerunner")
+	build := exec.Command("go", "build", "-o", bin, "github.com/modullar/blade-runner/internal/supervisor/testdata/fakerunner")
+	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+	if out, err := build.CombinedOutput(); err != nil {
+		return fmt.Errorf("build fakerunner: %v\n%s", err, out)
+	}
+	runnerImgBin = bin
+	return nil
+}
+
+// buildFakeRunnerImage builds the FROM scratch image. The tag carries the binary's content hash:
+// each test process builds its own copy, and a shared tag would be moved by the second build,
+// leaving the first process's image untagged while it is still in use.
+func buildFakeRunnerImage() error {
+	data, err := os.ReadFile(runnerImgBin)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(data)
+	tag := "br-supervisor-fakerunner:" + hex.EncodeToString(sum[:8])
+	dir, err := os.MkdirTemp("", "fakerunner-img-")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "fakerunner"), data, 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\nCOPY fakerunner /fakerunner\nENTRYPOINT [\"/fakerunner\"]\n"), 0o644); err != nil {
+		return err
+	}
+	if out, err := exec.Command("docker", "build", "-q", "-t", tag, dir).CombinedOutput(); err != nil {
+		return fmt.Errorf("docker build: %v\n%s", err, out)
+	}
+	runnerImgTag = tag
+	return nil
 }
