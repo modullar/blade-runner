@@ -43,8 +43,11 @@ and **nothing else**: not the host, the host's LAN or loopback services, cloud m
    answer is never asked for. The address policy has no configuration in the production binary.
    The name is resolved as an absolute name (trailing dot), so the resolver's search list cannot
    turn an allowlisted `github.com` into `github.com.<search domain>`. That is all the trailing
-   dot does: **`/etc/hosts` is still consulted** for an absolute name (Go's resolver reads it
-   first), so an entry there can answer for an allowlisted name. It cannot widen anything,
+   dot does: **`/etc/hosts` is still consulted** for an absolute name by the pure-Go resolver
+   the static proxy binary uses (checked here: with an entry `10.9.9.9 x.example`, looking up
+   `x.example.` returns 10.9.9.9; a cgo/glibc build did not consult it for the absolute form,
+   and Go answered `localhost.` from DNS rather than the file, so do not rely on either
+   behaviour), so an entry there can answer for an allowlisted name. It cannot widen anything,
    because `AddressPolicy` gates every address the resolver returns, wherever the answer came
    from, and the dial-time check backs it up. On the way in, a client's target may carry one
    trailing dot (`github.com.` is the same host as `github.com`, logged without the dot); two
