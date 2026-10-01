@@ -37,8 +37,11 @@ var DefaultAllowlist = []string{
 // DefaultPorts are the ports a CONNECT may target.
 var DefaultPorts = []int{443}
 
-// Allowlist is a set of hostnames a job may reach: exact names, and wildcards that match
-// subdomains only.
+// Allowlist is a set of hostnames a job may reach: exact names, and wildcards. A wildcard
+// `*.example.com` matches every name BELOW example.com at any depth (a.example.com and
+// a.b.example.com) and never example.com itself; trust it as you would trust everyone who can
+// create a name under that domain. Wildcards over a public or multi-tenant suffix are refused
+// (see sharedSuffixes).
 type Allowlist struct {
 	exact    map[string]bool
 	suffixes []string // ".example.com" for "*.example.com"
@@ -66,6 +69,9 @@ func ParseAllowlist(entries []string) (Allowlist, error) {
 		if wild {
 			if !strings.Contains(name, ".") {
 				return Allowlist{}, policyInvalid(fmt.Sprintf("%q would allow every name under a top-level domain", e))
+			}
+			if isSharedSuffix(name) {
+				return Allowlist{}, policyInvalid(fmt.Sprintf("%q would allow every registrant under the shared suffix %s (name one registrant's domain instead, or list exact hosts)", e, name))
 			}
 			a.suffixes = append(a.suffixes, "."+name)
 		} else {
@@ -128,11 +134,42 @@ func checkHostname(h string) error {
 			}
 		}
 	}
-	// A name that is all digits and dots (1.2.3 or 0x7f.1) is how old resolvers read an IP.
-	if !strings.ContainsAny(h, "abcdefghijklmnopqrstuvwxyz-") {
+	// inet_aton-style resolvers read a name whose every label is a number as an IPv4 address:
+	// decimal ("1.2.3"), octal ("010.1") or hex ("0x7f.1"). Refuse all three forms, so such a
+	// name is never on the list or accepted from a client. (This is defence in depth: whatever a
+	// name resolves to is still checked by the AddressPolicy.) A name with any ordinary label,
+	// like "0x7f.example", is not one of these and is allowed.
+	numeric := true
+	for _, label := range strings.Split(h, ".") {
+		if !numericLabel(label) {
+			numeric = false
+			break
+		}
+	}
+	if numeric {
 		return fmt.Errorf("looks like a numeric address")
 	}
 	return nil
+}
+
+// numericLabel reports whether label is a decimal or octal number, or 0x followed by hex digits.
+func numericLabel(label string) bool {
+	if strings.HasPrefix(label, "0x") {
+		label = label[2:]
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				return false
+			}
+		}
+		return true
+	}
+	for i := 0; i < len(label); i++ {
+		if label[i] < '0' || label[i] > '9' {
+			return false
+		}
+	}
+	return label != ""
 }
 
 // NormalizeHost lower-cases a client-supplied host and drops one trailing dot. It returns false

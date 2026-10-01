@@ -37,30 +37,40 @@ func TestAllowlistMatching(t *testing.T) {
 
 func TestParseAllowlistRefusesWhatItCannotTrust(t *testing.T) {
 	for name, entries := range map[string][]string{
-		"empty":                 nil,
-		"empty entry":           {""},
-		"an IPv4 address":       {"1.2.3.4"},
-		"an IPv6 address":       {"::1"},
-		"loopback":              {"127.0.0.1"},
-		"a bare star":           {"*"},
-		"a star over a TLD":     {"*.com"},
-		"a star in the middle":  {"a.*.com"},
-		"a star without a dot":  {"*example.com"},
-		"a port":                {"github.com:443"},
-		"a URL":                 {"https://github.com"},
-		"a path":                {"github.com/x"},
-		"upper case":            {"GitHub.com"},
-		"non-ASCII":             {"gîthub.com"},
-		"an underscore":         {"a_b.example.com"},
-		"a leading hyphen":      {"-a.example.com"},
-		"an empty label":        {"a..example.com"},
-		"a trailing dot":        {"example.com."},
-		"a space":               {"a b.example.com"},
-		"all digits":            {"10.1.2"},
-		"over-long label":       {strings.Repeat("a", 64) + ".com"},
-		"one bad among good":    {"github.com", "http://x"},
-		"a wildcard wildcard":   {"*.*.example.com"},
-		"a leading dot wildcad": {".example.com"},
+		"empty":                   nil,
+		"empty entry":             {""},
+		"an IPv4 address":         {"1.2.3.4"},
+		"an IPv6 address":         {"::1"},
+		"loopback":                {"127.0.0.1"},
+		"a bare star":             {"*"},
+		"a star over a TLD":       {"*.com"},
+		"a star in the middle":    {"a.*.com"},
+		"a star without a dot":    {"*example.com"},
+		"a port":                  {"github.com:443"},
+		"a URL":                   {"https://github.com"},
+		"a path":                  {"github.com/x"},
+		"upper case":              {"GitHub.com"},
+		"non-ASCII":               {"gîthub.com"},
+		"an underscore":           {"a_b.example.com"},
+		"a leading hyphen":        {"-a.example.com"},
+		"an empty label":          {"a..example.com"},
+		"a trailing dot":          {"example.com."},
+		"a space":                 {"a b.example.com"},
+		"all digits":              {"10.1.2"},
+		"hex numeric form":        {"0x7f.1"},
+		"hex numeric form 2":      {"0x7f.0x0.0x0.0x1"},
+		"mixed numeric forms":     {"0x7f.0.0.01"},
+		"a wildcard of digits":    {"*.10.1.2"},
+		"a public suffix":         {"*.co.uk"},
+		"a public suffix 2":       {"*.com.au"},
+		"a multi-tenant suffix":   {"*.github.io"},
+		"a multi-tenant suffix 2": {"*.herokuapp.com"},
+		"a multi-tenant suffix 3": {"*.s3.amazonaws.com"},
+		"a multi-tenant suffix 4": {"*.githubusercontent.com"},
+		"over-long label":         {strings.Repeat("a", 64) + ".com"},
+		"one bad among good":      {"github.com", "http://x"},
+		"a wildcard wildcard":     {"*.*.example.com"},
+		"a leading dot wildcad":   {".example.com"},
 	} {
 		_, err := ParseAllowlist(entries)
 		if diag.CodeOf(err) != diag.CodeEgressPolicyInvalid {
@@ -69,6 +79,27 @@ func TestParseAllowlistRefusesWhatItCannotTrust(t *testing.T) {
 	}
 	if _, err := ParseAllowlist(DefaultAllowlist); err != nil {
 		t.Errorf("the default allowlist must itself be valid: %v", err)
+	}
+}
+
+func TestWildcardsOverAPublicSuffixAreRefusedButNamesBelowItAreNot(t *testing.T) {
+	for _, ok := range []string{"*.example.co.uk", "*.example.com.au", "*.me.github.io", "*.myapp.herokuapp.com", "*.actions.githubusercontent.com", "*.example.com"} {
+		if _, err := ParseAllowlist([]string{ok}); err != nil {
+			t.Errorf("%s names one registrant and must be accepted: %v", ok, err)
+		}
+	}
+	// An EXACT entry for a suffix is the operator naming one host, which is their call.
+	if _, err := ParseAllowlist([]string{"github.io"}); err != nil {
+		t.Errorf("an exact entry is not a wildcard: %v", err)
+	}
+}
+
+func TestAWildcardMatchesDeeperSubdomainsToo(t *testing.T) {
+	a := allow(t, "*.example.com")
+	for host, want := range map[string]bool{"a.example.com": true, "a.b.example.com": true, "a.b.c.example.com": true, "example.com": false} {
+		if got := a.Allowed(host); got != want {
+			t.Errorf("Allowed(%q) = %v, want %v", host, got, want)
+		}
 	}
 }
 

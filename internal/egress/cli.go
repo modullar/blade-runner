@@ -47,7 +47,7 @@ func RunProxy(args []string, stdout, stderr io.Writer, extend func(fs *flag.Flag
 	port := fs.Int("port", ProxyPort, "port to listen on")
 	ports := fs.String("ports", "443", "comma-separated ports a CONNECT may target")
 	var allow listFlag
-	fs.Var(&allow, "allow", "an allowed hostname or *.domain wildcard (repeatable)")
+	fs.Var(&allow, "allow", "an allowed hostname or *.domain wildcard, which matches every depth below domain (repeatable)")
 	var adjust func(*Proxy)
 	if extend != nil {
 		adjust = extend(fs)
