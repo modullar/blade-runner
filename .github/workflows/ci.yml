@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # TODO(BR-6): pin actions to full commit SHAs. They are pinned by tag for now because
+      # the SHAs could not be looked up when this file was written; do not invent them.
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "gofmt needed on:"; echo "$out"; exit 1; fi
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      - name: cross-compile
+        run: |
+          for t in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
+            GOOS=${t%/*} GOARCH=${t#*/} CGO_ENABLED=0 go build -o /dev/null ./cmd/bladerunner
+            echo "built $t"
+          done
+
+  # The code paths are the same, but macOS runners exercise the darwin build of the tests
+  # (paths, permissions, the keychain backend's command handling). They still use a fake
+  # launchctl: a real launchd test needs a logged-in GUI session (BR-0 / BR-2 gate).
+  test-macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race -count=1 ./...

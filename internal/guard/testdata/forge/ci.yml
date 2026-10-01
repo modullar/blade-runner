@@ -1,0 +1,381 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "forge_engine/**"
+      - "tests/**"
+      # corpus/ ships in the backend image and entrypoint.sh reads it at boot,
+      # so changes here can break startup — they need the same gate.
+      - "corpus/**"
+      # A test root outside tests/ (see the discover step in `checks`): a change
+      # here must run its own suite.
+      - "extractor/**"
+      # The eval harness. Not a test root (its suite is tests/eval/), but a
+      # harness-only edit would otherwise trigger nothing and land untested.
+      - "eval/**"
+      # Not a test root, but `checks` lints the WHOLE tree (`ruff check .`,
+      # `ruff format --check .`). Without this, a scripts-only PR runs no CI at
+      # all and can merge unformatted — and the drift then reddens the next
+      # contributor's unrelated PR, which is the exact failure the format gate
+      # exists to prevent.
+      - "scripts/**"
+      # The rate seed the migration bulk-inserts. Every ownership module
+      # resolves against it, so a rate edit moves numbers the tco and ownership
+      # suites assert — but until it was listed here, editing
+      # data/rates/rates_seed.json triggered no suite at all.
+      - "data/**"
+      # W5-14: the committed frontend fixtures are real engine payloads, and the
+      # fixture step in `checks` below regenerates and diffs the ones a recipe can
+      # rebuild. Listed so an edit to a fixture runs that step at all; an engine
+      # change already trips it through forge_engine/**. Note what that does and
+      # does not catch: for the ONE recipe-covered fixture a hand edit is caught
+      # by the diff, but for the fifteen in NOT_REGENERABLE the job only proves
+      # the name is still declared — it has nothing to regenerate against them.
+      - "frontend/src/fixtures/**"
+      - "pyproject.toml"
+      - "Dockerfile"
+      - "docker/**"
+      - "migrations/**"
+      - "alembic.ini"
+      # The CI definition gates itself: a workflow-only change (matrix grouping,
+      # discovery, tripwire) must run the suite that proves it still works,
+      # otherwise the change lands green having tested nothing.
+      - ".github/workflows/**"
+      # The self-hosted runner's image, VM and launcher. Not a test root, but
+      # tests/ci_runner reads these files (the firewall ranges, the image's build
+      # context, the forge-ci launcher), so an edit here must run that suite or it
+      # lands untested and turns the next unrelated PR red. Its docs are not code:
+      # a README-only edit runs nothing.
+      - "ci/**"
+      - "!ci/**/*.md"
+  pull_request:
+    branches: [main]
+    paths:
+      - "forge_engine/**"
+      - "tests/**"
+      # corpus/ ships in the backend image and entrypoint.sh reads it at boot,
+      # so changes here can break startup — they need the same gate.
+      - "corpus/**"
+      # A test root outside tests/ (see the discover step in `checks`): a change
+      # here must run its own suite.
+      - "extractor/**"
+      # The eval harness — see the push filter above.
+      - "eval/**"
+      # Linted tree-wide by `checks` — see the push filter above.
+      - "scripts/**"
+      - "data/**"
+      # A hand-edited fixture must trip the fixture gate in `checks` — see above.
+      - "frontend/src/fixtures/**"
+      - "pyproject.toml"
+      - "Dockerfile"
+      - "docker/**"
+      - "migrations/**"
+      - "alembic.ini"
+      # The CI definition gates itself — see the push filter above.
+      - ".github/workflows/**"
+      # The self-hosted runner's files, docs excluded — see the push filter above.
+      - "ci/**"
+      - "!ci/**/*.md"
+  # By hand, and the fresh-run path runner-failover.yml falls back to when a re-run keeps
+  # routing a stranded job to the Mac (see scripts/ci_failover.py).
+  workflow_dispatch:
+
+# Nothing here writes to the repository. Declared so no job inherits the repo-wide
+# read-and-write default that geometry write mode needs (scripts/check_runner_policy.py).
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels that PR's run still in progress: only the
+# newest commit's result matters, and a superseded run's minutes are billed for
+# nothing. Every other run (a push to main, a dispatch) gets a group of its own, its
+# run_id, so it is never queued behind another run or cancelled: Railway's Wait for
+# CI has to see each main commit's own result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Where these jobs run: every one but docker-build (see there) by the same expression,
+# enforced by scripts/check_runner_policy.py. PRs and branches follow the FORGE_RUNNER
+# repository variable: "forge-mac" is the self-hosted Mac mini (ci/self-hosted/), and
+# "ubuntu-latest" or unset is GitHub-hosted, which is where runner-failover.yml sends them
+# within minutes of the Mac going offline. main never reads it and always runs hosted, so
+# Railway's deploy gate cannot depend on the Mac.
+jobs:
+  # The whole-tree checks in one job: suite discovery, ruff, formatting, mypy and the
+  # frontend-fixture gate. They used to be three jobs of well under a minute each, and
+  # GitHub bills every job rounded UP to a whole minute while each repeats the same
+  # setup (checkout, uv, dependencies, Postgres) — so one job bills one setup, not three.
+  #
+  # Discovery runs first, before anything that can fail, so the test matrix exists even
+  # when a later check goes red. Every later step runs whether or not an earlier one
+  # failed (`!cancelled()`), so one push reports every red check instead of the first.
+  checks:
+    runs-on: ${{ github.ref != 'refs/heads/main' && vars.FORGE_RUNNER || 'ubuntu-latest' }}
+    # Discovery, lint, format, types, the fixture gate and the runner policy in sequence:
+    # a few minutes on an idle runner, and about 18 in total on a busy Mac as three jobs.
+    timeout-minutes: 25
+    outputs:
+      matrix: ${{ steps.suites.outputs.matrix }}
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: forgedb
+          POSTGRES_USER: forge
+          POSTGRES_PASSWORD: localdev
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U forge -d forgedb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://forge:localdev@localhost:5433/forgedb
+    steps:
+      - uses: actions/checkout@v4
+
+      # Builds the test matrix by scanning the filesystem, so adding a folder under
+      # tests/ still gets that suite run automatically. A hardcoded list here would
+      # drift the moment someone forgets to update it — which is exactly how chains,
+      # corpus, cost, normalize, pipeline and tco went uncovered for so long.
+      #
+      # Discovered suites are folded into a few semantic GROUPS, so the matrix fans
+      # out three jobs instead of ~24. Grouping only decides how suites are packed
+      # into jobs; every suite still runs on its own and reports as a collapsible
+      # "thread" inside its group's job (see the test job below). A suite NOT named
+      # in GROUPS is never dropped: it falls through to its own single-suite group,
+      # so a new tests/ folder stays covered with no edit here.
+      - name: Discover test suites
+        id: suites
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+
+          suites = {d.name: f"{d}/"
+                    for d in sorted(pathlib.Path("tests").iterdir())
+                    if d.is_dir() and d.name != "__pycache__" and any(d.rglob("test_*.py"))}
+          # Lives outside tests/, so the scan above cannot find it. A new test
+          # root outside tests/ is the one case still needing a manual edit here.
+          suites["migrations"] = "forge_engine/tests/db/migrations/"
+          # Also outside tests/. extractor/conftest.py stubs the OCC bindings
+          # when pythonocc-core is absent, so this suite runs on a plain CI
+          # runner with no conda — which is why it can be here at all.
+          suites["extractor"] = "extractor/"
+
+          # Semantic grouping — edit freely; it only changes how suites are
+          # packed into jobs, never whether a suite runs. Unlisted suites get
+          # their own group, so forgetting to add one here degrades to "its own
+          # job" (safe), never to "silently skipped".
+          #
+          # Three groups, because GitHub bills each job rounded up to a whole
+          # minute and every job repeats its setup: nine groups of 30-90 s billed
+          # about 14 minutes a run for about 9 minutes of work. `platform` is the
+          # longest; the other two are sized to finish before it.
+          GROUPS = {
+              "platform": ["api", "services", "schemas", "rates", "auth", "ci_runner"],
+              "engine":   ["cost", "ownership", "tco", "chains", "pipeline", "geometry",
+                           "pricing", "lifecycle", "durability", "reporting"],
+              # extractor/ runs here with conftest's OCC *stubs*, so this leg
+              # proves the pure logic and nothing about geometry. The real kernel
+              # runs in geometry-tests.yml.
+              "data":     ["ingest", "normalize", "corpus", "step_intake", "eval",
+                           "db", "migrations", "extractor"],
+          }
+          group_of = {s: g for g, members in GROUPS.items() for s in members}
+
+          grouped: dict[str, list[str]] = {}
+          for suite, path in sorted(suites.items()):
+              grouped.setdefault(group_of.get(suite, suite), []).append(f"{suite}:{path}")
+
+          include = [{"group": g, "items": " ".join(items)}
+                     for g, items in sorted(grouped.items())]
+          matrix = json.dumps({"include": include})
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"matrix={matrix}\n")
+          print(f"discovered {len(suites)} suites in {len(include)} groups:\n{matrix}")
+
+          # Tripwire: if the scan breaks, an empty matrix would skip the test job
+          # and report the whole PR green having run nothing. Fail loudly instead.
+          # Count SUITES, not groups — grouping must not lower this floor.
+          if len(suites) < 24:
+              print(f"::error::only {len(suites)} suites discovered (expected >=24) — "
+                    "suite discovery is broken; refusing to report green on an untested tree")
+              raise SystemExit(1)
+          PY
+
+      - name: Install uv
+        if: ${{ !cancelled() }}
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        if: ${{ !cancelled() }}
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        id: deps
+        if: ${{ !cancelled() }}
+        run: uv sync --group dev
+
+      - name: Lint with ruff
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: uv run ruff check .
+
+      # Formatting is a SEPARATE gate from `ruff check`. Differently-wrapped code
+      # breaks no lint rule, so for a long time 16 files sat at the 88-col default
+      # while pyproject.toml said `line-length = 99` and nothing flagged it. The
+      # cost lands on contributors: CLAUDE.md tells them to run `ruff format`, and
+      # doing so silently added those 16 unrelated files to their diff (once
+      # turning a 20-file change into 36). Keep this step so the tree cannot drift
+      # out of `ruff format` agreement again.
+      - name: Check formatting with ruff
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: uv run ruff format --check .
+
+      - name: Type check with mypy
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: uv run mypy forge_engine/
+
+      # W5-14. frontend/src/fixtures/*.json are real API payloads that several Vitest
+      # suites render through real component trees, and the repo's rule is that they
+      # are regenerated, never hand-edited — but nothing checked. This step is the
+      # check, and it reports two different things:
+      #
+      #   * every fixture a recipe can rebuild is diffed against a fresh one, so a
+      #     fixture that no longer matches the engine goes red and names the field;
+      #   * every committed fixture must be either covered by a recipe or declared
+      #     in NOT_REGENERABLE with a reason, so a new fixture cannot land ungated
+      #     and the gate's own coverage stays legible.
+      #
+      # It lives here rather than in frontend.yml because the exporter needs Postgres
+      # and the Python environment, which that workflow has neither of.
+      - name: Fixtures are current, and every fixture is accounted for
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: uv run python scripts/export_frontend_fixtures.py --check
+
+      # Every job routed through FORGE_RUNNER or allowlisted as hosted-only, every job
+      # bounded by timeout-minutes, every workflow least-privilege. A job copied with a
+      # hardcoded `ubuntu-latest` would otherwise quietly spend the hosted quota the
+      # failover depends on.
+      - name: Runner policy
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: uv run python scripts/check_runner_policy.py
+
+  # One matrix leg per GROUP (not per suite): three parallel jobs instead of ~24.
+  # Each job still runs every suite in its group as a separate collapsible "thread"
+  # (::group::) and fails if any suite fails, so a red suite is still named in that
+  # group's log without a green cover. fail-fast: false keeps the other groups
+  # running when one fails — the point is to see every group's result in one pass,
+  # not to stop at the first red.
+  test:
+    name: test (${{ matrix.group }})
+    needs: checks
+    # Runs even when a check went red, so one push reports both; skipped only when
+    # discovery produced no matrix at all.
+    if: ${{ !cancelled() && needs.checks.outputs.matrix != '' }}
+    runs-on: ${{ github.ref != 'refs/heads/main' && vars.FORGE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.checks.outputs.matrix) }}
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: forgedb
+          POSTGRES_USER: forge
+          POSTGRES_PASSWORD: localdev
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U forge -d forgedb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://forge:localdev@localhost:5433/forgedb
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # Run every suite in the group, each wrapped in its own ::group:: fold so
+      # the Actions log shows one collapsible thread per suite. We do NOT stop at
+      # the first failing suite (|| keeps going) — every suite reports, then the
+      # step exits non-zero if any of them failed, so the group's check goes red
+      # and names the offending suite(s).
+      #
+      # -m "not slow" deselects the tests that call real external services
+      # (tests/normalize/test_*_slow.py). Those need live API credentials and
+      # cost money per run, so they stay a local/manual step per CLAUDE.md.
+      - name: Tests — ${{ matrix.group }}
+        run: |
+          failed=""
+          for item in ${{ matrix.items }}; do
+            suite="${item%%:*}"
+            path="${item#*:}"
+            echo "::group::test ($suite)"
+            if uv run pytest "$path" -v -m "not slow"; then
+              echo "$suite: passed"
+            else
+              echo "::error::suite '$suite' failed"
+              failed="$failed $suite"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::failing suites in group '${{ matrix.group }}':$failed"
+            exit 1
+          fi
+
+  docker-build:
+    # Always GitHub-hosted, like Railway's builder: it proves the production image builds
+    # for x86_64, and the Mac mini is Apple silicon (HOSTED_JOBS in
+    # scripts/check_runner_policy.py). About one hosted minute per run.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image built below must be the architecture every CI run has always built:
+      # x86_64, what GitHub-hosted ubuntu-latest and the Intel Mac mini both are. A runner
+      # host on another architecture (an Apple-silicon Mac, say) would otherwise build and
+      # vouch for an arm64 image — green here, for an image no earlier run ever checked.
+      - name: Docker builds for x86_64
+        run: |
+          arch=$(docker info --format '{{.Architecture}}')
+          if [ "$arch" != "x86_64" ]; then
+            echo "::error::this runner's Docker builds for $arch, not x86_64 — not the image every earlier CI run built and checked"
+            exit 1
+          fi
+          echo "Docker builds for $arch"
+
+      # No --target: this must be the lean default stage, the same one Railway
+      # builds. If someone makes `dev` the last stage, test tooling silently
+      # ships to production — the size assertion below is the tripwire.
+      - name: Build production Docker image
+        run: docker build -t forge-engine:ci .
+
+      # Exercises the entrypoint's exec-args path rather than bypassing it with
+      # --entrypoint "", so a regression there fails here instead of in a
+      # developer's hung test run.
+      - name: Verify alembic is available
+        run: docker run --rm forge-engine:ci alembic --help
+
+      - name: Production image excludes test tooling
+        run: |
+          if docker run --rm --entrypoint sh forge-engine:ci -c 'command -v pytest || command -v ruff || command -v mypy'; then
+            echo "::error::dev tooling found in the production image — check the Dockerfile target order"
+            exit 1
+          fi
+          echo "production image is clean: no pytest/ruff/mypy"
