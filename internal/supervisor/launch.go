@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -73,13 +74,14 @@ func (s *Supervisor) launch(ctx context.Context, cand judgement, a assessment) (
 	// Re-read the queue now that the registration exists, before anything can take a job.
 	b, err := s.assess(ctx)
 	if err != nil {
-		_ = s.cfg.Audit.Record(entry(KindWithheld, diag.CodeOf(err), "runner not started: "+what(err)))
-		return launchResult{}, err
+		s.refundAttempt(job.ID) // the queue could not be read: nothing was tried for this job
+		return launchResult{}, s.recordFailure(entry(KindWithheld, diag.CodeOf(err), "runner not started: "+what(err)), err)
 	}
 	still, ok := b.Admitted[job.ID]
 	if !b.clear() || !ok || still.Obs.Job.Status != statusQueued {
 		msg := fmt.Sprintf("runner %s not started: the queue changed while it was being registered (a waiting job is not admitted, or the job is no longer waiting)", name)
 		s.logf("withheld [%s]: %s", diag.CodeLaunchWithheld, msg)
+		s.refundAttempt(job.ID) // called off before any container ran: not a failure of this job
 		if err := s.cfg.Audit.Record(entry(KindWithheld, diag.CodeLaunchWithheld, msg)); err != nil {
 			return launchResult{Withheld: true}, err
 		}
@@ -137,12 +139,13 @@ func (s *Supervisor) launch(ctx context.Context, cand judgement, a assessment) (
 		}
 		msg := fmt.Sprintf("ALARM: runner %s was handed a job that is not admitted (%s); its container was stopped", name, why)
 		s.logf("%s [%s]", msg, diag.CodeUnexpectedJob)
-		_ = s.cfg.Audit.Record(entry(KindAlarm, diag.CodeUnexpectedJob, msg))
-		firstErr = diag.New(diag.CodeUnexpectedJob, msg, "the one-runner-one-admitted-job assumption failed (decision 0007)", "read the audit log and treat it as an incident")
+		firstErr = s.recordFailure(entry(KindAlarm, diag.CodeUnexpectedJob, msg),
+			diag.New(diag.CodeUnexpectedJob, msg, "the one-runner-one-admitted-job assumption failed (decision 0007)", "read the audit log and treat it as an incident"))
 		fin.Message = "runner ended after an alarm"
 	case w.stopped:
 		msg := fmt.Sprintf("runner %s was stopped before it was given a job: %s", name, w.reason)
 		s.logf("withheld [%s]: %s", w.code, msg)
+		s.refundAttempt(job.ID) // stopped because of someone else's job, not because this one failed
 		fin.Message, fin.Code = msg, w.code
 	case runErr != nil:
 		fin.Message = "the runner's container could not be run: " + what(runErr)
@@ -160,9 +163,19 @@ func (s *Supervisor) launch(ctx context.Context, cand judgement, a assessment) (
 	if cleanupMsg != "" {
 		fin.Message += "; " + cleanupMsg
 	}
+	if scanErr != nil && !w.alarm && len(unexpected) == 0 {
+		// The runner is gone, and so is the ability to say which job it took. It may have taken
+		// one that was never admitted, so this is an alarm, not a note: record it and fail.
+		msg := fmt.Sprintf("ALARM: runner %s ended (exit %d) but which job it took could not be confirmed (%s): it may have run a job that is not admitted", name, res.ExitCode, what(scanErr))
+		s.logf("%s [%s]", msg, diag.CodeQueueUnreadable)
+		alarmErr := s.recordFailure(entry(KindAlarm, diag.CodeQueueUnreadable, msg),
+			diag.Wrap(scanErr, diag.CodeQueueUnreadable, msg, "GitHub could not be read after the runner ended",
+				"check the provider's job list for this runner by hand, and treat it as an incident until you have"))
+		firstErr = errors.Join(firstErr, alarmErr)
+	}
 	s.logf("%s", fin.Message)
-	if err := s.cfg.Audit.Record(fin); err != nil && firstErr == nil {
-		firstErr = err
+	if err := s.cfg.Audit.Record(fin); err != nil {
+		firstErr = errors.Join(firstErr, err)
 	}
 	return launchResult{Launched: runErr == nil, Withheld: w.stopped && !w.alarm}, firstErr
 }
@@ -171,8 +184,8 @@ func (s *Supervisor) launch(ctx context.Context, cand judgement, a assessment) (
 func (s *Supervisor) failed(entry func(kind, code, msg string) Entry, what_ string, err error) error {
 	msg := what_ + ": " + what(err)
 	s.logf("%s [%s]", msg, diag.CodeLaunchFailed)
-	_ = s.cfg.Audit.Record(entry(KindError, diag.CodeLaunchFailed, msg))
-	return diag.Wrap(err, diag.CodeLaunchFailed, what_, "GitHub refused or could not be reached", "nothing was started; the job is retried a few times")
+	return s.recordFailure(entry(KindError, diag.CodeLaunchFailed, msg),
+		diag.Wrap(err, diag.CodeLaunchFailed, what_, "GitHub refused or could not be reached", "nothing was started; the job is retried a few times"))
 }
 
 // deregister removes the runner's registration if the provider still lists it (a just-in-time

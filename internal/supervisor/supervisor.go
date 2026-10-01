@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -201,6 +202,11 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		out, err := s.Tick(ctx)
 		if err != nil {
 			s.logf("%v", err)
+			if hasCode(err, diag.CodeAuditFailed) {
+				// What cannot be recorded cannot be accounted for: stop, rather than carry on
+				// polling and deciding things nobody can read back.
+				return err
+			}
 		}
 		if out.Launched && err == nil {
 			continue
@@ -336,6 +342,47 @@ func (s *Supervisor) Tick(ctx context.Context) (Outcome, error) {
 	res, err := s.launch(ctx, cand, a)
 	out.Launched, out.Withheld = res.Launched, res.Withheld
 	return out, err
+}
+
+// hasCode reports whether err, or any error joined into it, carries the diag code.
+func hasCode(err error, code string) bool {
+	if err == nil {
+		return false
+	}
+	var de *diag.Error
+	if errors.As(err, &de) && de.Code == code {
+		return true
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if hasCode(e, code) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return hasCode(u.Unwrap(), code)
+	}
+	return false
+}
+
+// recordFailure writes e, the audit record of a failure whose error is primary, and returns
+// primary. If the record cannot be written the audit failure is returned with it: a failure that
+// could be neither recorded nor reported must not look like a clean outcome.
+func (s *Supervisor) recordFailure(e Entry, primary error) error {
+	if err := s.cfg.Audit.Record(e); err != nil {
+		return errors.Join(primary, err)
+	}
+	return primary
+}
+
+// refundAttempt takes back one attempt for a launch that was only called off (a job that is not
+// admitted was waiting, or the queue could not be read): the admitted job did not fail to start,
+// so it must not move towards being given up on.
+func (s *Supervisor) refundAttempt(jobID int64) {
+	if s.attempts[jobID] > 0 {
+		s.attempts[jobID]--
+	}
 }
 
 func (s *Supervisor) noteError(err error) error {
