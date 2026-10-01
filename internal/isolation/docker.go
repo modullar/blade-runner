@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modullar/blade-runner/internal/diag"
@@ -36,6 +37,11 @@ type Result struct {
 type Docker struct {
 	Exec execx.Runner
 	Bin  string // default "docker"
+
+	// RecheckEvery is how often a RUNNING allowlist job's network is audited again (default
+	// 500ms). A container created on the network after the pre-start audit is caught by the
+	// next check, and the job is killed.
+	RecheckEvery time.Duration
 }
 
 func (d *Docker) bin() string {
@@ -204,15 +210,11 @@ func (d *Docker) Run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	if s.Network == NetworkAllowlist {
 		// The container's own record says which network it joined; the network's record says
-		// whether that network is what the design needs. Both must hold.
-		nw, err := d.docker(ctx, "", "network", "inspect", s.EgressNetwork)
+		// whether that network is what the design needs; the proxy's record says whether the
+		// neighbour is the proxy; the container list says who else is attached. All must hold.
+		nv, err := d.auditEgress(ctx, s)
 		if err != nil {
-			return Result{}, diag.Wrap(err, diag.CodeIsolation, "cannot read back the egress network's configuration",
-				"the network is gone or Docker stopped answering", "check `docker network ls`")
-		}
-		nv, err := AuditNetwork([]byte(nw.Stdout), s)
-		if err != nil {
-			return Result{}, diag.Wrap(err, diag.CodeIsolation, "cannot audit the egress network", "an unexpected Docker version", "update Docker")
+			return Result{}, err
 		}
 		violations = append(violations, nv...)
 	}
@@ -223,8 +225,16 @@ func (d *Docker) Run(ctx context.Context, spec Spec) (Result, error) {
 	runCtx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
 	var out, errOut cappedBuffer
+	var watch *egressWatch
+	if s.Network == NetworkAllowlist {
+		watch = d.watchEgress(s)
+	}
 	_, runErr := d.Exec.Run(runCtx, execx.Cmd{Name: d.bin(), Args: []string{"start", "-a", "-i", s.Name}, Stdin: s.Stdin, Stdout: &out, Stderr: &errOut})
 
+	var watchViolations []string
+	if watch != nil {
+		watchViolations = watch.stop()
+	}
 	res := Result{Stdout: out.String(), Stderr: errOut.String()}
 	if runCtx.Err() != nil { // the timeout (or the caller) cut the job off: stop the container itself
 		res.TimedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
@@ -252,7 +262,116 @@ func (d *Docker) Run(ctx context.Context, spec Spec) (Result, error) {
 			}
 		}
 	}
+	if len(watchViolations) > 0 { // the job ran on a network that stopped being the design's: its result is not to be trusted
+		return res, AuditError(s.Name, watchViolations)
+	}
 	return res, nil
+}
+
+// auditEgress reads the egress network, its attached containers (including ones that are only
+// created) and the proxy back from Docker and returns every way they are not the design.
+func (d *Docker) auditEgress(ctx context.Context, s Spec) ([]string, error) {
+	fail := func(err error, what, cause, fix string) ([]string, error) {
+		return nil, diag.Wrap(err, diag.CodeIsolation, what, cause, fix)
+	}
+	nw, err := d.docker(ctx, "", "network", "inspect", s.EgressNetwork)
+	if err != nil {
+		return fail(err, "cannot read back the egress network's configuration", "the network is gone or Docker stopped answering", "check `docker network ls`")
+	}
+	v, err := AuditNetwork([]byte(nw.Stdout), s)
+	if err != nil {
+		return fail(err, "cannot audit the egress network", "an unexpected Docker version", "update Docker")
+	}
+	ps, err := d.docker(ctx, "", "ps", "-a", "--filter", "network="+s.EgressNetwork, "--format", "{{.Names}}")
+	if err != nil {
+		return fail(err, "cannot list the containers on the egress network", "Docker stopped answering", "check Docker")
+	}
+	v = append(v, AuditMembers(strings.Fields(ps.Stdout), s)...)
+	px, err := d.docker(ctx, "", "inspect", s.EgressProxyContainer)
+	if err != nil {
+		return fail(err, "cannot read back the egress proxy's configuration", "the proxy is gone or Docker stopped answering", "check `docker ps -a`")
+	}
+	pv, err := AuditProxy([]byte(px.Stdout), []byte(nw.Stdout), s)
+	if err != nil {
+		return fail(err, "cannot audit the egress proxy", "an unexpected Docker version", "update Docker")
+	}
+	return append(v, pv...), nil
+}
+
+// egressWatch re-audits the egress topology while a job runs, and kills the job the moment it
+// is no longer the design (an unexpected container joined its network, the proxy changed).
+type egressWatch struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	d      *Docker
+	s      Spec
+
+	mu         sync.Mutex
+	violations []string
+}
+
+func (d *Docker) watchEgress(s Spec) *egressWatch {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &egressWatch{cancel: cancel, done: make(chan struct{}), d: d, s: s}
+	every := d.RecheckEvery
+	if every <= 0 {
+		every = 500 * time.Millisecond
+	}
+	go func() {
+		defer close(w.done)
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if w.check(ctx) {
+					kctx, kcancel := context.WithTimeout(context.Background(), 30*time.Second)
+					_, _ = d.docker(kctx, "", "kill", s.Name)
+					kcancel()
+					return
+				}
+			}
+		}
+	}()
+	return w
+}
+
+// check audits once and records what it found; it reports whether the job must be stopped. A
+// topology that cannot be read is treated as a violation: not knowing is not a pass.
+func (w *egressWatch) check(ctx context.Context) bool {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	v, err := w.d.auditEgress(cctx, w.s)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false // we were told to stop: that is not a finding
+		}
+		v = []string{egressPrefix + "cannot re-audit the egress network while the job runs: " + err.Error()}
+	}
+	if len(v) == 0 {
+		return false
+	}
+	w.mu.Lock()
+	w.violations = append(w.violations, v...)
+	w.mu.Unlock()
+	return true
+}
+
+// stop ends the watch, audits one last time, and returns every violation seen during the run.
+func (w *egressWatch) stop() []string {
+	w.cancel()
+	<-w.done
+	w.mu.Lock()
+	found := len(w.violations) > 0
+	w.mu.Unlock()
+	if !found {
+		w.check(context.Background())
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.violations
 }
 
 // RemoveStale removes every container this package created, for use at start-up: a crash can

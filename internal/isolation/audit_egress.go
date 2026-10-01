@@ -12,6 +12,14 @@ import (
 // hardening), so the refusal carries the egress code (BR-E082).
 const egressPrefix = "egress: "
 
+// Labels egress.Open puts on what it creates (the proxy container and the network). They are how
+// the audit tells the proxy Blade Runner built from any container that merely has its name.
+const (
+	LabelEgress       = "bladerunner.egress"
+	LabelEgressID     = "bladerunner.egress.id"
+	EgressRoleSession = "session" // the value of LabelEgress on a session's proxy and network
+)
+
 // OptInhibitIPv4 is the bridge option that gives the host no address on the network. Without it
 // an internal network still lets its containers reach the host through the bridge's own address
 // (observed on Docker 29.3.1, see docs/decisions/0008-egress.md).
@@ -85,6 +93,7 @@ type network struct {
 		} `json:"Config"`
 	} `json:"IPAM"`
 	Options    map[string]string `json:"Options"`
+	Labels     map[string]string `json:"Labels"`
 	Containers map[string]struct {
 		Name        string `json:"Name"`
 		IPv4Address string `json:"IPv4Address"`
@@ -93,8 +102,12 @@ type network struct {
 
 // AuditNetwork reads `docker network inspect` output for the egress network and returns every
 // way it is not the network the design needs: internal (no route out), a bridge, IPv4 only, no
-// address for the host on it, and no member other than the proxy and the job itself. The proxy
-// must be running (it is a member) and must be at the address the job was told.
+// address for the host on it, and no RUNNING member other than the proxy and the job itself.
+// The proxy must be running (it is a member) and must be at the address the job was told.
+// It also requires the egress manager's label on the network.
+//
+// Limit: network inspect lists only running containers. A container that was created on the
+// network but not started is invisible here; AuditMembers (from `docker ps -a`) covers it.
 func AuditNetwork(inspectJSON []byte, want Spec) ([]string, error) {
 	var list []network
 	if err := json.Unmarshal(inspectJSON, &list); err != nil || len(list) != 1 {
@@ -105,6 +118,9 @@ func AuditNetwork(inspectJSON []byte, want Spec) ([]string, error) {
 	add := func(format string, args ...any) { v = append(v, egressPrefix+fmt.Sprintf(format, args...)) }
 	if n.Name != want.EgressNetwork {
 		add("inspected network is %q, not %q", n.Name, want.EgressNetwork)
+	}
+	if n.Labels[LabelEgress] != EgressRoleSession || n.Labels[LabelEgressID] == "" {
+		add("network %s was not made by the egress manager (it lacks the %s label)", n.Name, LabelEgress)
 	}
 	if !n.Internal {
 		add("network %s is not internal: it has a route out that bypasses the proxy", n.Name)
@@ -152,6 +168,77 @@ func AuditNetwork(inspectJSON []byte, want Spec) ([]string, error) {
 	}
 	if !proxyFound {
 		add("the proxy container %s is not running on network %s", want.EgressProxyContainer, n.Name)
+	}
+	return v, nil
+}
+
+// AuditMembers checks the names of EVERY container attached to the egress network, started or
+// not (`docker ps -a --filter network=...`): only the proxy and the job itself may be there. This
+// is what enforces one job per session, and what sees a container that was created on the
+// network and is waiting to be started.
+func AuditMembers(names []string, want Spec) []string {
+	var v []string
+	seen := map[string]bool{}
+	for _, raw := range names {
+		for _, n := range strings.Split(raw, ",") { // `docker ps` joins a container's names (links add more)
+			n = strings.TrimSpace(n)
+			if n == "" || seen[n] {
+				continue
+			}
+			seen[n] = true
+			if n != want.EgressProxyContainer && n != want.Name {
+				v = append(v, egressPrefix+fmt.Sprintf("container %s is attached to the egress network %s (created, possibly not started): a session serves one job and its proxy, nothing else", n, want.EgressNetwork))
+			}
+		}
+	}
+	if !seen[want.Name] {
+		v = append(v, egressPrefix+fmt.Sprintf("the job container %s is not attached to the egress network %s", want.Name, want.EgressNetwork))
+	}
+	return v
+}
+
+// AuditProxy checks that the container the network lists under the proxy's name IS the proxy
+// the egress manager built: the very container the network holds under that name, carrying the
+// manager's labels (and the same session id as the network), running, and held to the same
+// hardening as a job. Name and address alone are not identity: any container can be given both.
+func AuditProxy(proxyInspect, networkInspect []byte, want Spec) ([]string, error) {
+	var nets []network
+	if err := json.Unmarshal(networkInspect, &nets); err != nil || len(nets) != 1 {
+		return nil, fmt.Errorf("cannot read the network's configuration back from Docker (expected one object): %v", err)
+	}
+	var list []inspected
+	if err := json.Unmarshal(proxyInspect, &list); err != nil || len(list) != 1 {
+		return nil, fmt.Errorf("cannot read the proxy's configuration back from Docker (expected one object): %v", err)
+	}
+	n, p := nets[0], list[0]
+	var v []string
+	add := func(format string, args ...any) {
+		v = append(v, egressPrefix+"proxy "+want.EgressProxyContainer+": "+fmt.Sprintf(format, args...))
+	}
+	memberID := ""
+	for id, m := range n.Containers {
+		if m.Name == want.EgressProxyContainer {
+			memberID = id
+		}
+	}
+	if memberID == "" || p.ID != memberID {
+		add("is not the container the network lists under that name (id %q, network has %q)", p.ID, memberID)
+	}
+	if !p.State.Running {
+		add("is not running")
+	}
+	if p.Config.Labels[LabelEgress] != EgressRoleSession {
+		add("lacks the %s label: it was not built by the egress manager", LabelEgress)
+	}
+	if id := p.Config.Labels[LabelEgressID]; id == "" || id != n.Labels[LabelEgressID] {
+		add("belongs to session %q, not the network's session %q", id, n.Labels[LabelEgressID])
+	}
+	hv, err := Audit(proxyInspect, Spec{Network: NetworkBridge})
+	if err != nil {
+		return nil, err
+	}
+	for _, x := range hv {
+		add("is not hardened: %s", x)
 	}
 	return v, nil
 }

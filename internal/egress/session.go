@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/modullar/blade-runner/internal/diag"
@@ -18,10 +20,10 @@ import (
 
 // Labels marking what this package creates, so a crash's leftovers can be found and removed.
 const (
-	LabelKey     = "bladerunner.egress"
-	labelSession = "session"
+	LabelKey     = isolation.LabelEgress // the audit in internal/isolation reads these two
+	labelSession = isolation.EgressRoleSession
 	labelOut     = "out"
-	labelID      = "bladerunner.egress.id"
+	labelID      = isolation.LabelEgressID
 
 	// OutNetwork is the one shared, ordinary bridge network the proxies reach the outside
 	// through. Jobs are never attached to it.
@@ -63,6 +65,12 @@ type Session struct {
 	ProxyAddr      string // ip:port on that network
 
 	m *Manager
+
+	// What THIS Open call created, by Docker's id. A failed Open removes only these: a name
+	// collision with another session's proxy or network must never remove that session's.
+	netRef, proxyRef string
+
+	claimed atomic.Bool // Apply has handed this session to a job
 }
 
 func (m *Manager) bin() string {
@@ -81,7 +89,9 @@ func setupErr(err error, what, cause, fix string) error {
 }
 
 // Open creates the internal network and the proxy for the session id, and returns once the
-// proxy accepts connections. On any failure everything it made is removed again.
+// proxy accepts connections. On any failure everything IT made is removed again, and nothing
+// else: if the names are already taken (another live session with this id), Open fails without
+// touching what is there.
 func (m *Manager) Open(ctx context.Context, id string) (s *Session, err error) {
 	if !idRe.MatchString(id) {
 		return nil, setupErr(nil, fmt.Sprintf("%q is not a valid egress session id", id), "a bug in the caller", "report this")
@@ -109,7 +119,7 @@ func (m *Manager) Open(ctx context.Context, id string) (s *Session, err error) {
 		if err != nil {
 			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			_ = s.Close(cctx)
+			_ = s.Close(cctx) // removes only what the refs below record
 			s = nil
 		}
 	}()
@@ -119,11 +129,13 @@ func (m *Manager) Open(ctx context.Context, id string) (s *Session, err error) {
 	}
 	// The network: no route out, and the host gets no address on it. The second property is what
 	// plain --internal lacks: there the host's bridge address stays reachable from the job.
-	if _, err := m.docker(ctx, "network", "create", "--internal", "--driver", "bridge",
+	netRes, err := m.docker(ctx, "network", "create", "--internal", "--driver", "bridge",
 		"--opt", isolation.OptInhibitIPv4+"=true",
-		"--label", LabelKey+"="+labelSession, "--label", labelID+"="+id, s.Network); err != nil {
+		"--label", LabelKey+"="+labelSession, "--label", labelID+"="+id, s.Network)
+	if err != nil {
 		return s, setupErr(err, "cannot create the job's internal network", "Docker refused (is the id already in use, or are Docker's address pools exhausted?)", "check `docker network ls`; a crash can leave networks behind, the next start removes them")
 	}
+	s.netRef = createdRef(netRes.Stdout, s.Network)
 	subnet, err := m.subnetOf(ctx, s.Network)
 	if err != nil {
 		return s, err
@@ -142,9 +154,11 @@ func (m *Manager) Open(ctx context.Context, id string) (s *Session, err error) {
 		args = append(args, "-allow", e)
 	}
 	args = append(args, m.ProxyExtraArgs...)
-	if _, err := m.docker(ctx, args...); err != nil {
-		return s, setupErr(err, "cannot create the egress proxy container", "the proxy image is missing or Docker refused", "check `docker images`")
+	proxyRes, err := m.docker(ctx, args...)
+	if err != nil {
+		return s, setupErr(err, "cannot create the egress proxy container", "the proxy image is missing, the name is taken, or Docker refused", "check `docker images` and `docker ps -a`")
 	}
+	s.proxyRef = createdRef(proxyRes.Stdout, s.ProxyContainer)
 	if _, err := m.docker(ctx, "network", "connect", OutNetwork, s.ProxyContainer); err != nil {
 		return s, setupErr(err, "cannot attach the proxy to the outbound network", "Docker refused", "check `docker network ls`")
 	}
@@ -163,6 +177,16 @@ func (m *Manager) Open(ctx context.Context, id string) (s *Session, err error) {
 		return s, err
 	}
 	return s, nil
+}
+
+// createdRef is the id `docker create` / `docker network create` printed for what it just made,
+// or the name when it printed nothing usable. The id is what later removal uses, so it can only
+// ever remove that object, never another one that has the same name.
+func createdRef(stdout, name string) string {
+	if f := strings.Fields(stdout); len(f) > 0 && regexp.MustCompile(`^[0-9a-f]{12,64}$`).MatchString(f[0]) {
+		return f[0]
+	}
+	return name
 }
 
 func (m *Manager) entrypoint() string {
@@ -272,12 +296,25 @@ func (m *Manager) waitReady(ctx context.Context, s *Session) error {
 		"check `docker logs "+s.ProxyContainer+"`")
 }
 
-// Apply fills in the spec fields that put a job on this session's network.
-func (s *Session) Apply(spec *isolation.Spec) {
+// ErrSessionInUse is returned by Apply when the session was already handed to a job.
+var ErrSessionInUse = errors.New("this egress session already serves a job: open another session for each job")
+
+// Apply fills in the spec fields that put a job on this session's network. A session serves ONE
+// job: jobs sharing a network could reach each other and would share one proxy's log, so a
+// second Apply fails (and leaves the spec unable to pass validation, so a caller that ignores
+// the error still cannot run it). isolation.Docker.Run enforces the same from Docker's side:
+// it refuses a job whose network has any container besides the proxy and that job.
+func (s *Session) Apply(spec *isolation.Spec) error {
+	if !s.claimed.CompareAndSwap(false, true) {
+		spec.Network = isolation.NetworkAllowlist
+		spec.EgressNetwork, spec.EgressProxy, spec.EgressProxyContainer = "", "", ""
+		return ErrSessionInUse
+	}
 	spec.Network = isolation.NetworkAllowlist
 	spec.EgressNetwork = s.Network
 	spec.EgressProxy = s.ProxyAddr
 	spec.EgressProxyContainer = s.ProxyContainer
+	return nil
 }
 
 // Decisions reads back what the proxy decided, oldest first. It is the record of what a job
@@ -299,14 +336,20 @@ func (s *Session) Decisions(ctx context.Context) ([]Decision, error) {
 	return out, sc.Err()
 }
 
-// Close removes the proxy and the network. It is idempotent and tolerates a half-built session.
+// Close removes the proxy and the network this session created. It is idempotent and tolerates a
+// half-built session: what Open never created (a name that was already taken, a step it did not
+// reach) is left alone.
 func (s *Session) Close(ctx context.Context) error {
 	var firstErr error
-	if _, err := s.m.docker(ctx, "rm", "-f", "-v", s.ProxyContainer); err != nil && !notFound(err) {
-		firstErr = err
+	if s.proxyRef != "" {
+		if _, err := s.m.docker(ctx, "rm", "-f", "-v", s.proxyRef); err != nil && !notFound(err) {
+			firstErr = err
+		}
 	}
-	if _, err := s.m.docker(ctx, "network", "rm", s.Network); err != nil && !notFound(err) && firstErr == nil {
-		firstErr = err
+	if s.netRef != "" {
+		if _, err := s.m.docker(ctx, "network", "rm", s.netRef); err != nil && !notFound(err) && firstErr == nil {
+			firstErr = err
+		}
 	}
 	if firstErr != nil {
 		return setupErr(firstErr, "cannot remove the job's egress network", "something is still attached to it", "run `docker rm -f "+s.ProxyContainer+"` and `docker network rm "+s.Network+"`")

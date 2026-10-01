@@ -31,22 +31,42 @@ and **nothing else**: not the host, the host's LAN or loopback services, cloud m
 3. **The proxy** (`internal/egress.Proxy`) accepts HTTP `CONNECT` only, to a plain hostname
    (never an IP literal) on an allowed port (default 443). For each request it checks the
    allowlist, resolves the name **once**, refuses the request if **any** resolved address is
-   not a public unicast address (loopback, private, link-local including metadata, carrier-grade
-   NAT, multicast, reserved, documentation, and IPv6 forms that wrap an IPv4 address), and
+   in a refused range. The refused ranges are Go's own classes
+   (loopback, private, link-local including metadata, multicast, unspecified) plus a list of
+   special-purpose ranges from the IANA registries (carrier-grade NAT, documentation,
+   benchmarking, reserved, deprecated site-local and 6to4 relay, and the IPv6 forms that wrap an
+   IPv4 address: IPv4-mapped, SIIT, NAT64, 6to4, Teredo). **That is a deny list, not a proof that
+   everything else is public**: a range IANA assigns later is allowed until it is added to
+   `forbiddenPrefixes`. The proxy
    connects to the address it checked, not to the name. A second check runs on the address the
    socket really connects to. This is what makes DNS rebinding irrelevant: a later, different
    answer is never asked for. The address policy has no configuration in the production binary.
+   The name is resolved as an absolute name (trailing dot), so the resolver's search list cannot
+   turn an allowlisted `github.com` into `github.com.<search domain>`, and `/etc/hosts` is not
+   consulted. Every client connection, tunnelled or not, counts against the connection cap, and
+   idle ones (kept alive, or tunnels with no traffic) are closed after `IdleTimeout`.
 4. **The audit** (`internal/isolation`, network mode `allowlist`). After `docker create` and
    before `docker start` the job is refused (BR-E082) unless: its network mode is the egress
    network and it is on no other; it has no extra hosts, links or DNS servers; its proxy
    settings are exactly the ones Blade Runner wrote, with an empty `NO_PROXY` and no other proxy
    variable; and the **network** reads back as internal, a bridge, IPv4 only, with
    `inhibit_ipv4` set, no gateway address, no member but the proxy and the job, and the proxy
-   running at the address the job was told. The proxy container is held to the container
-   hardening audit too, and must be on exactly its two networks. A caller cannot set proxy
-   variables (`Spec.Validate` reserves them).
+   running at the address the job was told. Docker's built-in network names (`bridge`, `host`,
+   `none`, `default`, `container:*`) cannot be named as the egress network. **One job per
+   session** is enforced twice: `Session.Apply` refuses a second job, and the audit lists every
+   container attached to the network with `docker ps -a` (network inspect does not show a
+   container that was created but not started) and refuses any besides the proxy and this job.
+   The same audit repeats every 500 ms while the job runs and kills the job, failing the run
+   with BR-E082, if an unexpected container appears (a container created and started in the gap
+   between two checks can have reached the job for up to that long). The container named as the
+   proxy must be **the one `egress.Open` built**: it carries the manager's labels with the same
+   session id as the network, is the container the network lists under that name, is running,
+   and passes the same hardening audit as a job (a name and an address are not an identity). The
+   proxy container is also held to the hardening audit before it starts, and must be on exactly
+   its two networks. A caller cannot set proxy variables (`Spec.Validate` reserves them).
 5. **Lifecycle** (`egress.Manager` / `Session`): `Open` builds the network and proxy and waits
-   until the proxy answers; `Apply` fills in the `isolation.Spec`; `Close` removes both
+   until the proxy answers (on failure it removes only what that call created, by Docker id:
+   a name collision with another live session fails without touching it); `Apply` fills in the `isolation.Spec`; `Close` removes both
    (idempotent); `Sweep` removes what a crash left behind; `Decisions` reads back what the proxy
    allowed and refused.
 
@@ -120,6 +140,17 @@ because they depend on the code at that moment.
 
 ## Limits
 
+- **Wildcards.** `*.example.com` matches names at any depth below `example.com` (`a.example.com`,
+  `a.b.example.com`), never the apex. A wildcard over a public or multi-tenant suffix
+  (`*.co.uk`, `*.github.io`, `*.herokuapp.com`) is refused, using a small embedded list in
+  `publicsuffix.go` that is **not exhaustive** (the Public Suffix List has thousands of entries):
+  the operator remains responsible for every wildcard they write. Names that read as numeric
+  IPv4 forms (`1.2.3`, `010.1`, `0x7f.1`) are refused as hostnames.
+- **The decision log is bounded, not unlimited.** Refused requests are itemised up to a cap
+  (default 1000) and then counted in a periodic summary line, so a flood of refusals cannot push
+  the allowed records out of Docker's 1 MiB x 2 log; logged host and port text is clipped to 64
+  and 8 bytes. Allowed decisions are always written (each is a real tunnel, bounded by the
+  connection cap).
 - **An allowed name is trusted with whatever the job sends it.** The allowlist limits where a job
   can talk, not what it says: a job holding a token could still use `github.com` to send it
   somewhere (a gist, a push to another repository). A wildcard such as
@@ -147,8 +178,9 @@ because they depend on the code at that moment.
   Docker's `local` log driver (1 MiB, 2 files) until `Close` removes the container.
 - **Concurrent runs share names.** `RemoveStale` acts on every container with the job label, so two
   test or runner processes on one daemon can remove each other's jobs. The repo's Docker tests take
-  a file lock to avoid that between `internal/isolation` and `internal/egress`; other processes
-  are not covered.
+  a file lock (`internal/dockerlock`, in a per-user private directory) to avoid that between
+  `internal/isolation` and `internal/egress`; processes of another user, and other test
+  packages that do not call it, are not covered.
 - **Error codes.** The codes asked for were BR-E080 to BR-E089, but BR-E080 was already the state
   file code, so this uses BR-E081 (invalid allowlist), BR-E082 (egress network could not be built
   or failed its audit) and BR-E083 (the proxy refused a request).
