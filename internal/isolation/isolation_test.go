@@ -205,6 +205,7 @@ func needDocker(t *testing.T) string {
 	if _, err := real.Preflight(ctx); err != nil {
 		t.Skipf("no usable Docker daemon: %v", err)
 	}
+	lockDocker(t)
 	imgOnce.Do(func() {
 		dir, err := os.MkdirTemp("", "probe-img-")
 		if err != nil {

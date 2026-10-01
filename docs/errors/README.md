@@ -6,7 +6,7 @@ has no section below.
 
 Codes are grouped: `E00x` config, `E01x` machine, `E02x` token and GitHub, `E03x` runner
 download, `E04x` registration, `E05x` service, `E06x` public-repository guard, `E07x`
-health, `E08x` state, `E09x` confirmation, `E10x` warnings about placement.
+health, `E08x` state and egress, `E09x` confirmation, `E10x` warnings about placement.
 
 ### BR-E001
 
@@ -309,3 +309,38 @@ asks you to type the runner name, or to pass `--yes` when no terminal is attache
 **Some jobs are pinned to the local runner (`placement: local`).** They queue, and wait,
 while the runner is down instead of falling back to GitHub-hosted runners. Use
 `placement: auto` for jobs that may fall back.
+
+### BR-E081
+
+**The egress allowlist is invalid.** A job that needs the network may reach only the hostnames
+you list, and a list that cannot be trusted is refused rather than guessed at. Each entry must
+be a lower-case ASCII hostname (`github.com`) or a wildcard for subdomains (`*.example.com`,
+which does not match `example.com` itself). Refused: IP addresses (the allowlist is by name),
+ports inside an entry, a bare `*`, a wildcard over a single label (`*.com`), non-ASCII names
+(write the `xn--` form) and an empty list. Ports must be between 1 and 65535. Fix the
+configuration the message names.
+
+### BR-E082
+
+**The job's egress network could not be built, or failed its audit.** For network mode
+`allowlist` Blade Runner creates a Docker network with no route out and no address for the host
+on it, starts one allowlisting proxy attached to that network and to an outbound one, reads
+back what Docker applied and refuses to start the job unless every property holds. The message
+names the step or the violation: for example Docker is not answering, the proxy image is
+missing or not pinned by content, the network is not internal, the host still has an address
+on it (an old Docker that ignores `com.docker.network.bridge.inhibit_ipv4`), the container is
+attached to another network, or the proxy is not running. Update Docker, or report it.
+`docker network ls --filter label=bladerunner.egress` shows leftovers from a crash; the next
+start removes them.
+
+### BR-E083
+
+**The egress proxy refused a request.** This is what a job sees as `403 Forbidden` (or `405`,
+`502`, `503`) from its proxy, and what the proxy's log records as a decision with a reason. The
+reason says which rule held: `not-allowlisted` (the host is not on the list: add it only if the
+job really needs it), `bad-port`, `ip-literal` (jobs must use names), `bad-host`,
+`forbidden-address` (the name is allowed but resolves to a loopback, private, link-local,
+metadata or otherwise internal address; this is never overridable from configuration, it is
+what stops an allowed name from being turned into a way to reach the host or the LAN),
+`unresolvable`, `connect-failed`, `too-many-connections` and `method` (only HTTP `CONNECT` is
+supported, so plain `http://` requests and non-HTTP protocols such as SSH or UDP do not work).

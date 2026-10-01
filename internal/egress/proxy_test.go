@@ -1,0 +1,535 @@
+package egress
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/netip"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// ---- fixtures: real sockets, no DNS --------------------------------------------------
+
+// target is a real TCP listener standing in for a service the job might reach. It echoes
+// whatever it receives, prefixed by a greeting, and counts how many connections it accepted:
+// for a forbidden target the count must stay zero, which is the only proof that nothing connected.
+type target struct {
+	l        net.Listener
+	accepted atomic.Int64
+}
+
+func newTarget(t *testing.T) *target {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tg := &target{l: l}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			tg.accepted.Add(1)
+			go func() {
+				defer c.Close()
+				io.WriteString(c, "hello\n")
+				io.Copy(c, c) // echo
+			}()
+		}
+	}()
+	return tg
+}
+
+func (tg *target) port() string { return strconv.Itoa(tg.l.Addr().(*net.TCPAddr).Port) }
+
+// fixedResolver answers from a table, and counts lookups. A name may have a different answer
+// on each call (answers[i]), which is how DNS rebinding looks to the proxy.
+type fixedResolver struct {
+	mu      sync.Mutex
+	answers map[string][][]netip.Addr
+	calls   map[string]int
+}
+
+func newResolver(m map[string][]string) *fixedResolver {
+	r := &fixedResolver{answers: map[string][][]netip.Addr{}, calls: map[string]int{}}
+	for name, ips := range m {
+		r.add(name, ips...)
+	}
+	return r
+}
+
+func (r *fixedResolver) add(name string, ips ...string) {
+	var as []netip.Addr
+	for _, ip := range ips {
+		as = append(as, netip.MustParseAddr(ip))
+	}
+	r.answers[name] = append(r.answers[name], as)
+}
+
+func (r *fixedResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	seq, ok := r.answers[host]
+	if !ok {
+		return nil, fmt.Errorf("no such host %q", host)
+	}
+	i := r.calls[host]
+	r.calls[host]++
+	if i >= len(seq) {
+		i = len(seq) - 1
+	}
+	return seq[i], nil
+}
+
+func (r *fixedResolver) lookups(host string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[host]
+}
+
+// loopbackOK is a test-only policy that treats loopback as the "internet" so a local listener
+// can be an allowed target. Everything else is judged by the production policy.
+type loopbackOK struct{}
+
+func (loopbackOK) Check(a netip.Addr) error {
+	if a.Unmap().IsLoopback() {
+		return nil
+	}
+	return PublicOnly{}.Check(a)
+}
+
+type recorder struct {
+	mu sync.Mutex
+	ds []Decision
+}
+
+func (r *recorder) observe(d Decision) { r.mu.Lock(); r.ds = append(r.ds, d); r.mu.Unlock() }
+func (r *recorder) last() Decision {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.ds) == 0 {
+		return Decision{}
+	}
+	return r.ds[len(r.ds)-1]
+}
+func (r *recorder) count() int { r.mu.Lock(); defer r.mu.Unlock(); return len(r.ds) }
+
+// startProxy serves p on a real loopback socket and returns its address and decision log.
+func startProxy(t *testing.T, p *Proxy) (string, *recorder) {
+	t.Helper()
+	rec := &recorder{}
+	p.Observe = rec.observe
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- p.Serve(l) }()
+	t.Cleanup(func() {
+		p.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("Serve did not return after Close")
+		}
+	})
+	return l.Addr().String(), rec
+}
+
+func allow(t *testing.T, entries ...string) Allowlist {
+	t.Helper()
+	a, err := ParseAllowlist(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// connectVia sends one CONNECT through the proxy and returns the status line, and the open
+// connection and reader if it was accepted.
+func connectVia(t *testing.T, proxy, authority string, pipelined string) (status string, c net.Conn, r *bufio.Reader) {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", proxy, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n%s", authority, authority, pipelined)
+	r = bufio.NewReader(c)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("CONNECT %s: %v", authority, err)
+	}
+	status = strings.TrimSpace(line)
+	if strings.Contains(status, " 200 ") {
+		for { // header block
+			l, err := r.ReadString('\n')
+			if err != nil || strings.TrimSpace(l) == "" {
+				break
+			}
+		}
+	}
+	return status, c, r
+}
+
+func wantStatus(t *testing.T, status string, code int) {
+	t.Helper()
+	if !strings.HasPrefix(status, "HTTP/1.1 "+strconv.Itoa(code)) {
+		t.Errorf("status = %q, want %d", status, code)
+	}
+}
+
+// ---- the proxy ------------------------------------------------------------------------
+
+func TestAnAllowedNameIsTunnelledBothWays(t *testing.T) {
+	tg := newTarget(t)
+	addr, rec := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())},
+		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}}), Policy: loopbackOK{},
+	})
+	status, c, r := connectVia(t, addr, "allowed.test:"+tg.port(), "")
+	wantStatus(t, status, 200)
+	if greeting, _ := r.ReadString('\n'); greeting != "hello\n" {
+		t.Errorf("greeting through the tunnel = %q", greeting)
+	}
+	io.WriteString(c, "ping\n")
+	if echo, _ := r.ReadString('\n'); echo != "ping\n" {
+		t.Errorf("echo through the tunnel = %q", echo)
+	}
+	if d := rec.last(); !d.Allowed || d.Reason != ReasonAllowed || d.Host != "allowed.test" || len(d.Resolved) != 1 {
+		t.Errorf("decision = %+v", d)
+	}
+}
+
+func TestBytesPipelinedBehindTheConnectAreDelivered(t *testing.T) {
+	tg := newTarget(t)
+	addr, _ := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())},
+		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}}), Policy: loopbackOK{},
+	})
+	status, _, r := connectVia(t, addr, "allowed.test:"+tg.port(), "early\n")
+	wantStatus(t, status, 200)
+	r.ReadString('\n') // greeting
+	if echo, _ := r.ReadString('\n'); echo != "early\n" {
+		t.Errorf("echo of the pipelined bytes = %q: data sent right after CONNECT must not be lost", echo)
+	}
+}
+
+func TestANameNotOnTheListIsRefusedAndNothingConnects(t *testing.T) {
+	tg := newTarget(t)
+	res := newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}, "forbidden.test": {"127.0.0.1"}})
+	addr, rec := startProxy(t, &Proxy{Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())}, Resolver: res, Policy: loopbackOK{}})
+	status, _, _ := connectVia(t, addr, "forbidden.test:"+tg.port(), "")
+	wantStatus(t, status, 403)
+	if d := rec.last(); d.Allowed || d.Reason != ReasonNotAllowlist {
+		t.Errorf("decision = %+v", d)
+	}
+	if res.lookups("forbidden.test") != 0 {
+		t.Error("a name that is not allowed must not even be resolved")
+	}
+	if tg.accepted.Load() != 0 {
+		t.Error("the target was contacted for a forbidden name")
+	}
+}
+
+// The central guarantee: a name on the allowlist that resolves to somewhere internal does not
+// become a way to reach it.
+func TestAnAllowedNameThatResolvesInsideIsRefused(t *testing.T) {
+	tg := newTarget(t) // a real listener on loopback: if the proxy connected, accepted would be 1
+	for _, ip := range []string{"127.0.0.1", "::1", "::ffff:127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.9", "169.254.169.254", "100.100.100.200", "0.0.0.0", "fd00:ec2::254"} {
+		t.Run(ip, func(t *testing.T) {
+			addr, rec := startProxy(t, &Proxy{ // the PRODUCTION policy
+				Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())},
+				Resolver: newResolver(map[string][]string{"allowed.test": {ip}}),
+			})
+			status, _, _ := connectVia(t, addr, "allowed.test:"+tg.port(), "")
+			wantStatus(t, status, 403)
+			if d := rec.last(); d.Allowed || d.Reason != ReasonForbiddenAddr {
+				t.Errorf("decision = %+v", d)
+			}
+		})
+	}
+	if tg.accepted.Load() != 0 {
+		t.Errorf("the loopback target was contacted %d times although every name resolved inside", tg.accepted.Load())
+	}
+}
+
+func TestOneInternalAddressAmongPublicOnesRefusesTheName(t *testing.T) {
+	tg := newTarget(t)
+	addr, rec := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())},
+		Resolver: newResolver(map[string][]string{"allowed.test": {"93.184.216.34", "127.0.0.1"}}),
+	})
+	status, _, _ := connectVia(t, addr, "allowed.test:"+tg.port(), "")
+	wantStatus(t, status, 403)
+	if d := rec.last(); d.Reason != ReasonForbiddenAddr || len(d.Resolved) != 2 {
+		t.Errorf("decision = %+v", d)
+	}
+	if tg.accepted.Load() != 0 {
+		t.Error("the proxy connected although one answer was internal")
+	}
+}
+
+func TestAnIPLiteralIsNeverAccepted(t *testing.T) {
+	tg := newTarget(t)
+	addr, rec := startProxy(t, &Proxy{Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())}, Resolver: newResolver(nil), Policy: loopbackOK{}})
+	for _, authority := range []string{"127.0.0.1:" + tg.port(), "[::1]:" + tg.port(), "169.254.169.254:" + tg.port(), "93.184.216.34:" + tg.port(), "[::ffff:127.0.0.1]:" + tg.port()} {
+		status, _, _ := connectVia(t, addr, authority, "")
+		wantStatus(t, status, 403)
+		if d := rec.last(); d.Reason != ReasonIPLiteral {
+			t.Errorf("%s: decision = %+v", authority, d)
+		}
+	}
+	if tg.accepted.Load() != 0 {
+		t.Error("an IP literal reached the target")
+	}
+}
+
+func TestMalformedTargetsAreRefused(t *testing.T) {
+	tg := newTarget(t)
+	addr, rec := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())},
+		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}}), Policy: loopbackOK{},
+	})
+	for name, authority := range map[string]string{
+		"userinfo trick":         "evil.com@allowed.test:" + tg.port(),
+		"allowed name as a user": "allowed.test@evil.com:" + tg.port(),
+		"a space":                "allowed .test:" + tg.port(),
+		"no port":                "allowed.test",
+		"a percent escape":       "allowed.test%2e:" + tg.port(),
+		"a path":                 "allowed.test/x:" + tg.port(),
+	} {
+		status, _, _ := connectVia(t, addr, authority, "")
+		if !strings.HasPrefix(status, "HTTP/1.1 400") && !strings.HasPrefix(status, "HTTP/1.1 403") {
+			t.Errorf("%s: status = %q, want a refusal", name, status)
+		}
+	}
+	if tg.accepted.Load() != 0 {
+		t.Error("a malformed target reached the target")
+	}
+	if rec.count() == 0 {
+		t.Error("refusals must be recorded")
+	}
+}
+
+func TestHostCaseAndTrailingDotAreNormalisedBeforeTheAllowlist(t *testing.T) {
+	tg := newTarget(t)
+	res := newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}})
+	addr, _ := startProxy(t, &Proxy{Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())}, Resolver: res, Policy: loopbackOK{}})
+	for _, authority := range []string{"ALLOWED.Test:" + tg.port(), "allowed.test.:" + tg.port()} {
+		status, _, _ := connectVia(t, addr, authority, "")
+		wantStatus(t, status, 200)
+	}
+}
+
+func TestOnlyAllowedPortsAreReachable(t *testing.T) {
+	tg := newTarget(t)
+	addr, rec := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())},
+		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}}), Policy: loopbackOK{},
+	})
+	for _, port := range []string{"22", "80", "0", "65536", "0443"} {
+		status, _, _ := connectVia(t, addr, "allowed.test:"+port, "")
+		wantStatus(t, status, 403)
+		if d := rec.last(); d.Reason != ReasonBadPort {
+			t.Errorf("port %q: decision = %+v", port, d)
+		}
+	}
+	// Spellings Go's own HTTP parser or the proxy's strict parse refuses: either answer is a refusal.
+	for _, port := range []string{"-1", "abc", "+" + tg.port(), tg.port() + " ", ""} {
+		status, _, _ := connectVia(t, addr, "allowed.test:"+port, "")
+		if !strings.HasPrefix(status, "HTTP/1.1 400") && !strings.HasPrefix(status, "HTTP/1.1 403") {
+			t.Errorf("port %q: status = %q, want a refusal", port, status)
+		}
+	}
+	if tg.accepted.Load() != 0 {
+		t.Error("a disallowed port reached the target")
+	}
+}
+
+func TestOnlyConnectIsSupported(t *testing.T) {
+	tg := newTarget(t)
+	addr, rec := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())},
+		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}}), Policy: loopbackOK{},
+	})
+	for _, req := range []string{
+		"GET http://allowed.test:" + tg.port() + "/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+		"POST http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 0\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+	} {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		io.WriteString(c, req)
+		line, _ := bufio.NewReader(c).ReadString('\n')
+		c.Close()
+		wantStatus(t, strings.TrimSpace(line), 405)
+		if d := rec.last(); d.Reason != ReasonMethod {
+			t.Errorf("decision = %+v", d)
+		}
+	}
+	if tg.accepted.Load() != 0 {
+		t.Error("a plain HTTP request reached the target")
+	}
+}
+
+func TestAnUnresolvableAllowedNameFails(t *testing.T) {
+	addr, rec := startProxy(t, &Proxy{Allow: allow(t, "allowed.test"), Ports: []int{443}, Resolver: newResolver(nil)})
+	status, _, _ := connectVia(t, addr, "allowed.test:443", "")
+	wantStatus(t, status, 502)
+	if d := rec.last(); d.Reason != ReasonUnresolvable {
+		t.Errorf("decision = %+v", d)
+	}
+}
+
+// DNS rebinding: a name that answers with a safe address once and an internal one the next
+// time. The proxy asks once and connects to the address it checked, so the second answer is
+// never seen.
+func TestRebindingCannotRedirectAConnectionAfterTheCheck(t *testing.T) {
+	tg := newTarget(t)
+	res := newResolver(nil)
+	res.add("rebind.test", "127.0.0.1") // first answer: passes the (test) policy
+	res.add("rebind.test", "10.9.9.9")  // every later answer: internal
+	addr, _ := startProxy(t, &Proxy{Allow: allow(t, "rebind.test"), Ports: []int{atoi(tg.port())}, Resolver: res, Policy: loopbackOK{}})
+	status, _, r := connectVia(t, addr, "rebind.test:"+tg.port(), "")
+	wantStatus(t, status, 200)
+	if g, _ := r.ReadString('\n'); g != "hello\n" {
+		t.Errorf("greeting = %q: the connection must have gone to the checked address", g)
+	}
+	if n := res.lookups("rebind.test"); n != 1 {
+		t.Errorf("the name was resolved %d times, want exactly once", n)
+	}
+}
+
+// The address the socket really connects to is checked again, at connect time. This policy
+// approves an address when asked about the resolution and refuses the same address afterwards,
+// as if the world changed in between; only a check at dial time can catch that.
+type flipPolicy struct{ calls atomic.Int64 }
+
+func (f *flipPolicy) Check(netip.Addr) error {
+	if f.calls.Add(1) == 1 {
+		return nil
+	}
+	return fmt.Errorf("refused at connect time")
+}
+
+func TestTheDialedAddressIsCheckedAgain(t *testing.T) {
+	tg := newTarget(t)
+	pol := &flipPolicy{}
+	addr, rec := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())},
+		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}}), Policy: pol,
+	})
+	status, _, _ := connectVia(t, addr, "allowed.test:"+tg.port(), "")
+	wantStatus(t, status, 502)
+	if d := rec.last(); d.Reason != ReasonConnectFailed || !strings.Contains(d.Detail, "refused at connect time") {
+		t.Errorf("decision = %+v", d)
+	}
+	if tg.accepted.Load() != 0 {
+		t.Error("the connection was made although the dial-time check refused it")
+	}
+}
+
+func TestTooManyTunnelsAreRefusedAndASlotFreesUp(t *testing.T) {
+	tg := newTarget(t)
+	addr, rec := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())}, MaxConns: 1,
+		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}}), Policy: loopbackOK{},
+	})
+	status, first, _ := connectVia(t, addr, "allowed.test:"+tg.port(), "")
+	wantStatus(t, status, 200)
+	status, _, _ = connectVia(t, addr, "allowed.test:"+tg.port(), "")
+	wantStatus(t, status, 503)
+	if d := rec.last(); d.Reason != ReasonTooMany {
+		t.Errorf("decision = %+v", d)
+	}
+	first.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		status, c, _ := connectVia(t, addr, "allowed.test:"+tg.port(), "")
+		if strings.Contains(status, " 200 ") {
+			c.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the slot never freed after the first tunnel closed: %s", status)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestAnIdleTunnelIsClosed(t *testing.T) {
+	// A target that accepts and then says nothing.
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer l.Close()
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	port := l.Addr().(*net.TCPAddr).Port
+	addr, _ := startProxy(t, &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{port}, IdleTimeout: 300 * time.Millisecond,
+		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}}), Policy: loopbackOK{},
+	})
+	status, c, r := connectVia(t, addr, "allowed.test:"+strconv.Itoa(port), "")
+	wantStatus(t, status, 200)
+	start := time.Now()
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := r.ReadByte(); err != io.EOF {
+		t.Errorf("read = %v, want the proxy to close the idle tunnel (EOF)", err)
+	}
+	if time.Since(start) > 4*time.Second {
+		t.Errorf("the idle tunnel stayed open for %v", time.Since(start))
+	}
+}
+
+func TestCloseEndsOpenTunnels(t *testing.T) {
+	tg := newTarget(t)
+	p := &Proxy{
+		Allow: allow(t, "allowed.test"), Ports: []int{atoi(tg.port())},
+		Resolver: newResolver(map[string][]string{"allowed.test": {"127.0.0.1"}}), Policy: loopbackOK{},
+	}
+	addr, _ := startProxy(t, p)
+	status, c, r := connectVia(t, addr, "allowed.test:"+tg.port(), "")
+	wantStatus(t, status, 200)
+	r.ReadString('\n')
+	p.Close()
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := r.ReadByte(); err == nil || strings.Contains(err.Error(), "timeout") {
+		t.Errorf("read = %v, want the tunnel closed by Close", err)
+	}
+}
+
+func TestDefaultsApplyWhenNothingIsConfigured(t *testing.T) {
+	p := &Proxy{}
+	if got := p.ports(); len(got) != 1 || got[0] != 443 {
+		t.Errorf("default ports = %v", got)
+	}
+	if _, ok := p.policy().(PublicOnly); !ok {
+		t.Errorf("default policy = %T, must be PublicOnly", p.policy())
+	}
+	if p.resolver() != net.DefaultResolver {
+		t.Error("default resolver must be the system resolver")
+	}
+}
+
+func atoi(s string) int { n, _ := strconv.Atoi(s); return n }

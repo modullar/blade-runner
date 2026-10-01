@@ -12,7 +12,8 @@ import (
 // actually applied, not the flags we asked for.
 type inspected struct {
 	Config struct {
-		User string `json:"User"`
+		User string   `json:"User"`
+		Env  []string `json:"Env"`
 	} `json:"Config"`
 	HostConfig struct {
 		Privileged      bool              `json:"Privileged"`
@@ -35,7 +36,13 @@ type inspected struct {
 		PublishAllPorts bool              `json:"PublishAllPorts"`
 		PortBindings    map[string]any    `json:"PortBindings"`
 		Tmpfs           map[string]string `json:"Tmpfs"`
+		ExtraHosts      []string          `json:"ExtraHosts"`
+		Links           []string          `json:"Links"`
+		DNS             []string          `json:"Dns"`
 	} `json:"HostConfig"`
+	NetworkSettings struct {
+		Networks map[string]json.RawMessage `json:"Networks"`
+	} `json:"NetworkSettings"`
 	Mounts []struct {
 		Type        string `json:"Type"`
 		Source      string `json:"Source"`
@@ -92,6 +99,9 @@ func Audit(inspectJSON []byte, want Spec) ([]string, error) {
 	if want.Network == NetworkNone && h.NetworkMode != "none" {
 		add("was asked for no network but has network mode %q", h.NetworkMode)
 	}
+	if want.Network == NetworkAllowlist {
+		v = append(v, auditEgressContainer(c, want)...)
+	}
 	if len(h.Devices) > 0 {
 		add("has host devices attached")
 	}
@@ -132,7 +142,14 @@ func AuditError(name string, violations []string) error {
 	if len(violations) == 0 {
 		return nil
 	}
-	return diag.New(diag.CodeIsolation,
+	code := diag.CodeIsolation
+	for _, x := range violations {
+		if strings.HasPrefix(x, egressPrefix) {
+			code = diag.CodeEgressSetup // the network design, not the container hardening, failed
+			break
+		}
+	}
+	return diag.New(code,
 		fmt.Sprintf("container %s was NOT started: it is not confined as required", name),
 		"Docker applied a different configuration than was asked for:\n    - "+strings.Join(violations, "\n    - "),
 		"update Docker, or report this: Blade Runner will not run a job that is less confined than specified")

@@ -61,6 +61,16 @@ and a real repository; see [decision 0005](decisions/0005-only-your-code-runs-he
   re-ran it.
 - The fork-approval endpoint and its `approval_policy` values.
 
+## Network access for isolated jobs
+
+An isolated job gets no network (`none`, the default). A job that must reach GitHub uses the
+`allowlist` mode instead of `bridge`: it runs on a network with no route out and no address for
+the host, and reaches only the hostnames you list, through a proxy that also refuses any name that
+resolves to a loopback, private, link-local or metadata address. The container is audited before it
+starts and is refused if its network is anything else. Built and tested on Linux with real Docker,
+**not yet verified on macOS**, and not yet started by anything. The allowed hosts can still receive
+whatever the job sends them. See [decision 0008](decisions/0008-egress.md).
+
 ## What this does not protect against
 
 - **A trusted actor's own code is trusted.** It runs as you, with your files, your Keychain and

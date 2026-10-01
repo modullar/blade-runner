@@ -27,6 +27,8 @@ fake can only confirm the code agrees with itself.
 
 | C4 to C9 | The supervisor's further assumptions: run cancellation, `runner_name` on jobs, job statuses, JIT labels, pagination, the runner image reading its config from stdin | **Open**; see [0007](0007-supervisor.md), which also states the shared-queue race it narrows but does not close | `provider/github`, `internal/supervisor` |
 
+Egress (a job that needs the network reaches only allowlisted hostnames, not the host, LAN, metadata or other containers) is [0008](0008-egress.md): built and tested on Linux with real Docker, **not verified on macOS**; it lives in `internal/egress` and the `allowlist` mode of `internal/isolation`.
+
 The current direction, cryptographic admission plus isolated runners, is
 [0006](0006-signed-admission-and-isolation.md); it supersedes the login-based hook of 0005 once built.
 
