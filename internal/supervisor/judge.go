@@ -118,8 +118,9 @@ func (j *judger) judge(ctx context.Context, o observed) judgement {
 	switch {
 	case a.err == nil:
 		return judgement{Obs: o, Kind: admitted, Subject: subj, Verdict: a.verdict}
-	case diag.CodeOf(a.err) == diag.CodeNotAdmitted && !strings.HasPrefix(what(a.err), "cannot fetch commit"):
-		// A real "no": the commit was read and failed a check.
+	case diag.CodeOf(a.err) == diag.CodeNotAdmitted:
+		// A real "no", told by its code and nothing else: the commit was read and failed a check,
+		// or GitHub says it does not exist (404/422), which no retry will change.
 		return judgement{Obs: o, Kind: refused, Code: diag.CodeJobRefused, Reason: what(a.err), Subject: subj}
 	default:
 		// The commit could not be read at all (provider error), or the answer is not a verdict.

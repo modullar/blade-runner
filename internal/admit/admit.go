@@ -30,7 +30,9 @@ func (a *Admitter) Admit(ctx context.Context, s Subject) (trust.Verdict, error) 
 	c, err := a.Provider.Commit(ctx, s.Repository, s.SHA)
 	if err != nil {
 		if diag.CodeOf(err) == "" {
-			return trust.Verdict{}, diag.Wrap(err, diag.CodeNotAdmitted, "cannot fetch commit "+s.SHA, "GitHub could not be reached", "re-run")
+			// Not a verdict on the commit: GitHub could not be asked. It must not carry
+			// BR-E067, which callers read as "this commit is not allowed to run".
+			return trust.Verdict{}, diag.Wrap(err, diag.CodeGitHubUnavailable, "cannot fetch commit "+s.SHA, "GitHub could not be reached", "re-run")
 		}
 		return trust.Verdict{}, err
 	}

@@ -256,7 +256,15 @@ func (c *Client) Commit(ctx context.Context, repository, sha string) (provider.C
 			Payload   *string `json:"payload"`
 		} `json:"verification"`
 	}
-	if _, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/git/commits/"+sha, c.Token != nil, &out); err != nil {
+	if resp, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/git/commits/"+sha, c.Token != nil, &out); err != nil {
+		if resp != nil && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusUnprocessableEntity) {
+			// GitHub says there is no such commit. Retrying will not change that, so this is a
+			// definitive "not admitted", not "GitHub could not be reached": a caller that treated
+			// it as transient would wait on it for ever.
+			return provider.Commit{}, diag.Wrap(err, diag.CodeNotAdmitted, fmt.Sprintf("commit %s cannot be fetched from %s (HTTP %d)", sha, repository, resp.StatusCode),
+				"the commit was deleted or force-pushed away, or its fork was deleted (or the token cannot see the repository: GitHub answers 404 to hide private ones)",
+				"nothing can run from a commit that does not exist; push the change again")
+		}
 		return provider.Commit{}, err
 	}
 	cm := provider.Commit{SHA: out.SHA}

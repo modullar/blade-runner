@@ -46,6 +46,7 @@ type Server struct {
 	ForkApproval map[string]string
 	commits      map[string]commitData // "owner/repo@sha"
 	commitOrder  map[string][]string   // repo -> shas, oldest first
+	commitStatus map[string]int        // sha -> forced HTTP status
 	runs         map[string][]provider.Run
 	jobs         map[string][]provider.Job
 	// JITUnsupported makes generate-jitconfig answer 404, as an API without it would.
@@ -122,6 +123,17 @@ func (s *Server) AddCommit(repo, sha, payload, signature string) {
 		s.commitOrder = map[string][]string{}
 	}
 	s.commitOrder[repo] = append(s.commitOrder[repo], sha)
+}
+
+// SetCommitStatus makes the commit endpoint answer with this HTTP status for sha, whatever else
+// it knows: 404 and 422 are what GitHub says for a commit that does not exist (a deleted fork).
+func (s *Server) SetCommitStatus(sha string, status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.commitStatus == nil {
+		s.commitStatus = map[string]int{}
+	}
+	s.commitStatus[sha] = status
 }
 
 // AddRun makes a workflow run visible for repo (newest last; the API lists newest first).
@@ -330,7 +342,12 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, repo, sha 
 	authed := r.Header.Get("Authorization") == "Bearer "+s.Token
 	s.mu.Lock()
 	cd, have := s.commits[repo+"@"+sha]
+	status, forced := s.commitStatus[sha]
 	s.mu.Unlock()
+	if forced {
+		writeJSON(w, status, map[string]string{"message": http.StatusText(status)})
+		return
+	}
 	if !known || !have || (private && !authed) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
 		return
