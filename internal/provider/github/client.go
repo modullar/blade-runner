@@ -239,6 +239,20 @@ func (c *Client) ForkApprovalPolicy(ctx context.Context, repository string) (str
 	return out.Policy, nil
 }
 
+// verificationUnavailable are the "verification.reason" values that mean GitHub's verification
+// service could not answer, as opposed to saying the commit is unsigned or its key unknown.
+//
+// ASSUMPTION C13, UNVERIFIED: this list is written from memory of GitHub's documented reason
+// codes, not observed (docs/decisions/0007-supervisor.md). A reason GitHub uses for an outage that
+// is missing here makes such a commit read as unsigned: a refusal that clears itself only when the
+// commit is pushed again. That fails closed. The danger of the other direction, listing a reason
+// that really means "unsigned", is that an unsigned commit is withheld for ever instead of refused:
+// nothing runs either way. BR-0 has to confirm the names.
+var verificationUnavailable = map[string]bool{
+	"gpgverify_unavailable": true,
+	"gpgverify_error":       true,
+}
+
 var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // Commit fetches a commit's signed payload and signature. It uses the token when one is
@@ -258,6 +272,7 @@ func (c *Client) Commit(ctx context.Context, repository, sha string) (provider.C
 		Verification struct {
 			Signature *string `json:"signature"`
 			Payload   *string `json:"payload"`
+			Reason    string  `json:"reason"`
 		} `json:"verification"`
 	}
 	if resp, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/git/commits/"+sha, c.Token != nil, &out); err != nil {
@@ -284,6 +299,14 @@ func (c *Client) Commit(ctx context.Context, repository, sha string) (provider.C
 			return provider.Commit{}, notFound(err, sha, repository, "GitHub answered 404 for it although the repository itself is readable")
 		}
 		return provider.Commit{}, err
+	}
+	if (out.Verification.Signature == nil || *out.Verification.Signature == "") && verificationUnavailable[out.Verification.Reason] {
+		// No signature in the answer, and GitHub says why: it could not look. That is not "this
+		// commit is unsigned" (a refusal, and a permanent-looking one), it is "ask again".
+		return provider.Commit{}, diag.Wrap(errors.Join(fmt.Errorf("verification reason %q", out.Verification.Reason), provider.ErrCommitUnavailable),
+			diag.CodeGitHubUnavailable, fmt.Sprintf("GitHub could not check the signature of commit %s in %s (reason %q)", sha, repository, out.Verification.Reason),
+			"GitHub's signature verification service was unavailable, so no signature came back",
+			"nothing was decided about the commit; it is tried again at the next poll")
 	}
 	cm := provider.Commit{SHA: out.SHA}
 	for _, p := range out.Parents {
@@ -470,6 +493,10 @@ func (c *Client) listRuns(ctx context.Context, repository, status string, limit 
 							URL string `json:"url"`
 						} `json:"repo"`
 					} `json:"head"`
+					Base *struct {
+						Ref string `json:"ref"`
+						SHA string `json:"sha"`
+					} `json:"base"`
 				} `json:"pull_requests"`
 			} `json:"workflow_runs"`
 		}
@@ -486,6 +513,9 @@ func (c *Client) listRuns(ctx context.Context, repository, status string, limit 
 			}
 			for _, pr := range r.PullRequests {
 				ref := provider.PullRequest{Number: pr.Number}
+				if pr.Base != nil {
+					ref.BaseRef, ref.BaseSHA = pr.Base.Ref, pr.Base.SHA
+				}
 				if pr.Head != nil {
 					ref.HeadSHA = pr.Head.SHA
 					if pr.Head.Repo != nil {

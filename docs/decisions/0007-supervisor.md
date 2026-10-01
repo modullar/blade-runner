@@ -229,8 +229,11 @@ a refusal and never grounds to cancel a run):
 
 ```
 run ── names exactly one pull request ─────────────────────────────── else refuse
-  1. GET pulls/N        open · base repo is this one · head sha = the run's head sha ·
-                        head repository = the run's · mergeable true · merge_commit_sha present
+  1. GET pulls/N        open · number is N · base repo is this one · base branch = the base ref
+                        the run's own pull_requests[] entry records (refuse when it differs) ·
+                        head sha = the run's head sha · head repository = the run's · mergeable
+                        true · merge_commit_sha present · base sha = the base sha the run's entry
+                        records (it differs: the base moved since the run was created: withhold)
                         (mergeable null or the PR unreadable: withhold; false or closed: refuse)
   2. GET commit M       the merge commit, from the BASE repository:
                         exactly two parents · parents[0] = base.sha · parents[1] = head sha
@@ -247,9 +250,28 @@ run ── names exactly one pull request ────────────�
 Step 2 is what binds "what will run" to "what is verified": the job's `GITHUB_SHA` is the merge
 commit, whose tree is the merge of two verified trees. Refusals outrank transients (a commit that
 failed is the answer whatever else could not be fetched). The commits of one pull request are
-verified by a bounded pool of 4 workers; after the first refusal the commits not yet started are
-skipped (so the detail names the first refusal found, not necessarily every bad commit). A pull
-request is read once per assessment however many jobs its run has.
+verified by a bounded pool of 4 workers; after a refusal the commits beyond it that are not yet
+started are skipped (an API call saved at every poll), so the detail does not name every bad
+commit. **It always names the lowest-index bad commit, whatever the timing of the workers:** a
+commit before the lowest refusal found so far is never skipped, so the refusal text, which goes
+into the audit log through `recordOnce`, cannot flap between two bad commits from poll to poll.
+The commit list is de-duplicated (a sha listed twice is verified, and audited, once). The result
+slot of a commit is "unset" until written, and unset is not admitted: only a result that says
+admitted lets a pull request through. A pull request is read once per assessment however many
+jobs its run has, and that verdict is remembered per (number, head repository, head sha, the base
+ref and base sha the run records), so two runs of one pull request number (a stale run and the
+current one, or one naming another repository) are each judged on their own.
+
+**The run's own `pull_requests[]` entry is compared with the pull request that was fetched.**
+Two open pull requests can have the same head commit into different bases, and a run lists one of
+them. If the base **branch** the run's entry records differs from the fetched pull request's, the
+run is not for this pull request as it stands: refused (BR-E072, the detail names both branches).
+If only the base **sha** differs, the base moved since the run was created: withheld (BR-E076) and
+judged again at the next poll, never refused. The run's `GITHUB_SHA` may then be the merge onto
+the OLD tip, which nothing here verified (see (f)); withholding is the safe answer, and a run
+that records a base sha that never catches up stays withheld until it is superseded by a newer
+run (a push to the pull request). A run entry that carries no base ref or sha (C10b, below) is not
+compared on that field. A pull request endpoint that answers with another number is refused.
 
 **Re-judged at every poll, and while a runner waits.** Nothing about a pull request is cached
 across polls except the fetch of commit objects (below). The judgement carries the merge commit
@@ -261,10 +283,19 @@ at, or when anything on the new one no longer passes. The next poll judges the n
 from scratch and runs it if it passes. A runner that already has its job is not killed
 (unchanged rule).
 
+**When a waiting job cannot be judged for 3 polls in a row**, the watcher stops the runner only if
+the repositories on the failing side read fine: the base repository when the pull request, the
+merge commit, the base tip or the commit list could not be read, the base and the fork when a
+commit could not be fetched. Before, only the head repository was asked, so a fork that read fine
+stopped a runner whose real problem was an unreadable base, and a gone fork kept alive a runner
+whose base side was failing with the base readable.
+
 **The audit record.** The `launching` entry of a pull request lists the merge commit (`merge_sha`)
 and every verified commit (`verified_commits`: role `base-tip` or `pr-commit`, the repository it
-was fetched from, sha, signer name and fingerprint), the first 50 and `verified_total` for the
-count.
+was fetched from, sha, signer name and fingerprint), at most 50 and `verified_total` for the
+count. When there are more than 50, the **base tip and the head commit are always listed** (with
+their signers: they are the two commits the merge commit is made of), and the rest are the oldest
+others in order, up to the bound.
 
 ### What it costs, in API calls
 
@@ -272,7 +303,9 @@ For one pull request with N commits (N <= 100) the first judgement makes **3 + P
 the pull request, the merge commit, the base tip, P pages of the commit list (P = 1 for up to 100
 commits, at most 3), and one fetch per commit; plus one repository read per commit GitHub
 answers 404 for. A commit never changes under its id, so the supervisor's admitter
-(`admit.CommitCache`, 4096 commits) remembers what it fetched, and **only the fetch**: the
+(`admit.CommitCache`, 4096 commits and 16 MiB, whichever is reached first, oldest evicted first; a
+commit bigger than the whole byte budget is not kept; the key names the repository, so a commit
+cached for one repository is never served for another) remembers what it fetched, and **only the fetch**: the
 signature is checked against the trust store as it is now at every poll, so a revocation still
 takes effect at the next one. Every later poll (and every 15 s watcher poll while a runner waits)
 therefore costs **2 + P** requests (the pull request, the commit list pages, the merge commit
@@ -313,7 +346,10 @@ refuse again).
   a run on its old merge commit, that merge was made against an older base tip that was never
   verified here. The re-judge on every poll narrows this (a moved base withholds the runner and
   the new merge is verified) but cannot close it. Whether a re-created merge is what a queued
-  run executes is part of what BR-0 must establish (see C10).
+  run executes is part of what BR-0 must establish (see C10). The comparison with the run's own
+  recorded base (above) turns the most visible case, a base that moved since the run was created,
+  into a withhold, but only to the extent GitHub keeps `pull_requests[].base.sha` as of the run's
+  creation (C10b).
 - **(g) A run from a fork may name no pull request.** The run's `pull_requests[]` is empty for
   runs from forks, as far as is recalled (C3, unverified). A run that names zero pull requests is
   refused, because which pull request, and so which merge commit, it is for cannot be told. If
@@ -366,7 +402,9 @@ correction changes the adapter and, at most, the field comments in `provider.go`
 | C10 | **UNVERIFIED (needs BR-0).** `GET /repos/{r}/pulls/{n}` returns `state`, `base.{ref,sha,repo.full_name}`, `head.{sha,repo.full_name}` (null for a deleted fork), `commits`, `mergeable` (null until GitHub computes it) and `merge_commit_sha`; for an open, mergeable pull request `merge_commit_sha` is the commit a `pull_request` job runs (`GITHUB_SHA`) | A missing field refuses the job (BR-E072); null `mergeable` withholds it. If `merge_commit_sha` is NOT what the job runs, the admitted merge is not the executed one (see (f)) and this design does not hold |
 | C11 | **UNVERIFIED (needs BR-0).** `GET /repos/{r}/pulls/{n}/commits` lists every commit of the pull request, paginated at 100, up to a cap of 250 | A list that stops short of the pull request's own count, or reaches 250, is refused as too many commits |
 | C12 | **UNVERIFIED (needs BR-0).** The merge commit (`GET /repos/{r}/git/commits/{merge sha}`) lists exactly two `parents`, `parents[0]` the base tip (`base.sha`) and `parents[1]` the pull request head | Any other shape is refused; if GitHub orders them the other way every pull request is refused (fails closed) |
-| C12b | **UNVERIFIED (needs BR-0).** The commits of a pull request from a fork can be read with `GET /repos/{base}/git/commits/{sha}` | The supervisor then asks the fork's repository; a commit neither serves withholds the job |
+| C10b | **UNVERIFIED (needs BR-0).** A run's `pull_requests[]` entries carry `base.ref` and `base.sha` (the branch and its tip when the run was created) | An entry without them is not compared on that field (no refusal, no withhold): the check is weaker, not wrong. A `base.sha` that GitHub keeps current would make the moved-base withhold never fire; one that is never updated withholds a run for ever (until a newer run supersedes it) |
+| C12b | **UNVERIFIED (needs BR-0).** The commits of a pull request from a fork can be read with `GET /repos/{base}/git/commits/{sha}`, with their `verification.signature` and `verification.payload` | The supervisor then asks the fork's repository; a commit neither serves withholds the job |
+| C13 | **UNVERIFIED, FROM MEMORY (needs BR-0).** When GitHub's signature verification service cannot answer, `verification.signature` is null or empty and `verification.reason` is `gpgverify_unavailable` or `gpgverify_error`; every other reason with no signature (`unsigned`, `unknown_key`, ...) means there is nothing to verify | **The two reason names were written from memory and have not been observed; the list is in `internal/provider/github/client.go` (`verificationUnavailable`) and is probably incomplete.** Such an answer is "not now": the commit is withheld (BR-E076), never refused as unsigned. A reason name GitHub uses for an outage that is missing from the list makes the commit read as unsigned: refused, which fails closed (a refusal, not a run). A signature that came back is verified by this machine whatever the reason says |
 
 ## Diagnostic codes
 
@@ -456,6 +494,22 @@ through the real command line with a real Docker container, a pull request of th
 runs and one with an untrusted contributor that is refused (and runs once they are trusted), plus
 the removed config key.
 
+Hardening round (independent review of the above), each item with a test written first and each
+test shown to fail when the fix is removed by hand: the run's recorded base ref and sha against the
+fetched pull request (two open pull requests with one head into different bases; a moved base;
+another number), the provider reading `base` out of the run listing; the zero value of the
+admission class not admitted (`firstNotAdmitted` over an unwritten slot); the audit bound keeping
+the base tip and the head of a 120-commit pull request; the verdict key (two runs of one number
+with another head sha and another head repository in one assessment, each key part mutated
+separately); a sha listed twice; the commit cache keyed by repository, and bounded by bytes with
+FIFO eviction and an oversized entry that flushes nothing; the early stop (at most 8 of 41 commit
+fetches after a refusal on the first) and the lowest bad commit named every time (an internal test
+holds back the worker of commit 1 until commit 3 has been refused, and a loop of 40 polls);
+verification reason `gpgverify_unavailable`/`gpgverify_error` withheld, other reasons unsigned
+(C13); the watcher asking the failing side (both directions, with a fork); the probe's C10
+wording, C12b requiring signature and payload (a signature without payload fails; commits that
+are all unsigned SKIP), and the summary and final line when C10 to C12b were skipped.
+
 Mutation check by hand, 45 mutants, each removed or inverted in turn, each killed by at least one
 test: exactly-one pull request
 (both directions); base repository; open state; run head versus pull request head; gone head
@@ -477,4 +531,12 @@ a duplicate field) and were rewritten as valid ones; all then failed a test. Not
 `Author` text, the order of the audit fields, and the log wording.
 
 Not verified by any test here: that GitHub behaves as C10 to C12b say, which is what the probe
-(C10, C11, C12, C12b) checks in BR-0 and SKIPs, never passes, when no pull request exists.
+(C10, C11, C12, C12b) checks in BR-0 and SKIPs, never passes, when no pull request exists. When
+any of them was skipped the probe's summary says "N checks SKIPPED, BR-0 is NOT complete" and its
+last line starts with "BR-0 INCOMPLETE"; the exit status stays 0 (nothing failed), so read the
+last line, not the status. C10 now passes on what is observed (the fields are present and well
+formed) and says in its detail that it did NOT observe that a job's `GITHUB_SHA` is the
+`merge_commit_sha`: compare it with a pull_request job's log. C12b additionally needs the fork
+commits' signature and payload to arrive; fork commits that are all unsigned SKIP it. C10b and C13
+have no probe check: C10b is read from the run listing the supervisor already uses, and C13 can
+only be observed when GitHub's verification service is down.

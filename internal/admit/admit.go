@@ -33,20 +33,42 @@ type Admitter struct {
 	Cache *CommitCache
 }
 
-// CommitCache is a bounded, concurrency-safe memory of fetched commits, oldest evicted first.
+// DefaultCacheBytes bounds the memory a CommitCache holds whatever its commit count: 16 MiB. A
+// commit object is small, but a signed commit message is not bounded by anyone but its author.
+const DefaultCacheBytes = 16 << 20
+
+// CommitCache is a bounded, concurrency-safe memory of fetched commits, oldest evicted first
+// (FIFO), bounded both by how many commits it holds and by the bytes they take.
 type CommitCache struct {
-	mu    sync.Mutex
-	max   int
-	byKey map[string]provider.Commit
-	order []string
+	mu       sync.Mutex
+	max      int
+	maxBytes int
+	bytes    int
+	byKey    map[string]provider.Commit
+	order    []string
 }
 
-// NewCommitCache returns a cache holding at most max commits (at least 1).
-func NewCommitCache(limit int) *CommitCache {
-	return &CommitCache{max: max(limit, 1), byKey: map[string]provider.Commit{}}
+// NewCommitCache returns a cache holding at most limit commits (at least 1) and at most
+// DefaultCacheBytes bytes.
+func NewCommitCache(limit int) *CommitCache { return NewCommitCacheBytes(limit, DefaultCacheBytes) }
+
+// NewCommitCacheBytes returns a cache holding at most limit commits (at least 1) and at most
+// maxBytes bytes of them (at least 1). A commit that alone exceeds the byte bound is not kept.
+func NewCommitCacheBytes(limit, maxBytes int) *CommitCache {
+	return &CommitCache{max: max(limit, 1), maxBytes: max(maxBytes, 1), byKey: map[string]provider.Commit{}}
 }
 
+// The key names the repository: the same id served by two repositories is two fetches, and a
+// commit cached for one must never be served for the other.
 func cacheKey(s Subject) string { return strings.ToLower(s.Repository) + "@" + s.SHA }
+
+func sizeOf(key string, cm provider.Commit) int {
+	n := len(key) + len(cm.SHA) + len(cm.Payload) + len(cm.Signature)
+	for _, p := range cm.Parents {
+		n += len(p)
+	}
+	return n
+}
 
 func (c *CommitCache) get(s Subject) (provider.Commit, bool) {
 	c.mu.Lock()
@@ -55,18 +77,31 @@ func (c *CommitCache) get(s Subject) (provider.Commit, bool) {
 	return cm, ok
 }
 
+func (c *CommitCache) evictOldest() {
+	k := c.order[0]
+	c.bytes -= sizeOf(k, c.byKey[k])
+	delete(c.byKey, k)
+	c.order = c.order[1:]
+}
+
 func (c *CommitCache) put(s Subject, cm provider.Commit) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := cacheKey(s)
-	if _, ok := c.byKey[k]; !ok {
-		for len(c.order) >= c.max {
-			delete(c.byKey, c.order[0])
-			c.order = c.order[1:]
+	if old, ok := c.byKey[k]; ok {
+		c.bytes += sizeOf(k, cm) - sizeOf(k, old)
+		c.byKey[k] = cm
+	} else {
+		if sizeOf(k, cm) > c.maxBytes {
+			return
 		}
 		c.order = append(c.order, k)
+		c.byKey[k] = cm
+		c.bytes += sizeOf(k, cm)
 	}
-	c.byKey[k] = cm
+	for len(c.order) > c.max || c.bytes > c.maxBytes {
+		c.evictOldest()
+	}
 }
 
 // Len is how many commits are held.
@@ -74,6 +109,13 @@ func (c *CommitCache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.byKey)
+}
+
+// Bytes is how many bytes the held commits take.
+func (c *CommitCache) Bytes() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bytes
 }
 
 // Admit returns who vouched for the commit, or a BR-E067 error saying why it is not admitted.

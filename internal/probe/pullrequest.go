@@ -26,11 +26,28 @@ const (
 var fullSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 var (
-	idC10  = Finding{ID: "C10", Assumption: "the pull request endpoint gives state, base and head commits, mergeable (null until computed) and merge_commit_sha (the commit a pull_request job runs)"}
+	idC10  = Finding{ID: "C10", Assumption: "the pull request endpoint gives state, base and head commits, mergeable (null until computed) and merge_commit_sha (GitHub's test merge of the head into the base; that a job RUNS this commit is a separate assumption this probe does not observe)"}
 	idC11  = Finding{ID: "C11", Assumption: "the pull request's commit list holds every commit of an open pull request, head included, up to a cap of 250"}
 	idC12  = Finding{ID: "C12", Assumption: "the merge commit has exactly two parents: parents[0] is the base tip (base.sha) and parents[1] is the pull request head"}
-	idC12b = Finding{ID: "C12b", Assumption: "the commits of a pull request from a fork are readable through the base repository"}
+	idC12b = Finding{ID: "C12b", Assumption: "the commits of a pull request from a fork are readable through the base repository, with their signature and signed payload"}
 )
+
+// prCheckIDs are the pull request checks: until none of them is skipped, BR-0 is not complete.
+var prCheckIDs = []string{"C10", "C11", "C12", "C12b"}
+
+// SkippedPullRequestChecks lists the pull request checks (C10 to C12b) that were SKIPPED: nothing
+// existed to look at, so nothing was proved.
+func SkippedPullRequestChecks(fs []Finding) []string {
+	var out []string
+	for _, f := range fs {
+		for _, id := range prCheckIDs {
+			if f.ID == id && f.Status == Skip {
+				out = append(out, id)
+			}
+		}
+	}
+	return out
+}
 
 func skipAll(reason string) []Finding {
 	out := []Finding{idC10, idC11, idC12, idC12b}
@@ -179,7 +196,7 @@ func checkPRFields(ctx context.Context, p provider.Provider, o Options, info pro
 	case !fullSHA.MatchString(info.MergeCommitSHA):
 		f.Status, f.Detail = Fail, fmt.Sprintf("%s: mergeable is true but merge_commit_sha is %q: the supervisor refuses such a pull request", pr, info.MergeCommitSHA)
 	default:
-		f.Status, f.Detail = Pass, fmt.Sprintf("%s (%s into %s:%s): state %s, mergeable true, merge_commit_sha %s, base.sha %s, head.sha %s, %d commit(s)",
+		f.Status, f.Detail = Pass, fmt.Sprintf("%s (%s into %s:%s) reports: state %s, mergeable true, merge_commit_sha %s, base.sha %s, head.sha %s, %d commit(s). Observed: the fields are there and well formed. NOT observed: that a pull_request job's GITHUB_SHA is this merge_commit_sha (compare it with a job's log)",
 			pr, info.HeadRepository, info.BaseRepository, info.BaseRef, info.State, short(info.MergeCommitSHA), short(info.BaseSHA), short(info.HeadSHA), info.Commits)
 	}
 	return f, info
@@ -252,25 +269,43 @@ func checkForkReadable(ctx context.Context, p provider.Provider, repo string, fo
 		return f
 	}
 	const sample = 5
-	checked, unreadable := 0, 0
-	var first string
+	checked, unreadable, signed, incomplete := 0, 0, 0, 0
+	var first, firstIncomplete string
 	for i, c := range list {
 		if i >= sample && c.SHA != fork.HeadSHA {
 			continue
 		}
 		checked++
-		if _, err := p.Commit(ctx, repo, c.SHA); err != nil {
+		cm, err := p.Commit(ctx, repo, c.SHA)
+		switch {
+		case err != nil:
 			unreadable++
 			if first == "" {
 				first = fmt.Sprintf("%s: %s", short(c.SHA), describe(err))
 			}
+		case cm.Signature != "" && cm.Payload == "":
+			// a signature without the bytes it covers cannot be verified here
+			incomplete++
+			if firstIncomplete == "" {
+				firstIncomplete = short(c.SHA) + " has a signature but no payload"
+			}
+		case cm.Signature != "":
+			signed++
 		}
+	}
+	if incomplete > 0 {
+		f.Status, f.Detail = Fail, fmt.Sprintf("%s: %d examined commit(s) came back without what verification needs (%s): the supervisor cannot verify them", pr, incomplete, firstIncomplete)
+		return f
 	}
 	if unreadable > 0 {
 		f.Status, f.Detail = Fail, fmt.Sprintf("%s: %d of %d examined commit(s) are not readable through %s (%s): the supervisor then asks the fork, and withholds the job if neither serves it", pr, unreadable, checked, repo, first)
 		return f
 	}
-	f.Status, f.Detail = Pass, fmt.Sprintf("%s: %d of %d commit(s) examined (the head among them) were all readable through %s", pr, checked, len(list), repo)
+	if signed == 0 {
+		f.Status, f.Detail = Skip, fmt.Sprintf("%s: %d commit(s) were readable through %s but none carries a signature and payload (they are unsigned), so whether a fork's SIGNED commit comes back whole is not observed: sign the fork's commit and run this again", pr, checked, repo)
+		return f
+	}
+	f.Status, f.Detail = Pass, fmt.Sprintf("%s: %d of %d commit(s) examined (the head among them) were readable through %s, and %d of them came back with both signature and signed payload", pr, checked, len(list), repo, signed)
 	return f
 }
 

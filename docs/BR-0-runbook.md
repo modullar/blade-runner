@@ -89,6 +89,8 @@ while it is open**, and close it afterwards (`gh pr close br0-probe`). The probe
 pull request's page once and run the probe again. C12b (commits of a pull request from a fork are
 readable through the base repository) needs a pull request from another account's fork, and a
 run that names it; the report says which of C10 to C12b were SKIPPED and why.
+If any of them was skipped the probe ends with "BR-0 INCOMPLETE" and says "N checks SKIPPED, BR-0 is NOT
+complete": its exit status is still 0, because nothing failed, so read that last line.
 
 ## 4. Create a token and run the probe (answers A2, C1, C2, C3, C10, C11, C12, C12b, H6)
 

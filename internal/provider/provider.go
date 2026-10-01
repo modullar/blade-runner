@@ -13,6 +13,11 @@ import (
 // errors.Is; any other error means "could not be asked", not "does not exist".
 var ErrNoSuchCommit = errors.New("no such commit")
 
+// ErrCommitUnavailable is wrapped by the error Commit returns when GitHub answered but says its
+// signature verification service could not look at the commit right now (assumption C13,
+// unverified). It is "not now": the commit is neither admitted nor refused for it.
+var ErrCommitUnavailable = errors.New("commit verification unavailable")
+
 // Scope is where a runner registers: one repository or one organization.
 type Scope struct {
 	Kind         string // "repo" or "org"
@@ -172,6 +177,11 @@ type PullRequest struct {
 	Number         int
 	HeadSHA        string
 	HeadRepository string // OWNER/REPO, or "" when the provider did not say
+	// BaseRef and BaseSHA are the branch the run's own entry says the pull request is against and
+	// the tip of it when the run was created ("" when the provider did not say). The supervisor
+	// compares them with the pull request it fetches (assumption C10, unverified).
+	BaseRef string
+	BaseSHA string
 }
 
 // Job is one job of a run.

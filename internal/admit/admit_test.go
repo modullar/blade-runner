@@ -257,3 +257,68 @@ func TestTheCacheIsBounded(t *testing.T) {
 		t.Errorf("requests = %d: a size-1 cache evicts the older commit, so each of three alternating commits is fetched", n)
 	}
 }
+
+func TestACommitCachedForOneRepositoryIsNotServedForAnother(t *testing.T) {
+	r, a, commits, pub := rig(t)
+	trustKey(t, r, "owner", pub["owner"], time.Time{})
+	a.Cache = admit.NewCommitCache(10)
+	other := "mallory/widgets"
+	r.Srv.Repos[other] = false // a repository that exists but does not have the commit
+	c := commits["owner"]
+
+	if _, err := a.Admit(ctx, subject(c)); err != nil {
+		t.Fatal(err)
+	}
+	before := commitRequests(r)
+	_, err := a.Admit(ctx, admit.Subject{Repository: other, SHA: c.SHA})
+	if err == nil {
+		t.Fatal("the commit cached under the base repository was served for another repository")
+	}
+	if commitRequests(r) != before+1 {
+		t.Error("the other repository was not asked: the cache key must name the repository")
+	}
+}
+
+func TestTheCacheIsBoundedByBytesAsWellAsByCount(t *testing.T) {
+	r, a, commits, pub := rig(t)
+	trustKey(t, r, "owner", pub["owner"], time.Time{})
+	trustKey(t, r, "mallory", pub["mallory"], time.Time{})
+
+	measure := admit.NewCommitCache(10)
+	a.Cache = measure
+	if _, err := a.Admit(ctx, subject(commits["owner"])); err != nil {
+		t.Fatal(err)
+	}
+	one := measure.Bytes()
+	if one == 0 {
+		t.Fatal("a cached commit takes no bytes?")
+	}
+
+	// Room for one commit and a bit, however many the count would allow.
+	a.Cache = admit.NewCommitCacheBytes(100, one+one/2)
+	for _, who := range []string{"owner", "mallory"} {
+		if _, err := a.Admit(ctx, subject(commits[who])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if a.Cache.Len() != 1 || a.Cache.Bytes() > one+one/2 {
+		t.Errorf("holds %d commits, %d bytes, budget %d", a.Cache.Len(), a.Cache.Bytes(), one+one/2)
+	}
+	// FIFO: the oldest (owner) went, the newest (mallory) stays.
+	before := commitRequests(r)
+	if _, err := a.Admit(ctx, subject(commits["mallory"])); err != nil || commitRequests(r) != before {
+		t.Errorf("the newest commit should still be cached: %v, %d new requests", err, commitRequests(r)-before)
+	}
+	if _, err := a.Admit(ctx, subject(commits["owner"])); err != nil || commitRequests(r) != before+1 {
+		t.Errorf("the oldest commit should have been evicted: %v", err)
+	}
+
+	// A commit bigger than the whole budget is not kept at all.
+	a.Cache = admit.NewCommitCacheBytes(100, 10)
+	if _, err := a.Admit(ctx, subject(commits["owner"])); err != nil {
+		t.Fatal(err)
+	}
+	if a.Cache.Len() != 0 || a.Cache.Bytes() != 0 {
+		t.Errorf("an oversized commit was kept: %d commits, %d bytes", a.Cache.Len(), a.Cache.Bytes())
+	}
+}

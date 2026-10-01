@@ -247,13 +247,17 @@ every commit verified"). The message names the exact commit and why: a commit (o
 base branch) that is unsigned, signed by a key this machine does not trust (the message gives its
 fingerprint), or by a revoked or expired one; a merge commit that does not have exactly the base
 tip and the head as its two parents; a pull request that is closed, cannot be merged, or whose
-head differs from the run's; a run that names no pull request or more than one; or **too many
+head differs from the run's; a run whose own record of the pull request names another base branch
+than the pull request has now; a run that names no pull request or more than one; or **too many
 commits to verify** (GitHub lists at most 250 of them, and a shorter list is never verified as if
 it were whole). A new contributor must be added with `bladerunner trust add` before their pull
 request can run. Commits made with GitHub's web buttons are signed by GitHub's key and are
 refused unless the owner trusts that key (see the trade-off in the decision). Data that could not
-be read (GitHub unreachable, `mergeable` not computed yet, a commit neither repository serves) is
-not this code: the job is withheld (BR-E076) and tried again at the next poll.
+be read (GitHub unreachable, `mergeable` not computed yet, a commit neither repository serves, a
+commit whose signature GitHub's verification service could not check right now, or a base branch
+that moved since the run was created) is not this code: the job is withheld (BR-E076) and tried
+again at the next poll. When several commits are bad the message names the first of them in the
+pull request's own order.
 
 ### BR-E073
 

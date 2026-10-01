@@ -94,10 +94,59 @@ func TestAnOpenSameRepositoryPullRequestPassesC10ToC12AndLeavesTheForkCheckSkipp
 	}
 }
 
+// signAsServed re-serves the pull request's commits with a signature and its payload, as GitHub
+// does for a signed commit (the bytes are not a real signature: C12b only asks that they arrive).
+func signAsServed(r *testrig.Rig, shas ...string) {
+	for _, s := range shas {
+		r.Srv.AddCommit(testrig.Target, s, "tree y\n\nc\n", "-----BEGIN SSH SIGNATURE-----\nx\n-----END SSH SIGNATURE-----")
+	}
+}
+
 func TestAForkPullRequestWhoseCommitsTheBaseRepositoryServesPassesC12b(t *testing.T) {
 	r := testrig.New(t, testrig.BaseConfig)
 	addPR(t, r, 8, "mallory/widgets", nil)
+	signAsServed(r, sha('d'), sha('b'))
 	want(t, prFindings(t, r), "C12b", probe.Pass, "readable through acme/widgets")
+	want(t, prFindings(t, r), "C12b", probe.Pass, "both signature and signed payload")
+}
+
+func TestAForkCommitThatArrivesUnsignedProvesNothingAboutTheSignatureAndIsSkipped(t *testing.T) {
+	r := testrig.New(t, testrig.BaseConfig)
+	addPR(t, r, 8, "mallory/widgets", nil) // served readable, but with no signature and no payload
+	want(t, prFindings(t, r), "C12b", probe.Skip, "none carries a signature and payload")
+}
+
+func TestAForkCommitWhoseSignatureComesWithoutItsPayloadFailsC12b(t *testing.T) {
+	r := testrig.New(t, testrig.BaseConfig)
+	addPR(t, r, 8, "mallory/widgets", nil)
+	signAsServed(r, sha('b'))
+	r.Srv.AddCommit(testrig.Target, sha('d'), "", "-----BEGIN SSH SIGNATURE-----\nx\n-----END SSH SIGNATURE-----")
+	want(t, prFindings(t, r), "C12b", probe.Fail, "signature but no payload")
+}
+
+func TestC10DoesNotClaimThatTheMergeCommitIsWhatAJobRuns(t *testing.T) {
+	r := testrig.New(t, testrig.BaseConfig)
+	addPR(t, r, 7, testrig.Target, nil)
+	f := find(prFindings(t, r), "C10")
+	if f.Status != probe.Pass {
+		t.Fatalf("C10 = %s %q", f.Status, f.Detail)
+	}
+	if strings.Contains(f.Assumption, "the commit a pull_request job runs") {
+		t.Errorf("the assumption still claims what a job runs: %q", f.Assumption)
+	}
+	if !strings.Contains(f.Detail, "NOT observed") || !strings.Contains(f.Detail, "GITHUB_SHA") {
+		t.Errorf("C10 passes on what was observed and must say what was not: %q", f.Detail)
+	}
+}
+
+func TestSkippedPullRequestChecksAreNamed(t *testing.T) {
+	fs := []probe.Finding{{ID: "C1", Status: probe.Skip}, {ID: "C10", Status: probe.Skip}, {ID: "C11", Status: probe.Pass}, {ID: "C12b", Status: probe.Skip}}
+	if got := strings.Join(probe.SkippedPullRequestChecks(fs), ","); got != "C10,C12b" {
+		t.Errorf("skipped = %q: C1 is not a pull request check and C11 passed", got)
+	}
+	if got := probe.SkippedPullRequestChecks([]probe.Finding{{ID: "C10", Status: probe.Pass}}); len(got) != 0 {
+		t.Errorf("skipped = %v", got)
+	}
 }
 
 func TestAForkPullRequestWhoseCommitsTheBaseRepositoryCannotServeFailsC12b(t *testing.T) {

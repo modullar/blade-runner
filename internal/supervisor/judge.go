@@ -46,6 +46,9 @@ type judgement struct {
 	// every commit that was verified for it. A runner is only kept while Merge stays the same.
 	Merge    string
 	Verified []VerifiedCommit
+	// Unreadable, for a transient pull request judgement, lists the repositories that failed to
+	// read: the watcher stops a waiting runner only once they all read fine.
+	Unreadable []string
 }
 
 type admission struct {

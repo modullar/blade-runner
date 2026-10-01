@@ -48,6 +48,7 @@ type Server struct {
 	commitOrder  map[string][]string     // repo -> shas, oldest first
 	commitStatus map[string]int          // sha -> forced HTTP status
 	repoStatus   map[string]int          // repo -> forced HTTP status of GET /repos/{repo}
+	reasons      map[string]string       // "owner/repo@sha" -> verification.reason served for it when unsigned
 	parents      map[string][]string     // "owner/repo@sha" -> parents served for it (default: the "parent" lines of its payload)
 	pulls        map[string]*PullRequest // "owner/repo#number"
 	runs         map[string][]provider.Run
@@ -242,6 +243,18 @@ func (s *Server) AddCommit(repo, sha, payload, signature string) {
 	s.commitOrder[repo] = append(s.commitOrder[repo], sha)
 }
 
+// SetCommitReason makes the commit endpoint report this verification.reason for sha in repo when
+// the commit is unsigned (GitHub's "unsigned" by default): "gpgverify_unavailable" is what a
+// verification outage would look like. It has no effect on a signed commit.
+func (s *Server) SetCommitReason(repo, sha, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reasons == nil {
+		s.reasons = map[string]string{}
+	}
+	s.reasons[repo+"@"+sha] = reason
+}
+
 // SetCommitStatus (status 0 clears it) makes the commit endpoint answer with this HTTP status for sha, whatever else
 // it knows: 404 and 422 are what GitHub says for a commit that does not exist (a deleted fork).
 func (s *Server) SetCommitStatus(sha string, status int) {
@@ -368,7 +381,8 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request, repo string,
 			prs := []map[string]any{}
 			for _, pr := range run.PullRequests {
 				prs = append(prs, map[string]any{"number": pr.Number, "head": map[string]any{
-					"sha": pr.HeadSHA, "repo": map[string]string{"url": s.URL + "/repos/" + pr.HeadRepository}}})
+					"sha": pr.HeadSHA, "repo": map[string]string{"url": s.URL + "/repos/" + pr.HeadRepository}},
+					"base": map[string]any{"ref": pr.BaseRef, "sha": pr.BaseSHA}})
 			}
 			entry := map[string]any{
 				"id": run.ID, "head_sha": run.HeadSHA, "event": run.Event, "status": run.Status,
@@ -419,6 +433,17 @@ func (s *Server) SetRunStatus(repo string, runID int64, status string) {
 	for i := range s.runs[repo] {
 		if s.runs[repo][i].ID == runID {
 			s.runs[repo][i].Status = status
+		}
+	}
+}
+
+// UpdateRun edits a run in place, as GitHub does when it records new facts about it.
+func (s *Server) UpdateRun(repo string, runID int64, edit func(*provider.Run)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.runs[repo] {
+		if s.runs[repo][i].ID == runID {
+			edit(&s.runs[repo][i])
 		}
 	}
 }
@@ -494,6 +519,7 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, repo, sha 
 	}
 	s.mu.Lock()
 	parents, overridden := s.parents[repo+"@"+sha]
+	reason, haveReason := s.reasons[repo+"@"+sha]
 	s.mu.Unlock()
 	if !overridden {
 		parents = payloadParents(cd.payload)
@@ -507,6 +533,9 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, repo, sha 
 		v["signature"], v["payload"] = cd.signature, cd.payload
 	} else {
 		v["reason"] = "unsigned"
+		if haveReason {
+			v["reason"] = reason
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sha": sha, "parents": plist, "verification": v})
 }

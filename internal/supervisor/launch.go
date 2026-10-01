@@ -63,7 +63,7 @@ func (s *Supervisor) launch(ctx context.Context, cand judgement, a assessment) (
 	launching := entry(KindLaunching, "", intent)
 	if cand.Merge != "" {
 		launching.MergeSHA = cand.Merge
-		launching.Verified, launching.VerifiedTotal = auditedCommits(cand.Verified)
+		launching.Verified, launching.VerifiedTotal = auditedCommits(cand.Verified, cand.Subject.SHA)
 		launching.Message += fmt.Sprintf("; pull request merge commit %s, %d commit(s) verified, each signed by a trusted key", cand.Merge, len(cand.Verified))
 	}
 	if err := s.cfg.Audit.Record(launching); err != nil {
@@ -286,7 +286,7 @@ func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]boo
 		// while the runner waits. So every waiting job it could take is judged again each poll
 		// (a commit is fetched once per poll however many jobs share it), not only the new ones.
 		j := &judger{s: s, cache: map[string]admission{}}
-		cannotJudge, cannotJudgeRepo := "", ""
+		cannotJudge, cannotJudgeRepos := "", []string(nil)
 		for _, o := range obs {
 			if !stillWaiting(o.Job) || !couldTake(s.labels, o.Job) {
 				continue
@@ -317,7 +317,10 @@ func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]boo
 					return
 				}
 				cannotJudge = fmt.Sprintf("job %d of run %d could not be judged again: %s", o.Job.ID, o.Run.ID, jd.Reason)
-				cannotJudgeRepo = jd.Subject.Repository
+				cannotJudgeRepos = jd.Unreadable
+				if len(cannotJudgeRepos) == 0 {
+					cannotJudgeRepos = []string{jd.Subject.Repository}
+				}
 			}
 		}
 		if cannotJudge != "" {
@@ -328,7 +331,7 @@ func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]boo
 			// "the commit cannot be judged" a statement about the commit and not about the link.
 			judgeFailures++
 			if judgeFailures >= watchErrorLimit {
-				if _, verr := s.cfg.Provider.Visibility(ctx, cannotJudgeRepo); verr == nil {
+				if s.allReadable(ctx, cannotJudgeRepos) {
 					w.stopped, w.code = true, diag.CodeQueueUnreadable
 					w.reason = fmt.Sprintf("a waiting job could not be judged %d times in a row although its repository reads fine (%s), so whether the runner may take it is unknown", judgeFailures, cannotJudge)
 					stop()
@@ -341,4 +344,17 @@ func (s *Supervisor) watch(ctx context.Context, name string, known map[int64]boo
 		}
 		judgeFailures = 0
 	}
+}
+
+// allReadable reports whether every repository reads fine with the token: the check that turns "the
+// job cannot be judged" into a statement about the job and not about the link. For a pull request
+// these are the repositories on the side that failed (the base for the pull request and the merge
+// commit, the base and the fork for the commits).
+func (s *Supervisor) allReadable(ctx context.Context, repos []string) bool {
+	for _, r := range repos {
+		if _, err := s.cfg.Provider.Visibility(ctx, r); err != nil {
+			return false
+		}
+	}
+	return true
 }

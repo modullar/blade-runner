@@ -596,3 +596,195 @@ func TestACommitListWithAnUnusableIdIsRefusedBeforeAnythingIsFetchedForIt(t *tes
 	p.queuePR(1, 10)
 	mustRefuse(t, p, "unusable id", "not-a-sha")
 }
+
+// ---- the run's own pull_requests[] entry against the pull request that was fetched --------------
+
+func TestARunListingAPullRequestAgainstAnotherBranchIsRefused(t *testing.T) {
+	// Two open pull requests with the very same head commit, one into main and one into release.
+	// The run lists #7 but was created for the release one: the merge commit it runs is not the
+	// merge of #7 into main, so what is verified for #7 says nothing about it.
+	p := newPRWorld(t, prSpec{})
+	yes := true
+	p.srv.SetPullRequest(repo, githubtest.PullRequest{
+		Info: provider.PullRequestInfo{Number: 8, State: "open", BaseRepository: repo, BaseRef: "release", BaseSHA: p.baseTip.SHA,
+			HeadRepository: p.headRep, HeadSHA: p.head().SHA, MergeCommitSHA: p.merge.SHA, Mergeable: &yes},
+		Commits: []provider.PullRequestCommit{{SHA: p.commits[0].SHA}, {SHA: p.commits[1].SHA}, {SHA: p.head().SHA}},
+	})
+	p.queuePR(1, 10, func(r *provider.Run) { r.PullRequests[0].BaseRef = "release" })
+	mustRefuse(t, p, `"main"`, `"release"`, "against branch")
+}
+
+func TestAPullRequestWhoseBaseMovedSinceTheRunWasCreatedIsWithheldNotRefused(t *testing.T) {
+	p := newPRWorld(t, prSpec{})
+	old := p.baseTip.SHA
+	p.moveBase() // GitHub merged the head onto a new, signed tip
+	p.queuePR(1, 10, func(r *provider.Run) { r.PullRequests[0].BaseSHA = old })
+	mustWithhold(t, p, "moved from "+short12(old))
+	// Judged again at every poll; the run's own record is what it is, so it stays withheld, and
+	// once the run records the base the pull request has now, it is admitted.
+	mustWithhold(t, p, "moved")
+	p.srv.UpdateRun(repo, 1, func(r *provider.Run) { r.PullRequests[0].BaseSHA = p.baseTip.SHA })
+	mustLaunch(t, p)
+}
+
+func TestAnAnswerForAnotherPullRequestNumberIsRefused(t *testing.T) {
+	p := newPRWorld(t, prSpec{})
+	p.editPR(func(i *provider.PullRequestInfo) { i.Number = 99 })
+	p.queuePR(1, 10)
+	mustRefuse(t, p, "#99", "#7")
+}
+
+// ---- the verdict is per run, not per pull request number -----------------------------------------
+
+func TestTwoRunsOfOnePullRequestNumberAreEachJudgedOnTheirOwnHeadAndRepository(t *testing.T) {
+	// One assessment, three runs that all say "pull request #7": the current one, a stale one for
+	// an older head commit, and one claiming another repository for the same head commit. The
+	// verdict on the first must not be handed to the others (or theirs to it).
+	p := newPRWorld(t, prSpec{})
+	old := p.commits[1].SHA
+	p.queuePR(1, 10)
+	p.queuePR(2, 20, func(r *provider.Run) {
+		r.HeadSHA = old
+		r.PullRequests[0].HeadSHA = old
+	})
+	p.queuePR(3, 30, func(r *provider.Run) {
+		r.HeadRepository = fork
+		r.PullRequests[0].HeadRepository = fork
+	})
+	out, err := p.sup.Tick(ctx)
+	if err != nil || out.Launched || !out.Withheld {
+		t.Fatalf("outcome = %+v, err = %v", out, err)
+	}
+	got := map[int64]string{}
+	for _, r := range out.Refused {
+		got[r.RunID] = r.Reason
+	}
+	if len(got) != 2 || !strings.Contains(got[2], "stale") || !strings.Contains(got[3], "says its head lives in") {
+		t.Errorf("refusals = %v: run 2 (stale head) and run 3 (other head repository) must each be refused on their own, and run 1 not at all", got)
+	}
+}
+
+// ---- gaps found by mutation ------------------------------------------------------------------
+
+func TestADuplicatedShaInTheCommitListIsVerifiedAndAuditedOnce(t *testing.T) {
+	p := newPRWorld(t, prSpec{})
+	p.srv.UpdatePullRequest(repo, p.number, func(pr *githubtest.PullRequest) {
+		var dup []provider.PullRequestCommit
+		for _, c := range pr.Commits {
+			dup = append(dup, c, c)
+		}
+		pr.Commits = dup
+	})
+	p.queuePR(1, 10)
+	p.srv.UpdateJob(repo, 10, func(j *provider.Job) { j.Status = "waiting" }) // one assessment, no launch
+	if out, err := p.sup.Tick(ctx); err != nil || !out.Idle {
+		t.Fatalf("%+v, %v", out, err)
+	}
+	for _, c := range p.commits {
+		if n := p.requestsContaining("/git/commits/" + c.SHA); n != 1 {
+			t.Errorf("commit %s fetched %d times", short12(c.SHA), n)
+		}
+	}
+	p.srv.UpdateJob(repo, 10, func(j *provider.Job) { j.Status = "queued" })
+	mustLaunch(t, p)
+	e := p.entriesOfKind(supervisor.KindLaunching)[0]
+	if len(e.Verified) != 4 || e.VerifiedTotal != 4 { // base tip + 3 distinct commits
+		t.Errorf("listed %d of %d: each distinct commit is verified and listed once", len(e.Verified), e.VerifiedTotal)
+	}
+}
+
+func TestAfterTheFirstRefusalTheRestOfALongPullRequestIsNotFetched(t *testing.T) {
+	authors := []string{"-"} // the oldest commit is unsigned
+	for i := 0; i < 40; i++ {
+		authors = append(authors, "alice")
+	}
+	p := newPRWorld(t, prSpec{authors: authors})
+	p.queuePR(1, 10)
+	mustRefuse(t, p, p.commits[0].SHA, "not signed")
+	// merge commit + base tip are two of the fetches; four workers may have a commit in flight
+	// each when the refusal lands, but 40 more must not be read for a job that is refused anyway.
+	if n := len(p.commitFetches()) - 2; n > 2*4 {
+		t.Errorf("%d pull request commits fetched after the first one was refused, want at most %d of 41", n, 2*4)
+	}
+}
+
+func TestTheRefusalTextNamesTheLowestBadCommitEveryTime(t *testing.T) {
+	// Commits 1 and 3 are unsigned, with workers racing over them: the audit log must not flap
+	// between two texts for the same job.
+	p := newPRWorld(t, prSpec{authors: []string{"alice", "-", "alice", "-", "alice", "alice", "alice", "alice"}})
+	p.queuePR(1, 10)
+	for i := 0; i < 40; i++ {
+		out, err := p.sup.Tick(ctx)
+		if err != nil || len(out.Refused) != 1 {
+			t.Fatalf("tick %d: %+v, %v", i, out, err)
+		}
+		if r := out.Refused[0].Reason; !strings.Contains(r, p.commits[1].SHA) || strings.Contains(r, p.commits[3].SHA) {
+			t.Fatalf("tick %d: reason %q must name commit 1 (%s), the lowest bad one", i, r, p.commits[1].SHA)
+		}
+	}
+}
+
+// ---- the watcher and a pull request it cannot judge: which side is unreadable ---------------
+
+func TestAWaitingRunnerIsNotStoppedWhenTheBaseRepositoryItselfCannotBeRead(t *testing.T) {
+	// A fork's pull request. The pull request cannot be read (base side) and the base repository
+	// does not read either, while the fork does: that says nothing about the pull request.
+	p := newPRWorld(t, prSpec{fork: true})
+	p.queuePR(1, 10)
+	stopped := false
+	p.rt.OnRun = func(c context.Context, spec isolation.Spec) (isolation.Result, error) {
+		p.srv.SetFailPath("/pulls/7")
+		p.srv.SetRepoStatus(repo, 404)
+		select {
+		case <-c.Done():
+			stopped = true
+		case <-time.After(300 * time.Millisecond): // thirty polls
+		}
+		p.srv.SetFailPath("")
+		p.srv.SetRepoStatus(repo, 0)
+		return p.takes(repo, 10, 1)(c, spec)
+	}
+	out, err := p.sup.Tick(ctx)
+	if err != nil || !out.Launched || stopped {
+		t.Fatalf("stopped = %v, outcome = %+v, err = %v: an unreadable base repository must not kill an admitted runner", stopped, out, err)
+	}
+}
+
+func TestAWaitingRunnerIsStoppedWhenTheBaseSideFailsAlthoughTheBaseReadsFine(t *testing.T) {
+	// The pull request cannot be read for three polls while the base repository reads fine. The
+	// fork is gone, but the failure is on the base side: it is the base that is asked.
+	p := newPRWorld(t, prSpec{fork: true})
+	p.queuePR(1, 10)
+	stopped := false
+	p.rt.OnRun = func(c context.Context, spec isolation.Spec) (isolation.Result, error) {
+		p.srv.SetFailPath("/pulls/7")
+		p.srv.SetRepoStatus(fork, 404)
+		select {
+		case <-c.Done():
+			stopped = true
+		case <-time.After(3 * time.Second):
+		}
+		return isolation.Result{}, nil
+	}
+	out, err := p.sup.Tick(ctx)
+	if err != nil || !stopped || !out.Withheld {
+		t.Fatalf("stopped = %v, outcome = %+v, err = %v", stopped, out, err)
+	}
+}
+
+func TestACommitGitHubCouldNotVerifyRightNowIsWithheldNotRefusedAsUnsigned(t *testing.T) {
+	// The commit is served with no signature and the reason of a verification outage (C13, the
+	// reason name is unverified): not "unsigned", so not a refusal.
+	p := newPRWorld(t, prSpec{})
+	c := p.commits[1]
+	p.srv.AddCommit(repo, c.SHA, c.Payload, "")
+	p.srv.SetCommitReason(repo, c.SHA, "gpgverify_unavailable")
+	p.queuePR(1, 10)
+	mustWithhold(t, p, c.SHA)
+	p.srv.AddCommit(repo, c.SHA, c.Payload, c.Signature)
+	mustLaunch(t, p)
+	// ... while a commit that is plainly unsigned is refused as before.
+	q := newPRWorld(t, prSpec{authors: []string{"alice", "-", "alice"}})
+	q.queuePR(1, 10)
+	mustRefuse(t, q, q.commits[1].SHA, "not signed")
+}

@@ -148,7 +148,7 @@ func (p *prWorld) queuePR(run, job int64, mutate ...func(*provider.Run)) {
 	p.t.Helper()
 	r := provider.Run{
 		ID: run, HeadSHA: p.head().SHA, Event: "pull_request", Status: "queued", HeadRepository: p.headRep, Actor: "alice",
-		PullRequests: []provider.PullRequest{{Number: p.number, HeadSHA: p.head().SHA, HeadRepository: p.headRep}},
+		PullRequests: []provider.PullRequest{{Number: p.number, HeadSHA: p.head().SHA, HeadRepository: p.headRep, BaseRef: "main"}},
 	}
 	for _, m := range mutate {
 		m(&r)
