@@ -66,7 +66,33 @@ jobs:
 
 Wait for it to finish (or leave it queued; either is useful).
 
-## 4. Create a token and run the probe (answers A2, C1, C2, C3, H6)
+## 3b. Give the probe a pull request (answers C10, C11, C12; C12b needs a fork)
+
+Admission of a pull request (ADR 0007, "Pull requests: every commit verified") leans on the pull
+request endpoint, its commit list and the parents of GitHub's merge commit. The probe checks them
+against a pull request behind a recent `pull_request` run, and **SKIPs, never passes,** when there
+is none. Make one (nothing runs on your Mac): add `pull_request` to the workflow's triggers on the
+`br0-probe` branch, push, and open a throwaway pull request from `br0-probe` into `main`:
+
+```yaml
+on: [push, pull_request]
+```
+
+```sh
+gh pr create --base main --head br0-probe --title "BR-0 probe (close me)" --body "throwaway"
+# no `gh`? open https://github.com/modullar/blade-runner/pull/new/br0-probe in a browser instead
+```
+
+Wait until its workflow run appears and GitHub shows the pull request as mergeable, **run step 4
+while it is open**, and close it afterwards (`gh pr close br0-probe`). The probe reads
+`mergeable` again a few times, because GitHub computes it lazily; if C10 still says SKIP, open the
+pull request's page once and run the probe again. C12b (commits of a pull request from a fork are
+readable through the base repository) needs a pull request from another account's fork, and a
+run that names it; the report says which of C10 to C12b were SKIPPED and why.
+If any of them was skipped the probe ends with "BR-0 INCOMPLETE" and says "N checks SKIPPED, BR-0 is NOT
+complete": its exit status is still 0, because nothing failed, so read that last line.
+
+## 4. Create a token and run the probe (answers A2, C1, C2, C3, C10, C11, C12, C12b, H6)
 
 Create a **fine-grained token** limited to this repository (Settings > Developer settings).
 Start with **Administration: read and write** and **Actions: read**; if the probe reports which
@@ -74,8 +100,8 @@ call was refused (403), note which permission fixes it: that is the answer to A2
 
 ```sh
 go build -o bladerunner ./cmd/bladerunner
-read -rs BLADERUNNER_TOKEN && export BLADERUNNER_TOKEN    # paste the token, press return
-./bladerunner probe github --repository modullar/blade-runner
+# Copy the token to the clipboard first (macOS), then:
+pbpaste | ./bladerunner probe github --repository modullar/blade-runner --token-stdin
 ```
 
 The report contains no secrets, so paste it back as is. Each line is `PASS`, `FAIL`, `SKIP`
@@ -90,7 +116,8 @@ Useful variants:
 ## 5. Clean up
 
 ```sh
-unset BLADERUNNER_TOKEN
+pbcopy < /dev/null   # empty the clipboard
+gh pr close br0-probe 2>/dev/null   # if the step 3b pull request is still open
 git checkout main && git branch -D br0-probe && git push origin --delete br0-probe
 ```
 

@@ -41,7 +41,18 @@ const (
 	CodeIsolation           = "BR-E068"
 	CodeDiskLow             = "BR-E070"
 	CodeCLIOutdated         = "BR-E071"
+	CodeJobRefused          = "BR-E072"
+	CodeJobAmbiguous        = "BR-E073"
+	CodeJobEventRefused     = "BR-E074"
+	CodeLaunchWithheld      = "BR-E075"
+	CodeQueueUnreadable     = "BR-E076"
+	CodeUnexpectedJob       = "BR-E077"
+	CodeLaunchFailed        = "BR-E078"
+	CodeAuditFailed         = "BR-E079"
 	CodeStateCorrupt        = "BR-E080"
+	CodeEgressPolicyInvalid = "BR-E081"
+	CodeEgressSetup         = "BR-E082"
+	CodeEgressDenied        = "BR-E083"
 	CodeConfirmRequired     = "BR-E090"
 	CodeLocalPlacement      = "BR-E100"
 )
@@ -55,7 +66,10 @@ func All() []string {
 		CodeRegistrationFailed, CodeRunnerNotRegistered, CodeServiceInstall,
 		CodeServiceNotRunning, CodeRunnerOffline, CodePublicRepoRefused,
 		CodeVisibilityUnknown, CodeWorkflowPolicy, CodeRepoMismatch, CodeForkApproval, CodeJobHook, CodeTrustStore, CodeNotAdmitted, CodeIsolation, CodeDiskLow, CodeCLIOutdated, CodeStateCorrupt,
+		CodeEgressPolicyInvalid, CodeEgressSetup, CodeEgressDenied,
 		CodeConfirmRequired, CodeLocalPlacement,
+		CodeJobRefused, CodeJobAmbiguous, CodeJobEventRefused, CodeLaunchWithheld, CodeQueueUnreadable,
+		CodeUnexpectedJob, CodeLaunchFailed, CodeAuditFailed,
 	}
 }
 

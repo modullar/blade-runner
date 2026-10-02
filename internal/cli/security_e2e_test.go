@@ -395,6 +395,14 @@ func TestProbeCommandReportsWithoutTouchingTheMachine(t *testing.T) {
 			t.Errorf("report missing %q:\n%s", want, out)
 		}
 	}
+	// No pull request exists to look at, so C10 to C12b were skipped: exit 0, but the summary must
+	// not read as a clean bill of health, and the last line says so apart from the table.
+	if !strings.Contains(out, "4 checks SKIPPED, BR-0 is NOT complete (C10, C11, C12, C12b)") {
+		t.Errorf("the summary does not say what was skipped:\n%s", out)
+	}
+	if lines := strings.Split(strings.TrimSpace(out), "\n"); !strings.HasPrefix(lines[len(lines)-1], "BR-0 INCOMPLETE: C10, C11, C12, C12b skipped") {
+		t.Errorf("the last line = %q", lines[len(lines)-1])
+	}
 	for _, secret := range []string{testrig.Token, "JIT-"} {
 		if strings.Contains(out, secret) {
 			t.Errorf("the report leaked %q", secret)

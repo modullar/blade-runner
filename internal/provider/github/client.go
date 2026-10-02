@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -238,6 +239,20 @@ func (c *Client) ForkApprovalPolicy(ctx context.Context, repository string) (str
 	return out.Policy, nil
 }
 
+// verificationUnavailable are the "verification.reason" values that mean GitHub's verification
+// service could not answer, as opposed to saying the commit is unsigned or its key unknown.
+//
+// ASSUMPTION C13, UNVERIFIED: this list is written from memory of GitHub's documented reason
+// codes, not observed (docs/decisions/0007-supervisor.md). A reason GitHub uses for an outage that
+// is missing here makes such a commit read as unsigned: a refusal that clears itself only when the
+// commit is pushed again. That fails closed. The danger of the other direction, listing a reason
+// that really means "unsigned", is that an unsigned commit is withheld for ever instead of refused:
+// nothing runs either way. BR-0 has to confirm the names.
+var verificationUnavailable = map[string]bool{
+	"gpgverify_unavailable": true,
+	"gpgverify_error":       true,
+}
+
 var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // Commit fetches a commit's signed payload and signature. It uses the token when one is
@@ -250,16 +265,53 @@ func (c *Client) Commit(ctx context.Context, repository, sha string) (provider.C
 			"a commit must be named by its full 40-character id", "use the full SHA")
 	}
 	var out struct {
-		SHA          string `json:"sha"`
+		SHA     string `json:"sha"`
+		Parents []struct {
+			SHA string `json:"sha"`
+		} `json:"parents"`
 		Verification struct {
 			Signature *string `json:"signature"`
 			Payload   *string `json:"payload"`
+			Reason    string  `json:"reason"`
 		} `json:"verification"`
 	}
-	if _, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/git/commits/"+sha, c.Token != nil, &out); err != nil {
+	if resp, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/git/commits/"+sha, c.Token != nil, &out); err != nil {
+		if resp == nil {
+			return provider.Commit{}, err
+		}
+		switch resp.StatusCode {
+		case http.StatusUnprocessableEntity:
+			// GitHub's own words for a commit id it has no object for. Any other 422 is not a
+			// statement about the commit and stays the generic (transient) error.
+			if strings.Contains(strings.ToLower(err.Error()), "no commit found") {
+				return provider.Commit{}, notFound(err, sha, repository, "GitHub says it has no such commit (HTTP 422)")
+			}
+		case http.StatusNotFound:
+			// A 404 alone proves nothing: GitHub answers it for a repository the token cannot see
+			// and for a commit that was only just pushed or whose fork is still being set up. It
+			// is a refusal only when the repository itself reads fine with the same token, so the
+			// 404 is about the commit. Otherwise it is "not now", never a verdict.
+			if _, verr := c.Visibility(ctx, repository); verr != nil {
+				return provider.Commit{}, diag.Wrap(err, diag.CodeGitHubUnavailable, fmt.Sprintf("commit %s cannot be fetched from %s: GitHub answered 404 and the repository is not readable either", sha, repository),
+					"the token cannot see the repository, or GitHub has not caught up with a fresh push or fork (GitHub answers 404 to hide private repositories)",
+					"nothing was decided about the commit; it is tried again at the next poll")
+			}
+			return provider.Commit{}, notFound(err, sha, repository, "GitHub answered 404 for it although the repository itself is readable")
+		}
 		return provider.Commit{}, err
 	}
+	if (out.Verification.Signature == nil || *out.Verification.Signature == "") && verificationUnavailable[out.Verification.Reason] {
+		// No signature in the answer, and GitHub says why: it could not look. That is not "this
+		// commit is unsigned" (a refusal, and a permanent-looking one), it is "ask again".
+		return provider.Commit{}, diag.Wrap(errors.Join(fmt.Errorf("verification reason %q", out.Verification.Reason), provider.ErrCommitUnavailable),
+			diag.CodeGitHubUnavailable, fmt.Sprintf("GitHub could not check the signature of commit %s in %s (reason %q)", sha, repository, out.Verification.Reason),
+			"GitHub's signature verification service was unavailable, so no signature came back",
+			"nothing was decided about the commit; it is tried again at the next poll")
+	}
 	cm := provider.Commit{SHA: out.SHA}
+	for _, p := range out.Parents {
+		cm.Parents = append(cm.Parents, p.SHA)
+	}
 	if out.Verification.Signature != nil {
 		cm.Signature = *out.Verification.Signature
 	}
@@ -267,6 +319,99 @@ func (c *Client) Commit(ctx context.Context, repository, sha string) (provider.C
 		cm.Payload = *out.Verification.Payload
 	}
 	return cm, nil
+}
+
+// notFound is the definitive "not admitted" for a commit that does not exist for a token that can
+// see its repository: retrying will not change it, so a caller that treated it as transient would
+// wait on it for ever.
+func notFound(err error, sha, repository, how string) error {
+	return diag.Wrap(errors.Join(err, provider.ErrNoSuchCommit), diag.CodeNotAdmitted, fmt.Sprintf("commit %s cannot be fetched from %s: %s", sha, repository, how),
+		"the commit was deleted or force-pushed away, or its fork's branch was",
+		"nothing can run from a commit that does not exist; push the change again")
+}
+
+// PullRequest reads a pull request of the base repository. The fields (state, base.sha,
+// head.sha, merge_commit_sha, mergeable, commits) are assumption C10, to confirm in BR-0.
+// mergeable is null while GitHub computes it, and is kept as nil, never read as false.
+func (c *Client) PullRequest(ctx context.Context, repository string, number int) (provider.PullRequestInfo, error) {
+	var out struct {
+		Number         int     `json:"number"`
+		State          string  `json:"state"`
+		MergeCommitSHA *string `json:"merge_commit_sha"`
+		Mergeable      *bool   `json:"mergeable"`
+		Commits        int     `json:"commits"`
+		Base           struct {
+			Ref  string `json:"ref"`
+			SHA  string `json:"sha"`
+			Repo *struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
+		} `json:"base"`
+		Head struct {
+			SHA  string `json:"sha"`
+			Repo *struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
+		} `json:"head"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d", repository, number), true, &out); err != nil {
+		return provider.PullRequestInfo{}, err
+	}
+	info := provider.PullRequestInfo{
+		Number: out.Number, State: out.State, BaseRef: out.Base.Ref, BaseSHA: out.Base.SHA,
+		HeadSHA: out.Head.SHA, Mergeable: out.Mergeable, Commits: out.Commits,
+	}
+	if out.Base.Repo != nil {
+		info.BaseRepository = out.Base.Repo.FullName
+	}
+	if out.Head.Repo != nil {
+		info.HeadRepository = out.Head.Repo.FullName
+	}
+	if out.MergeCommitSHA != nil {
+		info.MergeCommitSHA = *out.MergeCommitSHA
+	}
+	return info, nil
+}
+
+// pullCommitPages is how many pages of ListPullRequestCommits are read: GitHub serves at most
+// provider.PullRequestCommitCap commits, which is three pages of 100, and one more page is read
+// so that a list that does not stop where the cap says is noticed.
+const pullCommitPages = 4
+
+// ListPullRequestCommits returns the commits of a pull request, oldest first, following
+// pagination until a short or empty page. Assumption C11, to confirm in BR-0: the endpoint is
+// GET /repos/{r}/pulls/{n}/commits and stops at provider.PullRequestCommitCap. Whether the list
+// is COMPLETE is for the caller to judge against PullRequestInfo.Commits and the cap.
+func (c *Client) ListPullRequestCommits(ctx context.Context, repository string, number int) ([]provider.PullRequestCommit, error) {
+	var all []provider.PullRequestCommit
+	for page := 1; page <= pullCommitPages; page++ {
+		q := url.Values{"per_page": {strconv.Itoa(listPerPage)}, "page": {strconv.Itoa(page)}}
+		var out []struct {
+			SHA    string `json:"sha"`
+			Author *struct {
+				Login string `json:"login"`
+			} `json:"author"`
+			Commit struct {
+				Author struct {
+					Name string `json:"name"`
+				} `json:"author"`
+			} `json:"commit"`
+		}
+		if _, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d/commits?%s", repository, number, q.Encode()), true, &out); err != nil {
+			return nil, err
+		}
+		for _, x := range out {
+			who := x.Commit.Author.Name
+			if x.Author != nil && x.Author.Login != "" {
+				who = x.Author.Login
+			}
+			all = append(all, provider.PullRequestCommit{SHA: x.SHA, Author: who})
+		}
+		if len(out) < listPerPage {
+			return all, nil
+		}
+	}
+	return all, nil // four full pages: more than the cap, which the caller will see and refuse
 }
 
 // ListCommits returns recent commit ids of the default branch.
@@ -287,67 +432,180 @@ func (c *Client) ListCommits(ctx context.Context, repository string, limit int) 
 	return shas, nil
 }
 
-// ListRuns returns recent workflow runs. The field names are assumptions to confirm in BR-0.
+// Pagination bounds for the run and job listings. The supervisor decides whether it is safe to
+// start a runner from these lists, so a list that was cut short must be an error, never a
+// silently shorter answer.
+const (
+	listPerPage  = 100
+	listMaxPages = 20
+)
+
+var repoURLRe = regexp.MustCompile(`/repos/([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)$`)
+
+// ListRuns returns workflow runs, newest first, following pagination. The field names are
+// assumptions to confirm in BR-0 (C3). A listing longer than listMaxPages pages is an error.
 func (c *Client) ListRuns(ctx context.Context, repository, status string) ([]provider.Run, error) {
-	q := url.Values{"per_page": {"30"}}
-	if status != "" {
-		q.Set("status", status)
+	return c.listRuns(ctx, repository, status, 0)
+}
+
+// ListRecentRuns returns the newest limit runs (fewer if fewer exist), reading only as many
+// pages as that takes: a caller that wants "the latest 30" must not pay for every page of a long
+// history. A list that stops short of both limit and total_count is an error, as in ListRuns.
+func (c *Client) ListRecentRuns(ctx context.Context, repository, status string, limit int) ([]provider.Run, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("ListRecentRuns: limit %d is not positive", limit)
 	}
-	var out struct {
-		Runs []struct {
-			ID       int64  `json:"id"`
-			HeadSHA  string `json:"head_sha"`
-			Event    string `json:"event"`
-			Status   string `json:"status"`
-			HeadRepo *struct {
-				FullName string `json:"full_name"`
-			} `json:"head_repository"`
-			Actor *struct {
-				Login string `json:"login"`
-			} `json:"actor"`
-		} `json:"workflow_runs"`
+	return c.listRuns(ctx, repository, status, limit)
+}
+
+// listRuns reads runs; limit 0 means all of them.
+func (c *Client) listRuns(ctx context.Context, repository, status string, limit int) ([]provider.Run, error) {
+	var runs []provider.Run
+	total := 0
+	complete := false
+	perPage := listPerPage
+	if limit > 0 && limit < perPage {
+		perPage = limit
 	}
-	if _, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/actions/runs?"+q.Encode(), true, &out); err != nil {
-		return nil, err
-	}
-	runs := make([]provider.Run, 0, len(out.Runs))
-	for _, r := range out.Runs {
-		run := provider.Run{ID: r.ID, HeadSHA: r.HeadSHA, Event: r.Event, Status: r.Status}
-		if r.HeadRepo != nil {
-			run.HeadRepository = r.HeadRepo.FullName
+	for page := 1; page <= listMaxPages; page++ {
+		q := url.Values{"per_page": {strconv.Itoa(perPage)}, "page": {strconv.Itoa(page)}}
+		if status != "" {
+			q.Set("status", status)
 		}
-		if r.Actor != nil {
-			run.Actor = r.Actor.Login
+		var out struct {
+			Total int `json:"total_count"`
+			Runs  []struct {
+				ID       int64  `json:"id"`
+				HeadSHA  string `json:"head_sha"`
+				Event    string `json:"event"`
+				Status   string `json:"status"`
+				HeadRepo *struct {
+					FullName string `json:"full_name"`
+				} `json:"head_repository"`
+				Actor *struct {
+					Login string `json:"login"`
+				} `json:"actor"`
+				PullRequests []struct {
+					Number int `json:"number"`
+					Head   *struct {
+						SHA  string `json:"sha"`
+						Repo *struct {
+							URL string `json:"url"`
+						} `json:"repo"`
+					} `json:"head"`
+					Base *struct {
+						Ref string `json:"ref"`
+						SHA string `json:"sha"`
+					} `json:"base"`
+				} `json:"pull_requests"`
+			} `json:"workflow_runs"`
 		}
-		runs = append(runs, run)
+		if _, err := c.do(ctx, http.MethodGet, "/repos/"+repository+"/actions/runs?"+q.Encode(), true, &out); err != nil {
+			return nil, err
+		}
+		for _, r := range out.Runs {
+			run := provider.Run{ID: r.ID, HeadSHA: r.HeadSHA, Event: r.Event, Status: r.Status}
+			if r.HeadRepo != nil {
+				run.HeadRepository = r.HeadRepo.FullName
+			}
+			if r.Actor != nil {
+				run.Actor = r.Actor.Login
+			}
+			for _, pr := range r.PullRequests {
+				ref := provider.PullRequest{Number: pr.Number}
+				if pr.Base != nil {
+					ref.BaseRef, ref.BaseSHA = pr.Base.Ref, pr.Base.SHA
+				}
+				if pr.Head != nil {
+					ref.HeadSHA = pr.Head.SHA
+					if pr.Head.Repo != nil {
+						if m := repoURLRe.FindStringSubmatch(pr.Head.Repo.URL); m != nil {
+							ref.HeadRepository = m[1]
+						}
+					}
+				}
+				run.PullRequests = append(run.PullRequests, ref)
+			}
+			runs = append(runs, run)
+		}
+		total = out.Total
+		if limit > 0 && len(runs) >= limit {
+			return runs[:limit], nil // asked for the newest few, and has them
+		}
+		if endOfList(len(out.Runs), perPage, len(runs), total) {
+			complete = true
+			break
+		}
+	}
+	if limit > 0 && len(runs) >= limit {
+		return runs[:limit], nil
+	}
+	if !complete || len(runs) < total {
+		return nil, incompleteList("workflow runs", len(runs), total, "a very long queue (GitHub lists at most 1000 results), or a runaway workflow", "clear the queue (cancel old runs), then re-run")
 	}
 	return runs, nil
 }
 
-// ListJobs returns the jobs of a run.
+// endOfList says whether the page just read ended the listing: it was empty (GitHub's cap stops
+// a list short of total_count, and asking further only repeats the answer), or it was a short page
+// and everything promised has been read. A total_count that lags behind the list (more results
+// than it says) does not end the list by itself: a full page may still have a successor, so
+// the list is never cut at total_count, which would blind the caller to the rest.
+func endOfList(pageLen, perPage, have, total int) bool {
+	return pageLen == 0 || (pageLen < perPage && have >= total)
+}
+
+// incompleteList is the error for a listing whose results do not add up to its total_count.
+// The supervisor decides whether it is safe to start a runner from these lists, so a short or
+// capped list is never returned as if it were the whole.
+func incompleteList(what string, got, total int, cause, fix string) error {
+	return diag.New(diag.CodeGitHubUnavailable, fmt.Sprintf("read %d of %d %s: the list cannot be read completely", got, total, what), cause, fix)
+}
+
+// ListJobs returns every job of a run, following pagination.
 func (c *Client) ListJobs(ctx context.Context, repository string, runID int64) ([]provider.Job, error) {
-	var out struct {
-		Jobs []struct {
-			ID         int64    `json:"id"`
-			RunID      int64    `json:"run_id"`
-			Status     string   `json:"status"`
-			Labels     []string `json:"labels"`
-			RunnerName *string  `json:"runner_name"`
-			HeadSHA    string   `json:"head_sha"`
-		} `json:"jobs"`
-	}
-	if _, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs/%d/jobs", repository, runID), true, &out); err != nil {
-		return nil, err
-	}
-	jobs := make([]provider.Job, 0, len(out.Jobs))
-	for _, j := range out.Jobs {
-		job := provider.Job{ID: j.ID, RunID: j.RunID, Status: j.Status, Labels: j.Labels, HeadSHA: j.HeadSHA}
-		if j.RunnerName != nil {
-			job.RunnerName = *j.RunnerName
+	var jobs []provider.Job
+	total := 0
+	complete := false
+	for page := 1; page <= listMaxPages; page++ {
+		q := url.Values{"per_page": {strconv.Itoa(listPerPage)}, "page": {strconv.Itoa(page)}}
+		var out struct {
+			Total int `json:"total_count"`
+			Jobs  []struct {
+				ID         int64    `json:"id"`
+				RunID      int64    `json:"run_id"`
+				Status     string   `json:"status"`
+				Labels     []string `json:"labels"`
+				RunnerName *string  `json:"runner_name"`
+				HeadSHA    string   `json:"head_sha"`
+			} `json:"jobs"`
 		}
-		jobs = append(jobs, job)
+		if _, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs/%d/jobs?%s", repository, runID, q.Encode()), true, &out); err != nil {
+			return nil, err
+		}
+		for _, j := range out.Jobs {
+			job := provider.Job{ID: j.ID, RunID: j.RunID, Status: j.Status, Labels: j.Labels, HeadSHA: j.HeadSHA}
+			if j.RunnerName != nil {
+				job.RunnerName = *j.RunnerName
+			}
+			jobs = append(jobs, job)
+		}
+		total = out.Total
+		if endOfList(len(out.Jobs), listPerPage, len(jobs), total) {
+			complete = true
+			break
+		}
+	}
+	if !complete || len(jobs) < total {
+		return nil, incompleteList(fmt.Sprintf("jobs of run %d", runID), len(jobs), total, "an unusually large matrix, or GitHub cutting the list short", "cancel the run")
 	}
 	return jobs, nil
+}
+
+// CancelRun asks GitHub to cancel a run. The endpoint (POST .../actions/runs/{id}/cancel,
+// answering 202) is assumption C4, to confirm in BR-0.
+func (c *Client) CancelRun(ctx context.Context, repository string, runID int64) error {
+	return c.send(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/actions/runs/%d/cancel", repository, runID), struct{}{}, nil)
 }
 
 // GenerateJITConfig registers a single-use runner. The endpoint and fields are assumptions to
@@ -411,6 +669,8 @@ func (c *Client) ListRunners(ctx context.Context, s provider.Scope) ([]provider.
 	}
 	const perPage, maxPages = 100, 50
 	var all []provider.Runner
+	total := 0
+	complete := false
 	for page := 1; page <= maxPages; page++ {
 		var out struct {
 			TotalCount int          `json:"total_count"`
@@ -427,9 +687,14 @@ func (c *Client) ListRunners(ctx context.Context, s provider.Scope) ([]provider.
 			}
 			all = append(all, pr)
 		}
-		if len(out.Runners) < perPage || len(all) >= out.TotalCount {
-			return all, nil
+		total = out.TotalCount
+		if endOfList(len(out.Runners), perPage, len(all), total) {
+			complete = true
+			break
 		}
+	}
+	if !complete || len(all) < total {
+		return nil, incompleteList("runners", len(all), total, "more runners than the page limit allows, or GitHub cutting the list short", "remove runners you no longer use")
 	}
 	return all, nil
 }

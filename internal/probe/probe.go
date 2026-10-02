@@ -42,6 +42,9 @@ type Options struct {
 	SkipJIT    bool
 	// NewName makes the temporary runner's name; tests fix it.
 	NewName func() string
+	// Wait pauses between reads of a pull request whose mergeable is still null (GitHub computes
+	// it lazily); nil waits a few seconds. Tests make it instant.
+	Wait func(ctx context.Context)
 }
 
 func randomName() string {
@@ -61,6 +64,7 @@ func Run(ctx context.Context, p provider.Provider, o Options) []Finding {
 	out = append(out, checkAuth(ctx, p, scope))
 	out = append(out, checkCommits(ctx, p, o.Repository)...)
 	out = append(out, checkRuns(ctx, p, o.Repository)...)
+	out = append(out, checkPullRequests(ctx, p, o)...)
 	if o.SkipJIT {
 		out = append(out, Finding{"C2", "a single-use (just-in-time) runner can be registered", Skip, "skipped at your request (--skip-jit)"})
 	} else {
@@ -170,7 +174,7 @@ func checkCommits(ctx context.Context, p provider.Provider, repo string) []Findi
 
 func checkRuns(ctx context.Context, p provider.Provider, repo string) []Finding {
 	f := Finding{ID: "C3", Assumption: "a workflow run says which commit it executes, for which event, from which repository, on behalf of whom"}
-	runs, err := p.ListRuns(ctx, repo, "")
+	runs, err := p.ListRecentRuns(ctx, repo, "", 30)
 	if err != nil {
 		f.Status, f.Detail = Fail, "cannot list runs: "+describe(err)
 		return []Finding{f}

@@ -44,13 +44,36 @@ type Server struct {
 	// ForkApproval is the policy served per repository (default: the strictest).
 	// ForkApprovalUnsupported makes the endpoint answer 404, as an API that lacks it would.
 	ForkApproval map[string]string
-	commits      map[string]commitData // "owner/repo@sha"
-	commitOrder  map[string][]string   // repo -> shas, oldest first
+	commits      map[string]commitData   // "owner/repo@sha"
+	commitOrder  map[string][]string     // repo -> shas, oldest first
+	commitStatus map[string]int          // sha -> forced HTTP status
+	repoStatus   map[string]int          // repo -> forced HTTP status of GET /repos/{repo}
+	reasons      map[string]string       // "owner/repo@sha" -> verification.reason served for it when unsigned
+	parents      map[string][]string     // "owner/repo@sha" -> parents served for it (default: the "parent" lines of its payload)
+	pulls        map[string]*PullRequest // "owner/repo#number"
 	runs         map[string][]provider.Run
 	jobs         map[string][]provider.Job
 	// JITUnsupported makes generate-jitconfig answer 404, as an API without it would.
 	JITUnsupported          bool
 	ForkApprovalUnsupported bool
+	// CancelIgnored makes the cancel endpoint answer 202 without cancelling anything, as a
+	// cancellation that is slow or never takes effect would look. CancelUnsupported answers 404.
+	CancelIgnored     bool
+	CancelUnsupported bool
+	// ResultCap makes the run and job listings return only the first ResultCap results however
+	// many pages are asked for, while total_count still reports the full count: GitHub's list
+	// endpoints stop at 1000 results. 0 means no cap.
+	ResultCap int
+	// MaxPerPage makes a listing page hold at most this many items even when per_page asks for
+	// more (a short page that is not the last one). 0 means no limit.
+	MaxPerPage int
+	// TotalCountOffset is added to total_count in the run and job listings: negative, it models
+	// a total that lags behind the list (a run was created after the count was taken).
+	TotalCountOffset int
+	// JobRunIDOffset is added to the run_id the jobs endpoint reports, as inconsistent data would.
+	JobRunIDOffset int64
+	// FailPathContains makes every request whose path contains it answer 500.
+	FailPathContains string
 	// Tarball is the runner archive served; ChecksumOverride and OmitChecksum corrupt the
 	// published checksum on purpose.
 	Tarball          []byte
@@ -62,6 +85,7 @@ type Server struct {
 	nextID    int64
 	regTokens map[string]string // registration token -> scope target
 	requests  []string
+	uris      []string // "METHOD /path?query"
 	// ReleaseAuthHeader is the Authorization header seen on the release lookup.
 	ReleaseAuthHeader string
 }
@@ -92,6 +116,117 @@ func New() *Server {
 
 type commitData struct{ payload, signature string }
 
+// PullRequest is a pull request the fake serves at /repos/{repo}/pulls/{number}. Info.Commits is
+// ignored: the server reports len(Commits), as GitHub counts them, while the commits LIST stops at
+// provider.PullRequestCommitCap like GitHub's does.
+type PullRequest struct {
+	Info    provider.PullRequestInfo
+	Commits []provider.PullRequestCommit
+	// ListLimit makes the commits listing stop after this many commits (0: only GitHub's own cap
+	// of provider.PullRequestCommitCap), as a listing cut short for another reason would.
+	ListLimit int
+}
+
+// SetPullRequest serves (or replaces) a pull request of repo.
+func (s *Server) SetPullRequest(repo string, pr PullRequest) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pulls == nil {
+		s.pulls = map[string]*PullRequest{}
+	}
+	cp := pr
+	cp.Commits = append([]provider.PullRequestCommit(nil), pr.Commits...)
+	s.pulls[fmt.Sprintf("%s#%d", repo, pr.Info.Number)] = &cp
+}
+
+// UpdatePullRequest edits a served pull request in place, as GitHub does when the base branch
+// moves, a merge is recomputed or the pull request is pushed to.
+func (s *Server) UpdatePullRequest(repo string, number int, edit func(*PullRequest)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if pr := s.pulls[fmt.Sprintf("%s#%d", repo, number)]; pr != nil {
+		edit(pr)
+	}
+}
+
+// SetCommitParents overrides the parents the commit endpoint reports for sha in repo (by default
+// they are the "parent" lines of the served payload): a provider that disagrees with the commit.
+func (s *Server) SetCommitParents(repo, sha string, parents []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.parents == nil {
+		s.parents = map[string][]string{}
+	}
+	s.parents[repo+"@"+sha] = parents
+}
+
+// payloadParents reads the parent ids out of a commit object.
+func payloadParents(payload string) []string {
+	var out []string
+	for _, l := range strings.Split(payload, "\n") {
+		if l == "" {
+			break // the header ends at the first blank line
+		}
+		if p, ok := strings.CutPrefix(l, "parent "); ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (s *Server) handlePulls(w http.ResponseWriter, r *http.Request, repo string, rest []string) {
+	// rest is [number] or [number, "commits"].
+	n, err := strconv.Atoi(rest[0])
+	s.mu.Lock()
+	var pr PullRequest
+	have := false
+	if err == nil {
+		if p := s.pulls[fmt.Sprintf("%s#%d", repo, n)]; p != nil {
+			pr, have = *p, true
+			pr.Commits = append([]provider.PullRequestCommit(nil), p.Commits...)
+		}
+	}
+	s.mu.Unlock()
+	if !have {
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+		return
+	}
+	if len(rest) == 2 && rest[1] == "commits" {
+		all := pr.Commits
+		if len(all) > provider.PullRequestCommitCap {
+			all = all[:provider.PullRequestCommitCap] // GitHub's own cap on this listing
+		}
+		if pr.ListLimit > 0 && len(all) > pr.ListLimit {
+			all = all[:pr.ListLimit]
+		}
+		lo, hi := pageOf(r, len(all))
+		out := []map[string]any{}
+		for _, c := range all[lo:hi] {
+			out = append(out, map[string]any{"sha": c.SHA, "author": map[string]string{"login": c.Author}, "commit": map[string]any{"author": map[string]string{"name": c.Author}}})
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	if len(rest) != 1 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+		return
+	}
+	i := pr.Info
+	var merge any
+	if i.MergeCommitSHA != "" {
+		merge = i.MergeCommitSHA
+	}
+	var head any
+	if i.HeadRepository != "" {
+		head = map[string]string{"full_name": i.HeadRepository}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"number": i.Number, "state": i.State, "merge_commit_sha": merge, "mergeable": i.Mergeable, "commits": len(pr.Commits),
+		"base": map[string]any{"ref": i.BaseRef, "sha": i.BaseSHA, "repo": map[string]string{"full_name": i.BaseRepository}},
+		"head": map[string]any{"sha": i.HeadSHA, "repo": head},
+	})
+}
+
 // AddCommit serves a commit (its signed payload and signature) for repo at sha. Pass the
 // signature "" for an unsigned commit. The server returns whatever it is given: it does not
 // check that the sha is the hash of the content, so tests can model a dishonest server.
@@ -106,6 +241,48 @@ func (s *Server) AddCommit(repo, sha, payload, signature string) {
 		s.commitOrder = map[string][]string{}
 	}
 	s.commitOrder[repo] = append(s.commitOrder[repo], sha)
+}
+
+// SetCommitReason makes the commit endpoint report this verification.reason for sha in repo when
+// the commit is unsigned (GitHub's "unsigned" by default): "gpgverify_unavailable" is what a
+// verification outage would look like. It has no effect on a signed commit.
+func (s *Server) SetCommitReason(repo, sha, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reasons == nil {
+		s.reasons = map[string]string{}
+	}
+	s.reasons[repo+"@"+sha] = reason
+}
+
+// SetCommitStatus (status 0 clears it) makes the commit endpoint answer with this HTTP status for sha, whatever else
+// it knows: 404 and 422 are what GitHub says for a commit that does not exist (a deleted fork).
+func (s *Server) SetCommitStatus(sha string, status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if status == 0 {
+		delete(s.commitStatus, sha)
+		return
+	}
+	if s.commitStatus == nil {
+		s.commitStatus = map[string]int{}
+	}
+	s.commitStatus[sha] = status
+}
+
+// SetRepoStatus (status 0 clears it) makes GET /repos/{repo} answer with this HTTP status, whatever
+// else it knows: 404 is what GitHub says for a repository the token cannot see.
+func (s *Server) SetRepoStatus(repo string, status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if status == 0 {
+		delete(s.repoStatus, repo)
+		return
+	}
+	if s.repoStatus == nil {
+		s.repoStatus = map[string]int{}
+	}
+	s.repoStatus[repo] = status
 }
 
 // AddRun makes a workflow run visible for repo (newest last; the API lists newest first).
@@ -128,43 +305,182 @@ func (s *Server) AddJob(repo string, j provider.Job) {
 	s.jobs[repo] = append(s.jobs[repo], j)
 }
 
+// page returns the slice of n items that the request's page/per_page select (default: all).
+func (s *Server) page(r *http.Request, n int) (lo, hi int) {
+	if s.ResultCap > 0 && n > s.ResultCap {
+		n = s.ResultCap
+	}
+	lo, hi = pageOf(r, n)
+	if s.MaxPerPage > 0 && hi-lo > s.MaxPerPage {
+		hi = lo + s.MaxPerPage
+	}
+	return lo, hi
+}
+
+func pageOf(r *http.Request, n int) (lo, hi int) {
+	perPage, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
+	pg, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if perPage < 1 {
+		return 0, n
+	}
+	if pg < 1 {
+		pg = 1
+	}
+	lo, hi = (pg-1)*perPage, pg*perPage
+	if lo > n {
+		lo = n
+	}
+	if hi > n {
+		hi = n
+	}
+	return lo, hi
+}
+
 func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request, repo string, rest []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(rest) == 1 { // GET .../actions/runs[?status=]
-		status := r.URL.Query().Get("status")
-		out := []map[string]any{}
-		all := s.runs[repo]
-		for i := len(all) - 1; i >= 0; i-- { // newest first
-			run := all[i]
-			if status != "" && run.Status != status {
-				continue
-			}
-			out = append(out, map[string]any{
-				"id": run.ID, "head_sha": run.HeadSHA, "event": run.Event, "status": run.Status,
-				"head_repository": map[string]string{"full_name": run.HeadRepository},
-				"actor":           map[string]string{"login": run.Actor},
-			})
+	if r.Method == http.MethodPost && len(rest) == 3 && rest[2] == "cancel" { // POST .../actions/runs/{id}/cancel
+		id, _ := strconv.ParseInt(rest[1], 10, 64)
+		if s.CancelUnsupported {
+			writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(out), "workflow_runs": out})
+		found := false
+		for i := range s.runs[repo] {
+			if s.runs[repo][i].ID == id {
+				found = true
+				if !s.CancelIgnored {
+					s.runs[repo][i].Status = "completed"
+					for j := range s.jobs[repo] {
+						if s.jobs[repo][j].RunID == id && s.jobs[repo][j].Status != "in_progress" {
+							s.jobs[repo][j].Status = "completed"
+						}
+					}
+				}
+			}
+		}
+		if !found {
+			writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{})
 		return
 	}
-	if len(rest) == 3 && rest[2] == "jobs" { // GET .../actions/runs/{id}/jobs
-		id, _ := strconv.ParseInt(rest[1], 10, 64)
-		out := []map[string]any{}
-		for _, j := range s.jobs[repo] {
-			if j.RunID == id {
-				var runner any
-				if j.RunnerName != "" {
-					runner = j.RunnerName
-				}
-				out = append(out, map[string]any{"id": j.ID, "run_id": j.RunID, "status": j.Status, "labels": j.Labels, "runner_name": runner, "head_sha": j.HeadSHA})
+	if r.Method == http.MethodGet && len(rest) == 1 { // GET .../actions/runs[?status=]
+		status := r.URL.Query().Get("status")
+		var matching []provider.Run
+		all := s.runs[repo]
+		for i := len(all) - 1; i >= 0; i-- { // newest first
+			if status == "" || all[i].Status == status {
+				matching = append(matching, all[i])
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(out), "jobs": out})
+		lo, hi := s.page(r, len(matching))
+		out := []map[string]any{}
+		for _, run := range matching[lo:hi] {
+			prs := []map[string]any{}
+			for _, pr := range run.PullRequests {
+				prs = append(prs, map[string]any{"number": pr.Number, "head": map[string]any{
+					"sha": pr.HeadSHA, "repo": map[string]string{"url": s.URL + "/repos/" + pr.HeadRepository}},
+					"base": map[string]any{"ref": pr.BaseRef, "sha": pr.BaseSHA}})
+			}
+			entry := map[string]any{
+				"id": run.ID, "head_sha": run.HeadSHA, "event": run.Event, "status": run.Status,
+				"actor": map[string]string{"login": run.Actor}, "pull_requests": prs,
+			}
+			if run.HeadRepository != "" {
+				entry["head_repository"] = map[string]string{"full_name": run.HeadRepository}
+			}
+			out = append(out, entry)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(matching) + s.TotalCountOffset, "workflow_runs": out})
+		return
+	}
+	if r.Method == http.MethodGet && len(rest) == 3 && rest[2] == "jobs" { // GET .../actions/runs/{id}/jobs
+		id, _ := strconv.ParseInt(rest[1], 10, 64)
+		var mine []provider.Job
+		for _, j := range s.jobs[repo] {
+			if j.RunID == id {
+				mine = append(mine, j)
+			}
+		}
+		lo, hi := s.page(r, len(mine))
+		out := []map[string]any{}
+		for _, j := range mine[lo:hi] {
+			var runner any
+			if j.RunnerName != "" {
+				runner = j.RunnerName
+			}
+			out = append(out, map[string]any{"id": j.ID, "run_id": j.RunID + s.JobRunIDOffset, "status": j.Status, "labels": j.Labels, "runner_name": runner, "head_sha": j.HeadSHA})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(mine) + s.TotalCountOffset, "jobs": out})
 		return
 	}
 	writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+}
+
+// SetFailPath sets FailPathContains safely while requests are in flight.
+func (s *Server) SetFailPath(contains string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.FailPathContains = contains
+}
+
+// SetRunStatus changes a run's status, as GitHub does when a run starts or finishes.
+func (s *Server) SetRunStatus(repo string, runID int64, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.runs[repo] {
+		if s.runs[repo][i].ID == runID {
+			s.runs[repo][i].Status = status
+		}
+	}
+}
+
+// UpdateRun edits a run in place, as GitHub does when it records new facts about it.
+func (s *Server) UpdateRun(repo string, runID int64, edit func(*provider.Run)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.runs[repo] {
+		if s.runs[repo][i].ID == runID {
+			edit(&s.runs[repo][i])
+		}
+	}
+}
+
+// UpdateJob edits a job in place, as GitHub does when a runner takes it or it finishes.
+func (s *Server) UpdateJob(repo string, jobID int64, edit func(*provider.Job)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.jobs[repo] {
+		if s.jobs[repo][i].ID == jobID {
+			edit(&s.jobs[repo][i])
+		}
+	}
+}
+
+// Job returns a copy of a job, and whether it exists.
+func (s *Server) Job(repo string, jobID int64) (provider.Job, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, j := range s.jobs[repo] {
+		if j.ID == jobID {
+			return j, true
+		}
+	}
+	return provider.Job{}, false
+}
+
+// Run returns a copy of a run, and whether it exists.
+func (s *Server) Run(repo string, runID int64) (provider.Run, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.runs[repo] {
+		if r.ID == runID {
+			return r, true
+		}
+	}
+	return provider.Run{}, false
 }
 
 func (s *Server) handleCommitList(w http.ResponseWriter, r *http.Request, repo string) {
@@ -187,18 +503,41 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, repo, sha 
 	authed := r.Header.Get("Authorization") == "Bearer "+s.Token
 	s.mu.Lock()
 	cd, have := s.commits[repo+"@"+sha]
+	status, forced := s.commitStatus[sha]
 	s.mu.Unlock()
+	if forced {
+		msg := http.StatusText(status)
+		if status == http.StatusUnprocessableEntity {
+			msg = "No commit found for SHA: " + sha // GitHub's own wording
+		}
+		writeJSON(w, status, map[string]string{"message": msg})
+		return
+	}
 	if !known || !have || (private && !authed) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
 		return
+	}
+	s.mu.Lock()
+	parents, overridden := s.parents[repo+"@"+sha]
+	reason, haveReason := s.reasons[repo+"@"+sha]
+	s.mu.Unlock()
+	if !overridden {
+		parents = payloadParents(cd.payload)
+	}
+	plist := []map[string]string{}
+	for _, p := range parents {
+		plist = append(plist, map[string]string{"sha": p})
 	}
 	v := map[string]any{"verified": false, "reason": "unknown_key", "signature": nil, "payload": nil}
 	if cd.signature != "" {
 		v["signature"], v["payload"] = cd.signature, cd.payload
 	} else {
 		v["reason"] = "unsigned"
+		if haveReason {
+			v["reason"] = reason
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"sha": sha, "verification": v})
+	writeJSON(w, http.StatusOK, map[string]any{"sha": sha, "parents": plist, "verification": v})
 }
 
 // Requests returns "METHOD /path" for every request so far.
@@ -206,6 +545,13 @@ func (s *Server) Requests() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.requests...)
+}
+
+// URIs returns "METHOD /path?query" for every request so far, to assert how a client paged.
+func (s *Server) URIs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.uris...)
 }
 
 // Runners returns a copy of the runners registered at target.
@@ -251,8 +597,14 @@ func (s *Server) register(target, name string, labels []string, online bool) {
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.requests = append(s.requests, r.Method+" "+r.URL.Path)
+	s.uris = append(s.uris, r.Method+" "+r.URL.RequestURI())
 	down := s.Down
+	failPath := s.FailPathContains
 	s.mu.Unlock()
+	if failPath != "" && strings.Contains(r.URL.Path, failPath) {
+		http.Error(w, `{"message":"Internal Server Error"}`, http.StatusInternalServerError)
+		return
+	}
 	if down {
 		http.Error(w, `{"message":"Service Unavailable"}`, http.StatusServiceUnavailable)
 		return
@@ -285,6 +637,13 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleCommit(w, r, parts[1]+"/"+parts[2], parts[5])
 		return
 	}
+	if parts := strings.Split(strings.Trim(p, "/"), "/"); (len(parts) == 5 || len(parts) == 6) && parts[0] == "repos" && parts[3] == "pulls" && r.Method == http.MethodGet {
+		if !s.authorized(w, r) {
+			return
+		}
+		s.handlePulls(w, r, parts[1]+"/"+parts[2], parts[4:])
+		return
+	}
 	if parts := strings.Split(strings.Trim(p, "/"), "/"); len(parts) == 3 && parts[0] == "repos" && r.Method == http.MethodGet {
 		s.handleRepo(w, r, parts[1]+"/"+parts[2])
 		return
@@ -311,6 +670,13 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (s *Server) handleRepo(w http.ResponseWriter, r *http.Request, repo string) {
+	s.mu.Lock()
+	forced, isForced := s.repoStatus[repo]
+	s.mu.Unlock()
+	if isForced {
+		writeJSON(w, forced, map[string]string{"message": http.StatusText(forced)})
+		return
+	}
 	private, ok := s.Repos[repo]
 	authed := r.Header.Get("Authorization") == "Bearer "+s.Token
 	if !ok || (private && !authed) {
@@ -359,7 +725,7 @@ func (s *Server) handleRunners(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	target, rest, ok := s.scopeTarget(parts)
-	if ok && len(rest) >= 1 && rest[0] == "runs" && r.Method == http.MethodGet {
+	if ok && len(rest) >= 1 && rest[0] == "runs" && (r.Method == http.MethodGet || r.Method == http.MethodPost) {
 		s.handleRuns(w, r, parts[1]+"/"+parts[2], rest)
 		return
 	}

@@ -128,6 +128,7 @@ Commands:
   doctor    check prerequisites, token, registration and service health
   remove    deregister the runner and delete everything it installed
   trust     manage which signing keys may run code here (add, list, revoke, verify)
+  supervise watch the queue and run each admitted job in its own isolated container
   probe     check the GitHub behaviours this design assumes (read-only; see docs/BR-0-runbook.md)
   version   print the version
 
@@ -156,6 +157,8 @@ func Run(ctx context.Context, args []string, d Deps) int {
 		err = cmdTrust(ctx, rest, &d)
 	case "probe":
 		err = cmdProbe(ctx, rest, &d)
+	case "supervise":
+		err = cmdSupervise(ctx, rest, &d)
 	case "remove":
 		err = cmdRemove(ctx, rest, &d)
 	case "version", "--version":

@@ -44,9 +44,23 @@ func cmdProbe(ctx context.Context, args []string, d *Deps) error {
 	fmt.Fprintf(d.Stdout, "BR-0 probe of %s\nThis machine is not changed and no runner is installed. The report below contains no secrets.\n\n", *repo)
 	findings := probe.Run(ctx, client, probe.Options{Repository: *repo, SkipJIT: *skipJIT})
 	fmt.Fprint(d.Stdout, probe.Render(findings))
+	skipped := probe.SkippedPullRequestChecks(findings)
+	incomplete := ""
+	if len(skipped) > 0 {
+		incomplete = fmt.Sprintf("%d checks SKIPPED, BR-0 is NOT complete (%s): nothing was proved for them", len(skipped), strings.Join(skipped, ", "))
+	}
 	if probe.Failed(findings) {
 		fmt.Fprintln(d.Stdout, "\nAt least one assumption failed: share this report, it says what to change.")
+		if incomplete != "" {
+			fmt.Fprintln(d.Stdout, incomplete+".")
+			fmt.Fprintln(d.Stdout, "BR-0 INCOMPLETE: "+strings.Join(skipped, ", ")+" skipped.")
+		}
 		return errFailed
+	}
+	if incomplete != "" {
+		fmt.Fprintf(d.Stdout, "\nNo assumption failed, but %s. SKIP and NOTE lines say what is still unknown.\n", incomplete)
+		fmt.Fprintln(d.Stdout, "BR-0 INCOMPLETE: "+strings.Join(skipped, ", ")+" skipped; run the probe again once they have something to look at (exit status 0 does not mean complete).")
+		return nil
 	}
 	fmt.Fprintln(d.Stdout, "\nNo assumption failed. SKIP and NOTE lines say what is still unknown.")
 	return nil

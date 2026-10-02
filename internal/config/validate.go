@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/modullar/blade-runner/internal/isolation"
 	"github.com/modullar/blade-runner/internal/version"
 )
 
@@ -103,6 +104,23 @@ func Validate(c *Config) []Problem {
 		case path.IsAbs(w) || clean == ".." || strings.HasPrefix(clean, "../"):
 			add(key, "%q must be a path inside the project", w)
 		}
+	}
+
+	if img := c.Supervisor.Image; img != "" {
+		if _, err := (isolation.Spec{Name: "check", Image: img}).Validate(); err != nil {
+			add("supervisor.image", "%q is not pinned by content (name@sha256:<64 hex digits>): a tag can be moved to different code", img)
+		}
+	}
+	switch c.Supervisor.Network {
+	case "", isolation.NetworkBridge, isolation.NetworkNone:
+	default:
+		add("supervisor.network", "must be %s or %s (got %q)", isolation.NetworkBridge, isolation.NetworkNone, c.Supervisor.Network)
+	}
+	if c.Supervisor.MemoryMiB < 0 {
+		add("supervisor.memory_mib", "must not be negative")
+	}
+	if c.Supervisor.TimeoutMinutes < 0 {
+		add("supervisor.timeout_minutes", "must not be negative")
 	}
 
 	checkListen(c.Agent.Listen, add)

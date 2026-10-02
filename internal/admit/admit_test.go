@@ -2,12 +2,14 @@ package admit_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/modullar/blade-runner/internal/admit"
 	"github.com/modullar/blade-runner/internal/diag"
+	"github.com/modullar/blade-runner/internal/provider"
 	"github.com/modullar/blade-runner/internal/testrig"
 	"github.com/modullar/blade-runner/internal/trust"
 )
@@ -122,5 +124,201 @@ func TestAnEmptyOrMissingTrustStoreAdmitsNothing(t *testing.T) {
 		if _, err := a.Admit(ctx, subject(c)); err == nil {
 			t.Errorf("%s was admitted with nobody trusted", who)
 		}
+	}
+}
+
+// brokenProvider is a provider whose commit lookup fails with a plain error (no diag code), as a
+// transport failure inside a custom Provider would. Everything else is the real client.
+type brokenProvider struct {
+	provider.Provider
+	err error
+}
+
+func (b brokenProvider) Commit(context.Context, string, string) (provider.Commit, error) {
+	return provider.Commit{}, b.err
+}
+
+func TestAnAdmissionFailureIsToldFromARefusalByItsCode(t *testing.T) {
+	r, a, commits, pub := rig(t)
+	trustKey(t, r, "owner", pub["owner"], time.Time{})
+
+	// GitHub down (503): "could not ask" is BR-E022, never BR-E067 (callers read E067 as "this
+	// commit may not run" and would cancel or refuse on an outage).
+	r.Srv.Down = true
+	if _, err := a.Admit(ctx, subject(commits["owner"])); diag.CodeOf(err) != diag.CodeGitHubUnavailable {
+		t.Errorf("GitHub down: %v, want BR-E022", err)
+	}
+	r.Srv.Down = false
+
+	// A repository the token cannot read: a 404 that says nothing about the commit.
+	if _, err := a.Admit(ctx, admit.Subject{Repository: "ghost/hidden", SHA: commits["owner"].SHA}); err == nil || diag.CodeOf(err) == diag.CodeNotAdmitted {
+		t.Errorf("a repository the token cannot read: %v, want an error that is not BR-E067", err)
+	}
+
+	// A commit GitHub has no object for, in a repository it can read: a real refusal, BR-E067.
+	if _, err := a.Admit(ctx, admit.Subject{Repository: testrig.Target, SHA: strings.Repeat("c", 40)}); diag.CodeOf(err) != diag.CodeNotAdmitted {
+		t.Errorf("a commit that does not exist: %v, want BR-E067", err)
+	}
+
+	// A provider error with no code at all is wrapped as BR-E022, not passed on bare.
+	b := &admit.Admitter{Provider: brokenProvider{Provider: r.Env.Provider, err: errors.New("connection reset")}, Verifier: a.Verifier}
+	if _, err := b.Admit(ctx, subject(commits["owner"])); diag.CodeOf(err) != diag.CodeGitHubUnavailable {
+		t.Errorf("an uncoded provider error: %v, want BR-E022", err)
+	}
+	// ...and a coded refusal from a provider is passed on untouched.
+	refusal := diag.New(diag.CodeNotAdmitted, "no such commit", "x", "y")
+	b = &admit.Admitter{Provider: brokenProvider{Provider: r.Env.Provider, err: refusal}, Verifier: a.Verifier}
+	if _, err := b.Admit(ctx, subject(commits["owner"])); diag.CodeOf(err) != diag.CodeNotAdmitted {
+		t.Errorf("a coded refusal: %v, want BR-E067", err)
+	}
+}
+
+func commitRequests(r *testrig.Rig) int {
+	n := 0
+	for _, req := range r.Srv.Requests() {
+		if strings.Contains(req, "/git/commits/") {
+			n++
+		}
+	}
+	return n
+}
+
+func TestACacheSavesTheFetchButNeverTheTrustDecision(t *testing.T) {
+	r, a, commits, pub := rig(t)
+	trustKey(t, r, "owner", pub["owner"], time.Time{})
+	a.Cache = admit.NewCommitCache(10)
+	s := subject(commits["owner"])
+
+	for i := 0; i < 3; i++ {
+		if v, err := a.Admit(ctx, s); err != nil || v.Signer.Name != "owner" {
+			t.Fatalf("admit %d: %v %+v", i, err, v)
+		}
+	}
+	if n := commitRequests(r); n != 1 {
+		t.Errorf("commit requests = %d, want 1: the same commit is fetched once", n)
+	}
+	if _, err := r.Env.Trust.Revoke("owner"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Admit(ctx, s); err == nil || !strings.Contains(err.Error(), "revoked") {
+		t.Fatalf("a revocation must apply at once even for a cached commit: %v", err)
+	}
+	if n := commitRequests(r); n != 1 {
+		t.Errorf("the refusal after revocation cost %d requests", n)
+	}
+}
+
+func TestACacheNeverKeepsWhatItShouldNotTrust(t *testing.T) {
+	r, a, commits, pub := rig(t)
+	trustKey(t, r, "owner", pub["owner"], time.Time{})
+	a.Cache = admit.NewCommitCache(10)
+	o, m := commits["owner"], commits["mallory"]
+
+	// A server that answers the owner's id with mallory's bytes: refused, and not remembered, so
+	// the honest answer is accepted as soon as the server gives it.
+	r.Srv.AddCommit(testrig.Target, o.SHA, m.Payload, m.Signature)
+	if _, err := a.Admit(ctx, subject(o)); diag.CodeOf(err) != diag.CodeNotAdmitted {
+		t.Fatalf("dishonest answer: %v", err)
+	}
+	if a.Cache.Len() != 0 {
+		t.Error("bytes that are not the commit were cached")
+	}
+	r.Srv.AddCommit(testrig.Target, o.SHA, o.Payload, o.Signature)
+	if _, err := a.Admit(ctx, subject(o)); err != nil {
+		t.Fatalf("after the server corrected itself: %v", err)
+	}
+
+	// An unsigned commit is refused every time and not cached.
+	before := a.Cache.Len()
+	for i := 0; i < 2; i++ {
+		if _, err := a.Admit(ctx, subject(commits["unsigned"])); err == nil {
+			t.Fatal("unsigned commit admitted")
+		}
+	}
+	if a.Cache.Len() != before {
+		t.Error("an unsigned commit was cached")
+	}
+}
+
+func TestTheCacheIsBounded(t *testing.T) {
+	r, a, commits, pub := rig(t)
+	trustKey(t, r, "owner", pub["owner"], time.Time{})
+	trustKey(t, r, "mallory", pub["mallory"], time.Time{})
+	a.Cache = admit.NewCommitCache(1)
+	for _, who := range []string{"owner", "mallory", "owner"} {
+		if _, err := a.Admit(ctx, subject(commits[who])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if a.Cache.Len() != 1 {
+		t.Errorf("cache holds %d, want at most 1", a.Cache.Len())
+	}
+	if n := commitRequests(r); n != 3 {
+		t.Errorf("requests = %d: a size-1 cache evicts the older commit, so each of three alternating commits is fetched", n)
+	}
+}
+
+func TestACommitCachedForOneRepositoryIsNotServedForAnother(t *testing.T) {
+	r, a, commits, pub := rig(t)
+	trustKey(t, r, "owner", pub["owner"], time.Time{})
+	a.Cache = admit.NewCommitCache(10)
+	other := "mallory/widgets"
+	r.Srv.Repos[other] = false // a repository that exists but does not have the commit
+	c := commits["owner"]
+
+	if _, err := a.Admit(ctx, subject(c)); err != nil {
+		t.Fatal(err)
+	}
+	before := commitRequests(r)
+	_, err := a.Admit(ctx, admit.Subject{Repository: other, SHA: c.SHA})
+	if err == nil {
+		t.Fatal("the commit cached under the base repository was served for another repository")
+	}
+	if commitRequests(r) != before+1 {
+		t.Error("the other repository was not asked: the cache key must name the repository")
+	}
+}
+
+func TestTheCacheIsBoundedByBytesAsWellAsByCount(t *testing.T) {
+	r, a, commits, pub := rig(t)
+	trustKey(t, r, "owner", pub["owner"], time.Time{})
+	trustKey(t, r, "mallory", pub["mallory"], time.Time{})
+
+	measure := admit.NewCommitCache(10)
+	a.Cache = measure
+	if _, err := a.Admit(ctx, subject(commits["owner"])); err != nil {
+		t.Fatal(err)
+	}
+	one := measure.Bytes()
+	if one == 0 {
+		t.Fatal("a cached commit takes no bytes?")
+	}
+
+	// Room for one commit and a bit, however many the count would allow.
+	a.Cache = admit.NewCommitCacheBytes(100, one+one/2)
+	for _, who := range []string{"owner", "mallory"} {
+		if _, err := a.Admit(ctx, subject(commits[who])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if a.Cache.Len() != 1 || a.Cache.Bytes() > one+one/2 {
+		t.Errorf("holds %d commits, %d bytes, budget %d", a.Cache.Len(), a.Cache.Bytes(), one+one/2)
+	}
+	// FIFO: the oldest (owner) went, the newest (mallory) stays.
+	before := commitRequests(r)
+	if _, err := a.Admit(ctx, subject(commits["mallory"])); err != nil || commitRequests(r) != before {
+		t.Errorf("the newest commit should still be cached: %v, %d new requests", err, commitRequests(r)-before)
+	}
+	if _, err := a.Admit(ctx, subject(commits["owner"])); err != nil || commitRequests(r) != before+1 {
+		t.Errorf("the oldest commit should have been evicted: %v", err)
+	}
+
+	// A commit bigger than the whole budget is not kept at all.
+	a.Cache = admit.NewCommitCacheBytes(100, 10)
+	if _, err := a.Admit(ctx, subject(commits["owner"])); err != nil {
+		t.Fatal(err)
+	}
+	if a.Cache.Len() != 0 || a.Cache.Bytes() != 0 {
+		t.Errorf("an oversized commit was kept: %d commits, %d bytes", a.Cache.Len(), a.Cache.Bytes())
 	}
 }

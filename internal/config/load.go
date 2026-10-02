@@ -217,6 +217,29 @@ func decode(root *yamlsubset.Node) (*Config, []Problem) {
 			})
 		},
 		"workflows": func(n *yamlsubset.Node, p string) { c.Workflows = d.strList(n, p) },
+		"supervisor": func(n *yamlsubset.Node, p string) {
+			d.mapping(n, p, map[string]fieldFn{
+				"image":           func(n *yamlsubset.Node, p string) { c.Supervisor.Image = d.str(n, p) },
+				"network":         func(n *yamlsubset.Node, p string) { c.Supervisor.Network = d.str(n, p) },
+				"memory_mib":      func(n *yamlsubset.Node, p string) { c.Supervisor.MemoryMiB = d.integer(n, p) },
+				"timeout_minutes": func(n *yamlsubset.Node, p string) { c.Supervisor.TimeoutMinutes = d.integer(n, p) },
+				// Removed key: say so and why, rather than "unknown key" (or worse, a silent no-op).
+				"allow_pull_request_merge": func(n *yamlsubset.Node, p string) {
+					d.add(p, "this key was removed: pull_request runs no longer need a switch, because the supervisor now admits one only when "+
+						"the base tip and every commit of the pull request are signed by a key in the trust store (decision 0007, \"Pull requests: every commit verified\"); "+
+						"delete this line, and add each contributor with `bladerunner trust add` before their pull request can run")
+				},
+				"cancel_unadmitted": func(n *yamlsubset.Node, p string) {
+					switch v := d.str(n, p); v {
+					case "", "false":
+					case "true":
+						c.Supervisor.CancelUnadmitted = true
+					default:
+						d.add(p, "must be true or false (got %q)", v)
+					}
+				},
+			})
+		},
 		"agent": func(n *yamlsubset.Node, p string) {
 			d.mapping(n, p, map[string]fieldFn{
 				"listen":              func(n *yamlsubset.Node, p string) { c.Agent.Listen = d.str(n, p) },

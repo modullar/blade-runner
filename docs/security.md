@@ -8,6 +8,17 @@
 > not built. Until they land, the layers below are what is in force, and they rely on GitHub's
 > statement of who the actor is rather than on a signature.
 
+> **Pull requests under the supervisor.** `bladerunner supervise` runs a `pull_request` job only
+> when the tip of the base branch and **every commit of the pull request** are signed by a key in
+> your trust store, and the merge commit GitHub makes has exactly those two parents; each
+> contributor must be added with `bladerunner trust add` before their pull request can run. Any
+> unsigned or untrusted commit refuses the whole job. Commits made with GitHub's web buttons are
+> signed by GitHub's own key and are refused unless you trust that key, which would trust everything
+> GitHub signs for anyone. History under the signed base tip is covered only by the hash chain
+> (the git trust model), the merge algorithm is GitHub's and not re-run here, and the GitHub
+> behaviour this leans on is unverified (C10 to C12b). See
+> [decision 0007](decisions/0007-supervisor.md), "Pull requests: every commit verified".
+
 A self-hosted runner executes whatever job GitHub sends it, as you, on your machine. On a
 public repository anyone can open a pull request from a fork, and other collaborators can push
 branches. Blade Runner's rule is: **code from anyone but the people you name never runs on
@@ -60,6 +71,16 @@ and a real repository; see [decision 0005](decisions/0005-only-your-code-runs-he
 - `GITHUB_ACTOR` is the person who caused the run, and `GITHUB_TRIGGERING_ACTOR` the person who
   re-ran it.
 - The fork-approval endpoint and its `approval_policy` values.
+
+## Network access for isolated jobs
+
+An isolated job gets no network (`none`, the default). A job that must reach GitHub uses the
+`allowlist` mode instead of `bridge`: it runs on a network with no route out and no address for
+the host, and reaches only the hostnames you list, through a proxy that also refuses any name that
+resolves to a loopback, private, link-local or metadata address. The container is audited before it
+starts and is refused if its network is anything else. Built and tested on Linux with real Docker,
+**not yet verified on macOS**, and not yet started by anything. The allowed hosts can still receive
+whatever the job sends them. See [decision 0008](decisions/0008-egress.md).
 
 ## What this does not protect against
 

@@ -6,7 +6,7 @@ has no section below.
 
 Codes are grouped: `E00x` config, `E01x` machine, `E02x` token and GitHub, `E03x` runner
 download, `E04x` registration, `E05x` service, `E06x` public-repository guard, `E07x`
-health, `E08x` state, `E09x` confirmation, `E10x` warnings about placement.
+health, `E08x` state and egress, `E09x` confirmation, `E10x` warnings about placement.
 
 ### BR-E001
 
@@ -227,6 +227,100 @@ failure; jobs fail confusingly when the work directory fills up. Free space.
 
 **This `bladerunner` is older than `bladerunner.min_version`.** Upgrade it.
 
+The codes BR-E072 to BR-E079 belong to the supervisor (`bladerunner supervise`, see
+[decision 0007](../decisions/0007-supervisor.md)). BR-E070 and BR-E071 above were already taken
+by the doctor, so the supervisor's range starts at 072. Every refusal below is also written to the
+audit log, `~/.bladerunner/audit/supervisor-<runner name>.jsonl`, and nothing was started for the job.
+
+### BR-E072
+
+**A queued job was refused: its commit is not admitted.** The supervisor verified the job's head
+commit against this machine's trust store and the commit failed (BR-E067 explains which check), or
+GitHub says the commit does not exist (HTTP 404/422: deleted, force-pushed away, or a deleted
+fork), which no retry will change. No runner and no container was started for it. To allow it,
+trust the signer (`bladerunner trust add`) or have them sign the commit; to get rid of a job
+nobody should run, cancel its run, or start the supervisor with `--cancel-unadmitted`.
+
+**For a `pull_request` run the same code means that something in the pull request failed the
+rule "every commit verified"** ([decision 0007](../decisions/0007-supervisor.md), "Pull requests:
+every commit verified"). The message names the exact commit and why: a commit (or the tip of the
+base branch) that is unsigned, signed by a key this machine does not trust (the message gives its
+fingerprint), or by a revoked or expired one; a merge commit that does not have exactly the base
+tip and the head as its two parents; a pull request that is closed, cannot be merged, or whose
+head differs from the run's; a run whose own record of the pull request names another base branch
+than the pull request has now; a run that names no pull request or more than one; or **too many
+commits to verify** (GitHub lists at most 250 of them, and a shorter list is never verified as if
+it were whole). A new contributor must be added with `bladerunner trust add` before their pull
+request can run. Commits made with GitHub's web buttons are signed by GitHub's key and are
+refused unless the owner trusts that key (see the trade-off in the decision). Data that could not
+be read (GitHub unreachable, `mergeable` not computed yet, a commit neither repository serves, a
+commit whose signature GitHub's verification service could not check right now, or a base branch
+that moved since the run was created) is not this code: the job is withheld (BR-E076) and tried
+again at the next poll. When several commits are bad the message names the first of them in the
+pull request's own order.
+
+### BR-E073
+
+**A queued job was refused because GitHub's description of it is missing a field or contradicts
+itself**: no head commit or repository, a commit id that is not 40 hex digits, a head commit that
+differs from the one the job or the pull request names, a job with no labels, or a status the
+supervisor does not know. When it cannot tell what would run, it does not run it. If this appears
+for every job, GitHub's data differs from what Blade Runner assumes (C3): see decision 0007.
+
+### BR-E074
+
+**A queued job was refused because of the event that caused it.** Only `push`,
+`workflow_dispatch`, `schedule` and `pull_request` are accepted (a `pull_request` run additionally
+has to pass the "every commit verified" rule: see BR-E072 and
+[decision 0007](../decisions/0007-supervisor.md)). The config key
+`supervisor.allow_pull_request_merge` no longer exists. For the other events
+(for example `pull_request_target`, `issue_comment`, `workflow_run`) the code that runs is not the
+commit that was verified, or a stranger chose the moment. Change the workflow's trigger.
+
+### BR-E075
+
+**A runner was not started because a queued job that this runner could take is not admitted (or
+cannot be judged).** A just-in-time runner takes any queued job with matching labels, so starting
+one for an admitted job while an unadmitted one waits could run the unadmitted code. The
+supervisor starts nothing until every matching waiting job is admitted. Cancel the offending run,
+or start the supervisor with `--cancel-unadmitted` (or `supervisor.cancel_unadmitted: true`) so it
+asks GitHub to. The same code is used when a job appeared while a runner was already waiting: the
+runner is stopped and its registration removed.
+
+### BR-E076
+
+**The supervisor could not read the queue** (a GitHub error, a rate limit, or a list too long to
+read completely). It starts nothing and tries again at the next poll. Check the token
+(`bladerunner doctor`) and the network.
+
+### BR-E077
+
+**ALARM: a runner started by the supervisor was handed a job that was not admitted.** The
+supervisor stops the container at once and records what it saw, but code may already have
+started. Treat it as an incident: check the audit log, revoke what needs revoking, and report it:
+it means the "one runner, one admitted job" assumption failed (decision 0007).
+
+### BR-E078
+
+**Starting, running or cleaning up a runner failed**: GitHub would not issue the just-in-time
+config, the container could not be started (BR-E068 gives Docker's reasons), or the runner's
+registration could not be removed afterwards. The message says which; a registration that could
+not be removed is removed at the next start. A job that fails to start three times is left alone
+until the supervisor is restarted.
+
+### BR-E079
+
+**The audit log cannot be written.** Every decision (refusal, launch, outcome) is appended to
+`~/.bladerunner/audit/supervisor-<runner name>.jsonl` before it takes effect, and the supervisor refuses to
+start a job it cannot record. Fix the directory's permissions or free disk space.
+
+It is also raised when the log is not safe to continue: a write or flush failed earlier (the
+supervisor stops rather than guess what is on disk; restart it, and a torn last line is accounted
+for by a `recovered` entry), another supervisor has the same log open (each runner name has its
+own file, and the file is locked), or the log is damaged or shorter than its head anchor
+(`<log>.head`: the number and hash of the newest entry), in which case move both files aside to
+start a new log.
+
 ### BR-E080
 
 **The local state file is unreadable, corrupt, or from a newer `bladerunner`.** State is a
@@ -243,3 +337,42 @@ asks you to type the runner name, or to pass `--yes` when no terminal is attache
 **Some jobs are pinned to the local runner (`placement: local`).** They queue, and wait,
 while the runner is down instead of falling back to GitHub-hosted runners. Use
 `placement: auto` for jobs that may fall back.
+
+### BR-E081
+
+**The egress allowlist is invalid.** A job that needs the network may reach only the hostnames
+you list, and a list that cannot be trusted is refused rather than guessed at. Each entry must
+be a lower-case ASCII hostname (`github.com`) or a wildcard for subdomains (`*.example.com`,
+which does not match `example.com` itself). Refused: IP addresses (the allowlist is by name),
+ports inside an entry, a bare `*`, a wildcard over a single label (`*.com`), non-ASCII names
+(write the `xn--` form) and an empty list. Ports must be between 1 and 65535. Fix the
+configuration the message names.
+
+### BR-E082
+
+**The job's egress network could not be built, or failed its audit.** For network mode
+`allowlist` Blade Runner creates a Docker network with no route out and no address for the host
+on it, starts one allowlisting proxy attached to that network and to an outbound one, reads
+back what Docker applied and refuses to start the job unless every property holds. The message
+names the step or the violation: for example Docker is not answering, the proxy image is
+missing or not pinned by content, the network is not internal, the host still has an address
+on it (an old Docker that ignores `com.docker.network.bridge.inhibit_ipv4`), the container is
+attached to another network, the proxy is not running or is not the one Blade Runner built, or a
+container shares the proxy's or the job's network stack (`--network container:...`). When the
+message says the job **RAN**, the audit that repeats while the job runs (or once more when it
+ends) found the topology changed: the job was stopped if it was still running, and its result is
+not to be trusted. Update Docker, or report it.
+`docker network ls --filter label=bladerunner.egress` shows leftovers from a crash; the next
+start removes them.
+
+### BR-E083
+
+**The egress proxy refused a request.** This is what a job sees as `403 Forbidden` (or `405`,
+`502`, `503`) from its proxy, and what the proxy's log records as a decision with a reason. The
+reason says which rule held: `not-allowlisted` (the host is not on the list: add it only if the
+job really needs it), `bad-port`, `ip-literal` (jobs must use names), `bad-host`,
+`forbidden-address` (the name is allowed but resolves to a loopback, private, link-local,
+metadata or otherwise internal address; this is never overridable from configuration, it is
+what stops an allowed name from being turned into a way to reach the host or the LAN),
+`unresolvable`, `connect-failed`, `too-many-connections` and `method` (only HTTP `CONNECT` is
+supported, so plain `http://` requests and non-HTTP protocols such as SSH or UDP do not work).
